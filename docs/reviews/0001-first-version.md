@@ -1410,3 +1410,44 @@ Standards: every item is fixed. There are 0 hard violations, 1 soft glossary sli
 Clippy is clean with default features, `--all-features`, `--no-default-features`, fs only and
 sqlite only, each with `--all-targets` and without. So are rustfmt and rustdoc. `cargo test`
 passes with default features, `--no-default-features` and `--all-features`: 158 behaviour tests.
+
+---
+
+## Ticket 10: Filesystem backend, recovery, `Pending` and cancellation
+
+Reviewed: `git diff 7ca8305...005d5a1` (commit 005d5a1).
+
+### Standards
+
+**Documented-standard violations (hard)**
+
+None found. Each rule checked holds:
+- **Logging** (spec: "Logging is `tracing` at debug level only"). Every new log call is `tracing::debug!`: fs.rs:276-282, fs.rs:434-451, fs.rs:569-573, the Pending log in `commit`, and `recover` in journal.rs.
+- **Errors.** `Pending` joins the single `#[non_exhaustive]` `Error` (error.rs:32-38), matching the spec's list of errors.
+- **Backends private, no public trait.** Nothing new is public except `Pause` and `FailurePoint::RenameFails`. Both are behind `testing`, which the spec allows because it names the failure points and the pause point.
+- **Tests use only the public API.** The new tests go through `Store`, the failure points (`fail_at`/`pause_at`) and `temporary_files`, all of which are allowed. `symlinks()` (tests/behaviour/main.rs:875) reads the disk and isn't one of the four listed exceptions. But it checks something a person can see, not internal state, and an older test already does the same (main.rs:333 at 7ca8305), so it isn't counted as a breach.
+
+**Glossary (judgement call)**
+
+- error.rs:32,37 and backend/mod.rs:110 say a Commit "isn't fully applied yet". "apply" is on the `_Avoid_` list for **Commit**, and everywhere else the diff calls this state "finished" (ADR 0005, the fs.rs module doc, journal.rs). Suggest "isn't finished yet". The user-facing `#[error]` string matters most.
+
+**Smells (all judgement calls)**
+
+- **Duplicated Code.**
+  - fs.rs:292, 307, 317 and 326 each start with `let unfinished = Unfinished::read(&root.tidings())?;`.
+  - The loop in `stat_prefix` (fs.rs:323-336) has the same shape as `AreaState::revisions_under` (fs.rs:892-901), calling `read_committed` in place of `read_file`.
+  - Suggest one `AreaRoot::unfinished()` helper, or a `revisions_committed` beside `paths_committed`.
+- **Duplicated Code (tests).** `before_moves()` (main.rs:839) builds by hand what the new `staged()` helper (main.rs:817) builds: `staged(&[("a","a"),("d/e","e"),("kept.txt","old")], &[])`.
+- **Possible Feature Envy.** `read_committed` and `paths_committed` (fs.rs:530, 550) mostly work on `unfinished.written` and `unfinished.removed`. The overlay logic could move onto `Unfinished`, with `AreaRoot` supplying only the reads from disk.
+- **Mysterious Name.**
+  - `Target::Own` (journal.rs:79) doesn't say it means "the File at the Path being written". `Target::AtPath` would say more.
+  - `Testing` (fs.rs:227) is a generic name for the fail and pause settings.
+  - `read_committed` and `paths_committed` echo the journal's `committed` state but mean "as if finished". `read_as_finished` would be clearer.
+- **Primitive Obsession (minor).** `every_point` (main.rs:763) returns `(FailurePoint, bool)`, where the bool means "absent afterwards" and is only named where it's used (`absent`).
+
+No Speculative Generality found. `Pause`, `pause_at` and `RenameFails { times }` are all used, and the spec names the pause point.
+
+### Spec
+
+_Pending: the Spec review was still running when this entry was written._
+
