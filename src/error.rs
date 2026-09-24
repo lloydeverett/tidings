@@ -1,4 +1,4 @@
-use crate::InvalidPathReason;
+use crate::{InvalidPathReason, Path};
 
 /// Everything that can go wrong in tidings.
 ///
@@ -13,6 +13,14 @@ pub enum Error {
         path: String,
         /// Which rule it breaks.
         reason: InvalidPathReason,
+    },
+    /// A Commit was refused because at least one of its Preconditions didn't hold. Nothing was
+    /// written.
+    #[error("conflict: a Precondition failed for {paths:?}")]
+    Conflict {
+        /// The Paths whose Precondition failed, in order. For a Prefix, the Paths under it that
+        /// were added, removed or changed.
+        paths: Vec<Path>,
     },
 }
 

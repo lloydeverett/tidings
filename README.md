@@ -4,9 +4,9 @@ Text files for an application, in three areas (config, data, cache), stored on t
 SQLite or in memory. Writes happen only through staged commits. Every change is reported on a
 change feed.
 
-Status: early. Only the in-memory Store exists so far: reading, stat and listing, and commits of
-writes and deletes, with checked paths. Preconditions, snapshots and the other backends are still
-to come. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
+Status: early. Only the in-memory Store exists so far: reading, stat and listing, commits of
+writes and deletes with preconditions, and checked paths. Snapshots and the other backends are
+still to come. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
 
 ## Consistency
 
@@ -25,9 +25,11 @@ to come. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
 - Changes say which path changed, not what it now contains.
 - A read always returns a whole file, never a partly written one.
 - A commit can require that files, or everything under a prefix, are unchanged since you read
-  them, and fails with a conflict otherwise. On the filesystem this holds against other tidings
-  commits. A program outside tidings that writes a file while a commit is being applied can have
-  its edit overwritten.
+  them, and fails with a conflict otherwise, writing nothing and naming the paths that differ. A
+  precondition you stage always has to hold, even if something staged later replaces the write or
+  delete it came with. On the filesystem this holds against other tidings commits. A program
+  outside tidings that writes a file while a commit is being applied can have its edit
+  overwritten.
 
 ## Limitations
 
@@ -35,7 +37,9 @@ to come. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
 - Paths follow the strictest platform's rules on every backend, so a path that works on one
   platform works on all of them. Names Windows reserves (such as `CON`, `aux.txt` or `COM¹`),
   control characters, a trailing dot or space, `.` and `..`, and paths not in Unicode NFC form are
-  refused, as is anything under `.tidings/`.
+  refused, as is anything under `.tidings/`. A commit can't create a path that differs only in
+  letter case from another in the same area (`Themes/a.toml` against `themes/b.toml` counts too),
+  because some platforms treat them as the same name.
 - No moving a store's data from one backend to another.
 - No size limit or eviction for the cache area.
 - Backends are defined in this crate. You cannot plug in your own.

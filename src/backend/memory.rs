@@ -3,9 +3,9 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use super::{CommitOutcome, CommitRequest, RawChange};
+use super::{AreaState, CommitOutcome, CommitRequest, RawChange};
 use crate::staging::Action;
-use crate::{Area, ChangeKind, File, Path, Prefix, Revision, Stat};
+use crate::{Area, ChangeKind, File, Path, Prefix, PrefixRevision, Result, Revision, Stat};
 
 #[derive(Debug, Default)]
 pub(crate) struct MemoryBackend {
@@ -13,7 +13,10 @@ pub(crate) struct MemoryBackend {
 }
 
 /// Each Area's Files, indexed by `Area as usize`.
-type Areas = [BTreeMap<Path, Stored>; 3];
+type Areas = [Files; 3];
+
+/// One Area's Files.
+type Files = BTreeMap<Path, Stored>;
 
 /// A File as the memory Backend keeps it.
 #[derive(Debug)]
@@ -40,12 +43,20 @@ impl MemoryBackend {
         areas[area as usize].keys().filter(|path| prefix.covers(path)).cloned().collect()
     }
 
-    /// Applies every write and delete at once, under the one lock.
-    pub(crate) fn commit(&self, request: CommitRequest) -> CommitOutcome {
+    pub(crate) fn stat_prefix(&self, area: Area, prefix: &Prefix) -> Result<PrefixRevision> {
+        let areas = self.areas.lock().unwrap();
+        Ok(PrefixRevision::of(areas[area as usize].revisions_under(prefix)?))
+    }
+
+    /// Checks every Precondition, then applies every write and delete at once, under the one
+    /// lock.
+    pub(crate) fn commit(&self, request: CommitRequest) -> Result<CommitOutcome> {
         let CommitRequest { timestamp, mut staged } = request;
         let mut areas = self.areas.lock().unwrap();
         let files = &mut areas[staged.area as usize];
+        staged.check_preconditions(files)?;
         staged.expand_prefix_deletes(files.keys());
+        staged.refuse_letter_case_clashes(files.keys())?;
         let mut outcome = CommitOutcome::default();
         for (path, action) in staged.actions {
             match action {
@@ -67,6 +78,17 @@ impl MemoryBackend {
                 }
             }
         }
-        outcome
+        Ok(outcome)
+    }
+}
+
+impl AreaState for Files {
+    fn revision(&self, path: &Path) -> Result<Option<Revision>> {
+        Ok(self.get(path).map(|stored| stored.stat.revision()))
+    }
+
+    fn revisions_under(&self, prefix: &Prefix) -> Result<Vec<(Path, Revision)>> {
+        let under = self.iter().filter(|(path, _)| prefix.covers(path));
+        Ok(under.map(|(path, stored)| (path.clone(), stored.stat.revision())).collect())
     }
 }

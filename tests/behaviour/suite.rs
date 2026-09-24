@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use jiff::Timestamp;
 use tidings::{
-    Area, Change, ChangeFeed, ChangeKind, Error, FeedItem, File, InvalidPathReason, Origin,
-    Staging, Store,
+    Area, Change, ChangeFeed, ChangeKind, Committed, Error, FeedItem, File, InvalidPathReason,
+    Origin, Precondition, Staging, Store,
 };
 
 /// How a Backend opens a fresh, empty Store for one test.
@@ -44,6 +44,17 @@ macro_rules! behaviour_suite {
             a_dropped_staging_writes_nothing,
             an_invalid_path_is_refused_wherever_it_is_used,
             every_allowed_path_can_be_written_and_read_back,
+            a_write_requiring_absence_creates_a_file_only_if_there_is_none,
+            writing_back_a_file_requires_it_unchanged_since_it_was_read,
+            a_delete_can_require_the_file_unchanged,
+            a_rename_that_conflicts_leaves_both_paths_as_they_were,
+            a_commit_can_require_a_file_it_does_not_write,
+            a_prefix_revision_changes_when_a_file_under_the_prefix_does,
+            a_prefix_precondition_fails_when_a_file_is_added_under_the_prefix,
+            a_prefix_conflict_names_the_paths_added_removed_or_changed,
+            a_precondition_stays_when_something_staged_later_replaces_it,
+            a_staging_without_preconditions_depends_on_nothing,
+            a_path_differing_only_in_letter_case_is_refused,
         );
     };
     (@tests $fixture:expr; $($test:ident),* $(,)?) => {
@@ -399,6 +410,12 @@ pub async fn an_invalid_path_is_refused_wherever_it_is_used(fixture: &impl Fixtu
         assert_refused("deleting", path, expected, staging.delete(path).map(drop));
         assert_refused("reading", path, expected, store.read(Area::Data, path).await.map(drop));
         assert_refused("stat of", path, expected, store.stat(Area::Data, path).await.map(drop));
+        let requiring = staging.require(path, Precondition::Absent).map(drop);
+        assert_refused("requiring", path, expected, requiring);
+        let writing = staging.write_requiring(path, "x", Precondition::Absent).map(drop);
+        assert_refused("writing", path, expected, writing);
+        let deleting = staging.delete_requiring(path, Precondition::Absent).map(drop);
+        assert_refused("deleting", path, expected, deleting);
     }
 
     // One Prefix for each rule a Prefix can break. tests/paths.rs has the full table.
@@ -417,6 +434,11 @@ pub async fn an_invalid_path_is_refused_wherever_it_is_used(fixture: &impl Fixtu
         let deleting = staging.delete_prefix(prefix).map(drop);
         assert_refused("deleting under", prefix, expected, deleting);
         assert_refused("listing", prefix, expected, store.list(Area::Data, prefix).await.map(drop));
+        let stat = store.stat_prefix(Area::Data, prefix).await;
+        let prefix_revision = store.stat_prefix(Area::Data, "").await.unwrap();
+        assert_refused("stat of", prefix, expected, stat.map(drop));
+        let requiring = staging.require_prefix(prefix, prefix_revision).map(drop);
+        assert_refused("requiring", prefix, expected, requiring);
     }
 }
 
@@ -442,6 +464,365 @@ pub async fn every_allowed_path_can_be_written_and_read_back(fixture: &impl Fixt
         let file = read(&store, Area::Data, path).await;
         assert_eq!((file.path().as_str(), file.contents()), (path, path));
     }
+}
+
+pub async fn a_write_requiring_absence_creates_a_file_only_if_there_is_none(
+    fixture: &impl Fixture,
+) {
+    let Opened { store, mut feed } = fixture.open().await;
+
+    let mut create = Staging::new(Area::Data);
+    create.write_requiring("id.txt", "first", Precondition::Absent).unwrap();
+    store.commit(create).await.unwrap();
+    next_batch(&mut feed).await;
+
+    let mut create_again = Staging::new(Area::Data);
+    create_again.write_requiring("id.txt", "second", Precondition::Absent).unwrap();
+    create_again.write("other.txt", "other").unwrap();
+    assert_conflict(store.commit(create_again).await, &["id.txt"]);
+
+    assert_eq!(read(&store, Area::Data, "id.txt").await.contents(), "first");
+    assert_eq!(store.read(Area::Data, "other.txt").await.unwrap(), None);
+    assert_nothing_more(&mut feed).await;
+}
+
+pub async fn writing_back_a_file_requires_it_unchanged_since_it_was_read(fixture: &impl Fixture) {
+    let Opened { store, feed: _feed } = fixture.open().await;
+    let mut staging = Staging::new(Area::Config);
+    staging.write("settings.toml", "a = 1\n").unwrap();
+    store.commit(staging).await.unwrap();
+
+    // Someone else changes the File between our read and our write.
+    let ours = read(&store, Area::Config, "settings.toml").await;
+    let mut theirs = Staging::new(Area::Config);
+    theirs.write("settings.toml", "a = 2\n").unwrap();
+    store.commit(theirs).await.unwrap();
+    let mut write_back = Staging::new(Area::Config);
+    write_back.write_back(&ours, "a = 1\nb = 1\n");
+    assert_conflict(store.commit(write_back).await, &["settings.toml"]);
+    assert_eq!(read(&store, Area::Config, "settings.toml").await.contents(), "a = 2\n");
+
+    // Read again, it goes through, and the Revision it gives back is good for the next write.
+    let ours = read(&store, Area::Config, "settings.toml").await;
+    let mut write_back = Staging::new(Area::Config);
+    write_back.write_back(&ours, "a = 2\nb = 1\n");
+    let committed = store.commit(write_back).await.unwrap();
+    let mut again = Staging::new(Area::Config);
+    let revision = committed.revisions()[ours.path()];
+    again.write_requiring(ours.path(), "a = 3\n", Precondition::UnchangedSince(revision)).unwrap();
+    store.commit(again).await.unwrap();
+    assert_eq!(read(&store, Area::Config, "settings.toml").await.contents(), "a = 3\n");
+}
+
+pub async fn a_delete_can_require_the_file_unchanged(fixture: &impl Fixture) {
+    let Opened { store, feed: _feed } = fixture.open().await;
+    let mut staging = Staging::new(Area::Data);
+    staging.write("a.txt", "a").unwrap();
+    store.commit(staging).await.unwrap();
+    let read_a = read(&store, Area::Data, "a.txt").await;
+
+    let mut change = Staging::new(Area::Data);
+    change.write("a.txt", "changed").unwrap();
+    store.commit(change).await.unwrap();
+    let mut delete = Staging::new(Area::Data);
+    delete.delete_requiring("a.txt", Precondition::UnchangedSince(read_a.revision())).unwrap();
+    assert_conflict(store.commit(delete).await, &["a.txt"]);
+    assert_eq!(read(&store, Area::Data, "a.txt").await.contents(), "changed");
+
+    // Changed back, the contents are what they were, so it counts as unchanged.
+    let mut change_back = Staging::new(Area::Data);
+    change_back.write("a.txt", "a").unwrap();
+    store.commit(change_back).await.unwrap();
+    let mut delete = Staging::new(Area::Data);
+    delete.delete_requiring("a.txt", Precondition::UnchangedSince(read_a.revision())).unwrap();
+    store.commit(delete).await.unwrap();
+    assert_eq!(store.read(Area::Data, "a.txt").await.unwrap(), None);
+
+    // Absent holds for a delete of a Path with no File, which does nothing.
+    let mut delete = Staging::new(Area::Data);
+    delete.delete_requiring("a.txt", Precondition::Absent).unwrap();
+    store.commit(delete).await.unwrap();
+}
+
+pub async fn a_rename_that_conflicts_leaves_both_paths_as_they_were(fixture: &impl Fixture) {
+    let Opened { store, mut feed } = fixture.open().await;
+    let mut staging = Staging::new(Area::Config);
+    staging.write("old-name.toml", "a = 1\n").unwrap();
+    store.commit(staging).await.unwrap();
+    let file = read(&store, Area::Config, "old-name.toml").await;
+    let mut change = Staging::new(Area::Config);
+    change.write("old-name.toml", "a = 2\n").unwrap();
+    store.commit(change).await.unwrap();
+    next_batch(&mut feed).await;
+    next_batch(&mut feed).await;
+
+    let mut rename = Staging::new(Area::Config);
+    rename.delete_requiring(file.path(), Precondition::UnchangedSince(file.revision())).unwrap();
+    rename.write_requiring("new-name.toml", file.contents(), Precondition::Absent).unwrap();
+    assert_conflict(store.commit(rename).await, &["old-name.toml"]);
+
+    assert_eq!(list(&store, Area::Config, "").await, ["old-name.toml"]);
+    assert_eq!(read(&store, Area::Config, "old-name.toml").await.contents(), "a = 2\n");
+    assert_nothing_more(&mut feed).await;
+}
+
+pub async fn a_commit_can_require_a_file_it_does_not_write(fixture: &impl Fixture) {
+    let Opened { store, feed: _feed } = fixture.open().await;
+    let mut staging = Staging::new(Area::Data);
+    staging.write("rates.toml", "rate = 2\n").unwrap();
+    store.commit(staging).await.unwrap();
+
+    // Prices are worked out from the rates, so they are only written if the rates haven't moved.
+    let rates = read(&store, Area::Data, "rates.toml").await;
+    let unchanged = Precondition::UnchangedSince(rates.revision());
+    let mut prices = Staging::new(Area::Data);
+    prices.require(rates.path(), unchanged).unwrap();
+    prices.require("lock.txt", Precondition::Absent).unwrap();
+    prices.write("prices.toml", "price = 20\n").unwrap();
+    store.commit(prices).await.unwrap();
+
+    let mut change = Staging::new(Area::Data);
+    change.write("rates.toml", "rate = 3\n").unwrap();
+    change.write("lock.txt", "").unwrap();
+    store.commit(change).await.unwrap();
+    let mut prices = Staging::new(Area::Data);
+    prices.require(rates.path(), unchanged).unwrap();
+    prices.require("lock.txt", Precondition::Absent).unwrap();
+    prices.write("prices.toml", "price = 30\n").unwrap();
+    assert_conflict(store.commit(prices).await, &["lock.txt", "rates.toml"]);
+
+    assert_eq!(read(&store, Area::Data, "prices.toml").await.contents(), "price = 20\n");
+    assert_eq!(read(&store, Area::Data, "rates.toml").await.contents(), "rate = 3\n");
+}
+
+pub async fn a_prefix_revision_changes_when_a_file_under_the_prefix_does(fixture: &impl Fixture) {
+    let Opened { store, feed: _feed } = fixture.open().await;
+    let empty_area = store.stat_prefix(Area::Config, "").await.unwrap();
+    let mut staging = Staging::new(Area::Config);
+    staging.write("themes/dark.toml", "dark").unwrap();
+    staging.write("settings.toml", "a = 1\n").unwrap();
+    store.commit(staging).await.unwrap();
+    let themes = store.stat_prefix(Area::Config, "themes/").await.unwrap();
+    let area = store.stat_prefix(Area::Config, "").await.unwrap();
+    assert_ne!(area, empty_area);
+
+    let mut steps: Vec<(&str, Staging)> = Vec::new();
+    let mut added = Staging::new(Area::Config);
+    added.write("themes/deep/light.toml", "light").unwrap();
+    steps.push(("added", added));
+    let mut changed = Staging::new(Area::Config);
+    changed.write("themes/dark.toml", "darker").unwrap();
+    steps.push(("changed", changed));
+    let mut removed = Staging::new(Area::Config);
+    removed.delete("themes/dark.toml").unwrap();
+    steps.push(("removed", removed));
+    let mut seen = vec![themes.clone()];
+    for (what, staging) in steps {
+        store.commit(staging).await.unwrap();
+        let now = store.stat_prefix(Area::Config, "themes/").await.unwrap();
+        assert!(!seen.contains(&now), "a File under the Prefix was {what}");
+        seen.push(now);
+    }
+
+    // Put back as it was, it is as it was. Changes outside the Prefix, or in another Area, don't
+    // count.
+    let mut back = Staging::new(Area::Config);
+    back.write("themes/dark.toml", "dark").unwrap();
+    back.delete("themes/deep/light.toml").unwrap();
+    back.write("themes2/dark.toml", "outside").unwrap();
+    store.commit(back).await.unwrap();
+    let mut other_area = Staging::new(Area::Data);
+    other_area.write("themes/dark.toml", "elsewhere").unwrap();
+    store.commit(other_area).await.unwrap();
+    assert_eq!(store.stat_prefix(Area::Config, "themes/").await.unwrap(), themes);
+
+    // The empty Prefix covers the whole Area.
+    assert_ne!(store.stat_prefix(Area::Config, "").await.unwrap(), area);
+}
+
+pub async fn a_prefix_precondition_fails_when_a_file_is_added_under_the_prefix(
+    fixture: &impl Fixture,
+) {
+    let Opened { store, mut feed } = fixture.open().await;
+    let mut staging = Staging::new(Area::Data);
+    staging.write("inbox/1.eml", "one").unwrap();
+    store.commit(staging).await.unwrap();
+    next_batch(&mut feed).await;
+
+    // The index is worked out from everything in the inbox, so it holds only if nothing arrived.
+    let inbox = store.stat_prefix(Area::Data, "inbox/").await.unwrap();
+    let mut index = Staging::new(Area::Data);
+    index.require_prefix("inbox/", inbox.clone()).unwrap();
+    index.write("index.txt", "1.eml").unwrap();
+    let mut arrival = Staging::new(Area::Data);
+    arrival.write("inbox/2.eml", "two").unwrap();
+    store.commit(arrival).await.unwrap();
+    next_batch(&mut feed).await;
+    assert_conflict(store.commit(index).await, &["inbox/2.eml"]);
+    assert_eq!(store.read(Area::Data, "index.txt").await.unwrap(), None);
+    assert_nothing_more(&mut feed).await;
+
+    // With a Prefix Revision taken after the arrival, and changes only outside the Prefix, it
+    // goes through.
+    let inbox = store.stat_prefix(Area::Data, "inbox/").await.unwrap();
+    let mut outside = Staging::new(Area::Data);
+    outside.write("inbox2/3.eml", "three").unwrap();
+    store.commit(outside).await.unwrap();
+    let mut index = Staging::new(Area::Data);
+    index.require_prefix("inbox/", inbox).unwrap();
+    index.write("index.txt", "1.eml 2.eml").unwrap();
+    store.commit(index).await.unwrap();
+    assert_eq!(read(&store, Area::Data, "index.txt").await.contents(), "1.eml 2.eml");
+}
+
+pub async fn a_prefix_conflict_names_the_paths_added_removed_or_changed(fixture: &impl Fixture) {
+    let Opened { store, feed: _feed } = fixture.open().await;
+    let mut staging = Staging::new(Area::Cache);
+    for path in ["a/changed.txt", "a/kept.txt", "a/removed.txt", "b.txt"] {
+        staging.write(path, path).unwrap();
+    }
+    store.commit(staging).await.unwrap();
+    let under_a = store.stat_prefix(Area::Cache, "a/").await.unwrap();
+    let whole_area = store.stat_prefix(Area::Cache, "").await.unwrap();
+
+    let mut changes = Staging::new(Area::Cache);
+    changes.write("a/added.txt", "added").unwrap();
+    changes.write("a/changed.txt", "changed").unwrap();
+    changes.delete("a/removed.txt").unwrap();
+    changes.write("b.txt", "changed outside a/").unwrap();
+    store.commit(changes).await.unwrap();
+
+    let mut staging = Staging::new(Area::Cache);
+    staging.require_prefix("a/", under_a).unwrap();
+    staging.write("summary.txt", "").unwrap();
+    assert_conflict(
+        store.commit(staging).await,
+        &["a/added.txt", "a/changed.txt", "a/removed.txt"],
+    );
+    let mut staging = Staging::new(Area::Cache);
+    staging.require_prefix("", whole_area).unwrap();
+    staging.write("summary.txt", "").unwrap();
+    assert_conflict(
+        store.commit(staging).await,
+        &["a/added.txt", "a/changed.txt", "a/removed.txt", "b.txt"],
+    );
+    assert_eq!(store.read(Area::Cache, "summary.txt").await.unwrap(), None);
+}
+
+pub async fn a_precondition_stays_when_something_staged_later_replaces_it(fixture: &impl Fixture) {
+    let Opened { store, feed: _feed } = fixture.open().await;
+    let mut staging = Staging::new(Area::Data);
+    staging.write("drafts/a.md", "a").unwrap();
+    staging.write("notes.md", "notes").unwrap();
+    store.commit(staging).await.unwrap();
+    let draft = read(&store, Area::Data, "drafts/a.md").await;
+    let notes = read(&store, Area::Data, "notes.md").await;
+    let staged_later = |staging: &mut Staging| {
+        staging.write_back(&draft, "edited");
+        staging.delete_prefix("drafts/").unwrap();
+        staging.write_back(&notes, "edited");
+        staging.write("notes.md", "replaced").unwrap();
+    };
+
+    let mut change = Staging::new(Area::Data);
+    change.write("drafts/a.md", "changed").unwrap();
+    change.write("notes.md", "changed").unwrap();
+    store.commit(change).await.unwrap();
+    let mut staging = Staging::new(Area::Data);
+    staged_later(&mut staging);
+    assert_conflict(store.commit(staging).await, &["drafts/a.md", "notes.md"]);
+    assert_eq!(list(&store, Area::Data, "").await, ["drafts/a.md", "notes.md"]);
+
+    // Once they hold again, what was staged later is what happens.
+    let mut change_back = Staging::new(Area::Data);
+    change_back.write("drafts/a.md", "a").unwrap();
+    change_back.write("notes.md", "notes").unwrap();
+    store.commit(change_back).await.unwrap();
+    let mut staging = Staging::new(Area::Data);
+    staged_later(&mut staging);
+    store.commit(staging).await.unwrap();
+    assert_eq!(list(&store, Area::Data, "").await, ["notes.md"]);
+    assert_eq!(read(&store, Area::Data, "notes.md").await.contents(), "replaced");
+}
+
+pub async fn a_staging_without_preconditions_depends_on_nothing(fixture: &impl Fixture) {
+    let Opened { store, feed: _feed } = fixture.open().await;
+    let mut staging = Staging::new(Area::Config);
+    staging.write("a.toml", "a = 1\n").unwrap();
+    staging.write("b.toml", "b = 1\n").unwrap();
+    store.commit(staging).await.unwrap();
+
+    // Staged after reading, then everything changes before the Commit.
+    let mut staging = Staging::new(Area::Config);
+    staging.write("a.toml", "a = 3\n").unwrap();
+    staging.delete("b.toml").unwrap();
+    staging.write("c.toml", "c = 3\n").unwrap();
+    let mut change = Staging::new(Area::Config);
+    change.write("a.toml", "a = 2\n").unwrap();
+    change.write("b.toml", "b = 2\n").unwrap();
+    change.write("c.toml", "c = 2\n").unwrap();
+    store.commit(change).await.unwrap();
+    store.commit(staging).await.unwrap();
+
+    assert_eq!(list(&store, Area::Config, "").await, ["a.toml", "c.toml"]);
+    assert_eq!(read(&store, Area::Config, "a.toml").await.contents(), "a = 3\n");
+    assert_eq!(read(&store, Area::Config, "c.toml").await.contents(), "c = 3\n");
+}
+
+pub async fn a_path_differing_only_in_letter_case_is_refused(fixture: &impl Fixture) {
+    let Opened { store, mut feed } = fixture.open().await;
+    let mut staging = Staging::new(Area::Config);
+    staging.write("Settings.toml", "a = 1\n").unwrap();
+    staging.write("themes/dark.toml", "dark").unwrap();
+    store.commit(staging).await.unwrap();
+    next_batch(&mut feed).await;
+
+    // Each Commit also writes a File that would be fine alone, which must not be written either.
+    // Where two Paths in the Commit clash, either may be the one refused.
+    let clashes: [&[&str]; 8] = [
+        // With an existing Path.
+        &["settings.toml"],
+        // With a Prefix: on a case-insensitive filesystem, `Themes/` is the `themes/` directory.
+        &["Themes/light.toml"],
+        &["THEMES/DARK.TOML"],
+        // With another Path in the same Commit.
+        &["new.toml", "NEW.toml"],
+        &["fonts/a.ttf", "FONTS/b.ttf"],
+        // Letters that are the same only once folded or uppercased, or only uppercased as Windows
+        // does: `ß` and `ss`, the long `ſ` and `s`, the dotless `ı` and `I`.
+        &["stra\u{df}e.txt", "STRASSE.txt"],
+        &["\u{17f}.txt", "s.txt"],
+        &["\u{131}.txt", "I.txt"],
+    ];
+    for paths in clashes {
+        let mut staging = Staging::new(Area::Config);
+        for path in paths {
+            staging.write(*path, "clash").unwrap();
+        }
+        staging.write("fine.toml", "fine").unwrap();
+        match store.commit(staging).await {
+            Err(Error::InvalidPath { path, reason: InvalidPathReason::LetterCaseClash }) => {
+                assert!(paths.contains(&path.as_str()), "{paths:?} refused for {path:?}");
+            }
+            other => panic!("{paths:?} should clash, got {other:?}"),
+        }
+    }
+    assert_eq!(list(&store, Area::Config, "").await, ["Settings.toml", "themes/dark.toml"]);
+    assert_nothing_more(&mut feed).await;
+
+    // Writing a File again in its own letter case is fine, and so is renaming it to another letter
+    // case in one Commit, since only one of them is left.
+    let mut staging = Staging::new(Area::Config);
+    staging.write("Settings.toml", "a = 2\n").unwrap();
+    staging.write("themes/light.toml", "light").unwrap();
+    store.commit(staging).await.unwrap();
+    let mut rename = Staging::new(Area::Config);
+    rename.delete("Settings.toml").unwrap();
+    rename.write("settings.toml", "a = 2\n").unwrap();
+    rename.delete_prefix("themes/").unwrap();
+    rename.write("Themes/dark.toml", "dark").unwrap();
+    store.commit(rename).await.unwrap();
+    assert_eq!(list(&store, Area::Config, "").await, ["Themes/dark.toml", "settings.toml"]);
 }
 
 // Helpers shared by the tests above.
@@ -490,6 +871,17 @@ async fn list(store: &Store, area: Area, prefix: &str) -> Vec<String> {
 async fn assert_nothing_more(feed: &mut ChangeFeed) {
     if let Ok(item) = tokio::time::timeout(Duration::from_millis(200), feed.next()).await {
         panic!("expected nothing more on the Change feed, got {item:?}");
+    }
+}
+
+/// Checks that a Commit failed with a Conflict on exactly `expected`.
+fn assert_conflict(result: Result<Committed, Error>, expected: &[&str]) {
+    match result {
+        Err(Error::Conflict { paths }) => {
+            let paths: Vec<_> = paths.iter().map(|path| path.as_str()).collect();
+            assert_eq!(paths, expected);
+        }
+        other => panic!("expected a Conflict on {expected:?}, got {other:?}"),
     }
 }
 

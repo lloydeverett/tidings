@@ -8,12 +8,21 @@ use std::collections::BTreeMap;
 use jiff::Timestamp;
 
 use crate::staging::Staged;
-use crate::{Area, ChangeKind, File, Path, Prefix, Result, Revision, Stat};
+use crate::{Area, ChangeKind, File, Path, Prefix, PrefixRevision, Result, Revision, Stat};
 
 /// The Backend a Store was opened on.
 #[derive(Debug)]
 pub(crate) enum Backend {
     Memory(memory::MemoryBackend),
+}
+
+/// What an Area holds when a Commit runs, as the checks shared by every Backend need to see it.
+/// Each Backend reads it its own way, under its lock.
+pub(crate) trait AreaState {
+    /// The Revision of the File at `path`, or `None` if there is none.
+    fn revision(&self, path: &Path) -> Result<Option<Revision>>;
+    /// The Path and Revision of every File under `prefix`, in order of Path.
+    fn revisions_under(&self, prefix: &Prefix) -> Result<Vec<(Path, Revision)>>;
 }
 
 /// A Staging, with its Paths validated, ready for a Backend to commit.
@@ -62,11 +71,19 @@ impl Backend {
         }
     }
 
+    /// The Prefix Revision of everything under `prefix`.
+    pub(crate) async fn stat_prefix(&self, area: Area, prefix: &Prefix) -> Result<PrefixRevision> {
+        match self {
+            Backend::Memory(backend) => backend.stat_prefix(area, prefix),
+        }
+    }
+
     /// Applies every write and delete in `request`, all-or-nothing, after expanding its Prefix
-    /// deletes and leaving out writes that would not change the contents.
+    /// deletes, checking its Preconditions and leaving out writes that would not change the
+    /// contents.
     pub(crate) async fn commit(&self, request: CommitRequest) -> Result<CommitOutcome> {
         match self {
-            Backend::Memory(backend) => Ok(backend.commit(request)),
+            Backend::Memory(backend) => backend.commit(request),
         }
     }
 }

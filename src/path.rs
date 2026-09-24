@@ -1,6 +1,8 @@
 use std::fmt;
 
+use caseless::Caseless;
 use relative_path::{Component, RelativePath};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::{Error, Result};
 
@@ -32,8 +34,9 @@ impl Path {
     }
 }
 
-/// The top-level name tidings keeps its own bookkeeping under, in upper case.
-const RESERVED_UPPERCASE: &str = ".TIDINGS";
+/// The top-level name tidings keeps its own bookkeeping under. It is its own
+/// [`letter_case_key`].
+const RESERVED: &str = ".tidings";
 
 /// Why `path` is refused, if it is.
 pub(crate) fn refusal(path: &str) -> Option<InvalidPathReason> {
@@ -98,10 +101,21 @@ fn is_device_name_sanitize_filename_misses(name: &str) -> bool {
 }
 
 /// Whether `name`, as a Path's first segment, is tidings' own. Letter case is ignored, because on a
-/// case-insensitive filesystem `.Tidings` is the same directory. Comparing in upper case, as NTFS
-/// does, also catches letters such as `ſ` that only match once uppercased.
+/// case-insensitive filesystem `.Tidings` is the same directory, and so are `.tidingſ` and
+/// `.tıdings` on some.
 fn is_reserved(name: &str) -> bool {
-    name.to_uppercase() == RESERVED_UPPERCASE
+    letter_case_key(name) == RESERVED
+}
+
+/// A form of `name` that is the same for two names some platform treats as the same apart from
+/// letter case, so that such names can be refused on every platform.
+///
+/// It is Unicode canonical caseless matching (NFD, full case folding, NFD again, from the
+/// `caseless` crate), applied to the name in upper case. Case folding is what macOS does. Windows
+/// compares names in upper case instead, and some letters match only that way: the dotless `ı`
+/// is `I` in upper case, but doesn't fold to `i`. Folding the upper case catches both.
+pub(crate) fn letter_case_key(name: &str) -> String {
+    name.to_uppercase().chars().nfd().default_case_fold().nfd().collect()
 }
 
 /// Which rule a refused Path or Prefix breaks, as given by [`Error::InvalidPath`].
@@ -127,6 +141,10 @@ pub enum InvalidPathReason {
     Reserved,
     /// A Prefix other than the empty one doesn't end with `/`.
     NoTrailingSlash,
+    /// A Commit would create a Path that differs only in letter case from another Path in the
+    /// Area, or from another Path in the same Commit, or would put it under a Prefix that does.
+    /// Some platforms treat them as the same name, so only one is allowed.
+    LetterCaseClash,
 }
 
 impl fmt::Display for InvalidPathReason {
@@ -142,6 +160,9 @@ impl fmt::Display for InvalidPathReason {
                 "it is under `.tidings/`, which tidings keeps for itself"
             }
             InvalidPathReason::NoTrailingSlash => "it is a Prefix that doesn't end with `/`",
+            InvalidPathReason::LetterCaseClash => {
+                "it differs only in letter case from another Path in the Area"
+            }
         })
     }
 }

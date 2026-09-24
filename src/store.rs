@@ -5,8 +5,8 @@ use jiff::Timestamp;
 use crate::backend::{Backend, CommitRequest, RawChange, memory::MemoryBackend};
 use crate::change::{self, FeedSender};
 use crate::{
-    Area, Change, ChangeFeed, Committed, File, IntoPath, IntoPrefix, Origin, Path, Result, Staging,
-    Stat,
+    Area, Change, ChangeFeed, Committed, File, IntoPath, IntoPrefix, Origin, Path, PrefixRevision,
+    Result, Staging, Stat,
 };
 
 /// What an application opens to reach its Files: all three Areas, held by one Backend.
@@ -57,6 +57,18 @@ impl Store {
         self.inner.backend.list(area, &prefix).await
     }
 
+    /// Gives the Prefix Revision of everything under `prefix` in `area`: which Files are there,
+    /// and the Revision of each. Pass it to
+    /// [`Staging::require_prefix`](crate::Staging::require_prefix) to make a Commit fail if any of
+    /// them was added, removed or changed since. The empty Prefix covers the whole Area.
+    ///
+    /// Unlike [`list`](Self::list), it needs the Revision of every File under `prefix`. On the
+    /// filesystem that means reading them all.
+    pub async fn stat_prefix(&self, area: Area, prefix: impl IntoPrefix) -> Result<PrefixRevision> {
+        let prefix = prefix.into_prefix()?;
+        self.inner.backend.stat_prefix(area, &prefix).await
+    }
+
     /// Commits `staging`: applies all of its writes and deletes, or none of them. Prefix deletes
     /// cover the Files under the Prefix at this moment.
     ///
@@ -64,6 +76,13 @@ impl Store {
     /// wouldn't change the File's contents is left out, so the File keeps its time and no Change
     /// is sent for it. The Changes arrive on the Change feed in one batch, and a Commit that
     /// changes nothing sends none. On success, gives the timestamp and the new Revisions.
+    ///
+    /// Nothing is written if the Commit fails:
+    /// - [`Error::Conflict`](crate::Error::Conflict) if any of the Staging's Preconditions doesn't
+    ///   hold, naming every Path where one fails;
+    /// - [`Error::InvalidPath`](crate::Error::InvalidPath) with
+    ///   [`LetterCaseClash`](crate::InvalidPathReason::LetterCaseClash) if a write would create a
+    ///   Path that differs only in letter case from another Path in the Area.
     pub async fn commit(&self, staging: Staging) -> Result<Committed> {
         let area = staging.area();
         let timestamp = Timestamp::now();
