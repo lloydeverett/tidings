@@ -56,9 +56,10 @@ processes' commits reach the change feed. Still to come: the blocking API. See
   If watching fails or loses track of events, or an area's directory is removed or renamed away
   (the cache cleared, say), that area gets a resync, and is watched again, a removed directory
   being made again first. If an area can't be watched, when the store opens or later (as when
-  the platform's limit on watches is reached), the store still opens and works, and watching the
-  area is tried again, after the debounce window, then twice as long each time, up to half a
-  minute. Changes to it are missed meanwhile, so it gets a resync once it is watched.
+  the platform's limit on watches is reached), the store still opens and works, and the area gets
+  a resync straight away, since its changes aren't reported meanwhile. Watching it is tried
+  again, after the debounce window, then twice as long each time, up to half a minute, and it
+  gets another resync once it is watched.
 - The store can be cloned and shared between tasks. The change feed ends once every clone has
   been dropped, even if a snapshot is still held. Dropping the change feed leaves the store
   working.

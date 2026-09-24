@@ -15,6 +15,9 @@ pub enum Area {
 impl Area {
     /// The Area's name in lower case, which names its directory under a Root override, and its
     /// database.
+    /// Every Area, in order.
+    pub(crate) const ALL: [Area; 3] = [Area::Config, Area::Data, Area::Cache];
+
     #[cfg(any(feature = "fs", feature = "sqlite"))]
     pub(crate) fn name(self) -> &'static str {
         match self {
@@ -30,15 +33,19 @@ impl Area {
 pub(crate) struct PerArea<T>([T; 3]);
 
 impl<T> PerArea<T> {
-    const AREAS: [Area; 3] = [Area::Config, Area::Data, Area::Cache];
-
     /// One `T` for each Area, made by `make`, or the first error it gives.
     #[cfg(any(feature = "fs", feature = "sqlite"))]
     pub(crate) fn try_from_fn(
         mut make: impl FnMut(Area) -> crate::Result<T>,
     ) -> crate::Result<PerArea<T>> {
-        let [config, data, cache] = Self::AREAS;
+        let [config, data, cache] = Area::ALL;
         Ok(PerArea([make(config)?, make(data)?, make(cache)?]))
+    }
+
+    /// One `T` for each Area, made by `make`.
+    #[cfg(feature = "fs")]
+    pub(crate) fn from_fn(make: impl FnMut(Area) -> T) -> PerArea<T> {
+        PerArea(Area::ALL.map(make))
     }
 
     pub(crate) fn get(&self, area: Area) -> &T {
@@ -52,11 +59,11 @@ impl<T> PerArea<T> {
     /// Each Area with its `T`, in order of Area.
     #[cfg(any(feature = "fs", feature = "sqlite"))]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (Area, &T)> {
-        Self::AREAS.into_iter().zip(&self.0)
+        Area::ALL.into_iter().zip(&self.0)
     }
 
     /// Each Area with its `T`, in order of Area.
     pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (Area, &mut T)> {
-        Self::AREAS.into_iter().zip(&mut self.0)
+        Area::ALL.into_iter().zip(&mut self.0)
     }
 }

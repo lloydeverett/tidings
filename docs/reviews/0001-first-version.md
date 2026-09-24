@@ -1767,3 +1767,137 @@ Clippy (`--all-targets` and without) is clean with default features, `--all-feat
 `cargo test` passes with default features, `--no-default-features` and `--all-features`: 183
 behaviour tests. The watching and two-Store tests passed 20 runs out of 20 alone, and 10 out of
 10 with three copies of the filesystem suite running alongside.
+
+### Re-review (after the fix commit c56fcaa)
+
+The fix reworked how the watcher reads Files outside the Commit turn, how it follows chains of symlinks, and how it watches an Area again after losing it. That was substantial, so `git diff b68d6de...c56fcaa` was reviewed again on both axes, with probes run a second time.
+
+#### Standards
+
+**Earlier Standards findings:** all fixed.
+- `lock_ignoring_poison` (watch.rs:256).
+- `area_roots` / `area_paths` (271, 391), and `watched.watched` is gone.
+- `until_removal_settles` / `until_renames_settle` (480).
+- One `Watched::relink` (961). `look_at` still destructures and clones the Arcs (915-916), but only once.
+- `Watches` bundles the debouncer, and the `Links` methods take `&mut Watches` (1026, 1058, 1073).
+- `Seen.names` and `Looked` hold `Path`s. `Reported.files` keeps `String` keys, which the field's doc justifies (115-116).
+- `record_observed` takes a single `Observed`. The Resolution says "SQLite's two callers loop", but one of those loops is `Store::commit` (store.rs:299), which serves both Backends. That's a small inaccuracy in the Resolution, not in the code.
+
+**Documented-standard violations (hard):** none.
+- **Spec:** `WatchingAnAreaFails { times }` is `testing`-only and on the `#[non_exhaustive]` enum (fs.rs:257). All new `tracing` calls are `debug!`.
+- **Tests:** the new tests use only the public API, plus failure points and direct disk writes. `an_area_that_cant_be_watched_…` (main.rs:697) relies on the order in which Areas are watched, which `FailurePoint`'s public doc states, so this is acceptable.
+- **README and spec** were updated together.
+- **CONTEXT.md near misses (judgement calls):**
+  - "lost watches" and `lose_watches`/`loses_watches` (watch.rs:73, 370, 805) use "lost", which is on Resync's `_Avoid_` list. They describe notify's watches, not the Resync concept, so they pass.
+  - "Keyed by the Path's string… a range of keys" (116) is close to Path's `_Avoid_: key`. It means map keys, so it passes, but "indexed by" would avoid the word.
+  - store.rs:256 adds another "the order they were applied", and "apply" is on Commit's `_Avoid_` list. The wording was already there, but ticket 10's review had the same slip fixed to "finished".
+
+**New baseline smells (all judgement calls)**
+
+1. **Mysterious Name:**
+   - `enum Now { Absent, There(Option<Revision>) }` (watch.rs:214) and `fn now()` (249). The local `let now = … now(finished, &path)?` (993-997) shadows the function, and `take_settled` uses `now` for an `Instant` (340). Something like `Seen`, `FileState` or `AsRead` would say what it holds.
+   - `look`, `Look`, `Looks`, `Looked`, `look_at`, `look_under` and `look_again` are hard to tell apart.
+   - `Looked.under` (207) doesn't say what it holds.
+2. **Mysterious Name:** `fails` is a `bool` in `handler` (613) but a countdown `usize` in `Watches.fails` (401). The `first_events` testing flag is also split between `handler` and `Watched.loses_watches` (462).
+3. **Duplicated Code:** `[Area::Config, Area::Data, Area::Cache]` is written out again at watch.rs:777 (new) and 464, next to `PerArea::AREAS`/`iter()`. `self.areas.iter()` would do.
+4. **Fallibility that no longer exists:** `PerArea::try_from_fn(|area| { watches.watch_area(area, root); Ok(…) })?` (452-456) can no longer fail, and it discards the `bool` that `watch_area` returns. It should be a `from_fn`, or use the `bool`.
+5. **Duplicated Code (minor):** the loop `for observed in … { record_observed(…) }` now appears twice, at store.rs:299 and store.rs:398. The old signature kept that loop in one place, so the fix traded one smell for another. Either a `record_all` helper or accepting it as it is would be fine.
+
+No Speculative Generality: `WatchFailures` and the retry state both serve behaviour that is tested.
+
+#### Spec
+
+All 183 behaviour tests pass with `--all-features`. Probes were run in a scratch copy:
+- slow looks without the Commit turn (a 20k-file flood) alongside this Store's own writes, new directories, Prefix deletes, and a File swapped for a Prefix and back
+- external edits and removals racing this Store's own Commits to the same Paths
+- a real inotify overflow (180k files from 12 threads), with directories created during it
+- chains of links: a link made over a File, a link replaced by a File, a middle link replaced or re-linked, and `rm` followed by `ln`
+- the Area root removed 20 times
+- the Store dropped while an Area is waiting to be watched again
+- the cost of reading Config at `open`, and edits made during `open`
+
+**Fixed correctly:**
+- a1: every chain case gave the right Change, and edits to old targets gave nothing.
+- a2: after a real overflow, all 180 edits in directories created during it arrived.
+- a3, c4 and c5.
+- c6: under the flood, the slowest Commit took 721 ms. With the same flood outside the Areas it took 488 ms.
+
+**Reading outside the Commit turn:** no race found, either by reading the code or by probing.
+- Across all runs, no Path changed only by this Store got an External Change, and the feed ended matching the disk.
+- `start_looking` runs before every read. Every `committed()` runs under the turn, after its writes are on disk. So if the watcher's look sees a journal, that Commit's `committed()` comes after `start_looking`, and the Commit is noted.
+
+**Watching an Area again:** dropping the Store while it waits to retry ends the feed at once. There is no storm of Resyncs: one per Area per overflow, and a failed retry sends nothing.
+
+**(c) Implemented but looks wrong**
+
+1. **New: a symlink can switch off watching for a whole Area.** The ticket says (lines 8-9): "If watching breaks … the app gets a Resync instead of silence."
+   - While an Area isn't watched (it failed at `open`, or failed to be watched again), `in_an_area` (watch.rs:741-746) returns false for its directories.
+   - So a link pointing into that Area gets `watch_outside` (703-719), on the same path notify later watches as part of the Area.
+   - When the link changes, or the Area is listed again, `unwatch_outside` (723-730) removes notify's only watch on that path.
+   - Probe: Config fails once at `open`, and `data/l.toml → config/t.toml`. Once Config is watched, retarget `l.toml`. After that, edits and new Files in `config/` give nothing, not even a Resync.
+2. **New: an unreadable Config File makes `open` fail.** store.rs:144-145 lists only two reasons for `open` to fail: "a directory can't be made, or the record of an interrupted Commit can't be read."
+   - `list` now reads Config Files with `now(...)?` (watch.rs:941-942), and `start` passes that error on (465).
+   - Probe: a `config/secret.toml` with mode 000 makes `open_fs` fail with Permission denied. At b68d6de it opened, and the same File in Data still opens.
+   - Fix: treat a read error there as `There(None)`.
+3. **c7: the app isn't told while an Area isn't watched.** README:31 says: "Every change after `open` returns is reported."
+   - An Area that can't be watched at `open` reports nothing until a retry succeeds: watch.rs:452-456 ignores the result.
+   - Probe: with Data unwatched for 3 s, an edit there produced no item.
+   - If the watch limit stays exhausted, the app never hears anything, which is exactly the silence the ticket rules out.
+   - Fix: send a Resync when watching fails at `open` too, as the retry path already does (786-787), or add a caveat at README:31.
+
+**Minor:** hashing Config takes about 1 s per 100 MB in a debug build, at every `open` and at every Config Resync. It doesn't race with edits made during `open`, because the Area is watched before it is listed; the probe matched.
+
+**(a) Missing:** nothing new. **(b) Scope creep:** none.
+
+#### Summary
+
+Standards: every earlier finding is fixed, with 0 hard violations and 5 new smells. The worst is the `Now`/`look*` naming. Spec: all the earlier fixes are verified, and no race was found in reading outside the Commit turn. The fix introduced 2 new problems and left 1 honesty gap. The worst new problem: while an Area isn't watched, a symlink pointing into it can later remove notify's only watch for that Area, which silently turns off watching for a whole Area.
+
+
+
+#### Resolution
+
+1. **Spec c1, a link switching off an Area's watch:** fixed.
+   - `Watches::area_paths` now holds every Area's canonical root from the start, whether or not
+     the Area is watched. A separate `watching` flag says which are. `in_an_area` uses the
+     paths alone, so a link into an Area that isn't watched yet never has that Area's directory
+     watched apart from it, and so never unwatches it later.
+   - `a_link_into_an_area_not_watched_yet_leaves_its_watch_alone` is the probe: Config fails
+     once at `open`, and `data/l.toml → config/t.toml`. Once Config is watched, the test
+     retargets `l.toml`, then edits `config/t.toml`, and the edit arrives. It fails with the old
+     `in_an_area`.
+2. **Spec c2, an unreadable Config File:** fixed. Listing Config treats a read error as an
+   unknown Revision (`FileState::There(None)`), and logs it at debug level.
+   `a_config_file_that_cant_be_read_doesnt_stop_the_store_opening` (Unix) opens with a mode-000
+   `config/secret.toml`.
+3. **Spec c3, silence while an Area isn't watched:** fixed.
+   - `FsWatcher::start` keeps the Areas it couldn't watch, and `open_fs` sends each a Resync
+     before it returns. Each gets another Resync once it is watched.
+   - `an_area_that_cant_be_watched_is_resynced_and_tried_again` now expects Config, Data and
+     Cache at `open`, then Data and Cache on the first retry, then Config on the second.
+   - README:31 needs no caveat: its Resync clause covers this. The watching bullet, the module
+     doc, `open_fs` and the spec say it.
+4. **Standards:** done.
+   - `Now` is now `FileState`, and `now()` is now `state_of()`. The shadowing is gone (`state`,
+     `revision`, `chain_now`, `time`).
+   - The `look*` family is now read-based:
+     - `FsWatcher::read` / `Watched::read` give `Readings`, of `AreaReading::{Changes, Missed}`,
+       each holding a `ReadFiles`.
+     - `read_names`, `read_name` and `ReadFiles::read_again`.
+     - `Reported::start_noting` / `stop_noting` / `changed_while_reading`.
+   - `ReadFiles.under` is now `listed_under`, and `everything` is now `whole_area`.
+   - `first_events_fail` in `handler`, `failures_left` in `Watches` and
+     `first_error_loses_watches` in `Watched`.
+   - `Area::ALL` is the one list of Areas. `PerArea` uses it, and so do the watcher's loops.
+   - The infallible `try_from_fn` is now `PerArea::from_fn`, and it uses the `bool` for item 3.
+   - store.rs now says Commits reach the feed "in the order they were made".
+   - A `record_all_observed` helper holds the loop `Store::commit` and SQLite's poller share.
+
+   The first Resolution said "SQLite's two callers loop". One of those two was `Store::commit`,
+   which serves every Backend: the review is right.
+
+Clippy (`--all-targets` and without) is clean with default features, `--all-features`,
+`--no-default-features`, `fs`, `sqlite` and `fs,testing`, and so are rustfmt and the public
+rustdoc. `cargo test` passes with default features, `--no-default-features` and
+`--all-features`: 185 behaviour tests. The watching and two-Store tests passed 20 runs out of 20
+alone, and 10 out of 10 with three copies of the filesystem suite running alongside.

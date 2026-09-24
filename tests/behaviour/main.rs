@@ -690,26 +690,30 @@ mod fs {
     }
 
     /// An Area that can't be watched, as when the platform's limit on watches is reached, is
-    /// tried again, waiting longer each time. The Store opens meanwhile, and the Area gets a
-    /// Resync once it is watched, since Changes to it were missed until then.
+    /// tried again, waiting longer each time. The Store opens meanwhile. The Area gets a Resync
+    /// straight away, since its Changes aren't reported, and another once it is watched, since
+    /// they were missed until then.
     #[tokio::test]
-    async fn an_area_that_cant_be_watched_is_tried_again_and_resynced_once_it_is() {
+    async fn an_area_that_cant_be_watched_is_resynced_and_tried_again() {
         let fixture = Fs::new();
-        // Each Area fails when the Store opens, and Config once more after that.
+        // Each Area fails when the Store opens, and Config once more after that. A longer window,
+        // so that the Resyncs at open are read before the retries' come.
         let failing = FailurePoint::WatchingAnAreaFails { times: 4 };
+        let window = Duration::from_millis(100);
         let Opened { store: _store, mut feed } =
-            fixture.open_with(|options| options.fail_at(failing)).await;
+            fixture.open_with(|options| options.fail_at(failing).debounce_window(window)).await;
 
         let mut resynced = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..6 {
             match next_item(&mut feed).await {
                 FeedItem::Resync(area) => resynced.push(area),
                 other => panic!("expected a Resync, got {other:?}"),
             }
         }
-        assert_eq!(resynced, [Area::Data, Area::Cache, Area::Config]);
+        use Area::*;
+        assert_eq!(resynced, [Config, Data, Cache, Data, Cache, Config]);
         assert_nothing_more(&mut feed).await;
-        for area in [Area::Config, Area::Data, Area::Cache] {
+        for area in [Config, Data, Cache] {
             fixture.write_directly(area, "seen.txt", "x");
             let batch = next_batch(&mut feed).await;
             assert_eq!(
@@ -717,6 +721,55 @@ mod fs {
                 [(area, "seen.txt", ChangeKind::Changed, Origin::External)]
             );
         }
+    }
+
+    /// A symlink in one Area can point into another. While that other Area isn't watched yet,
+    /// following the link must not watch its directory apart from it: unwatching that when the
+    /// link changes would stop the Area's own watch.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_link_into_an_area_not_watched_yet_leaves_its_watch_alone() {
+        let fixture = Fs::new();
+        fixture.write_directly(Area::Config, "t.toml", "t");
+        fixture.write_directly(Area::Config, "u.toml", "u");
+        std::fs::create_dir_all(fixture.on_disk(Area::Data, "")).unwrap();
+        let link = fixture.on_disk(Area::Data, "l.toml");
+        std::os::unix::fs::symlink(fixture.on_disk(Area::Config, "t.toml"), &link).unwrap();
+        // Config, watched first, fails once, when the Store opens.
+        let failing = FailurePoint::WatchingAnAreaFails { times: 1 };
+        let Opened { store: _store, mut feed } =
+            fixture.open_with(|options| options.fail_at(failing)).await;
+        assert_eq!(next_item(&mut feed).await, FeedItem::Resync(Area::Config));
+        // Watched again after a window.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(next_item(&mut feed).await, FeedItem::Resync(Area::Config));
+        assert_nothing_more(&mut feed).await;
+
+        let new_link = fixture.on_disk(Area::Data, "new link");
+        std::os::unix::fs::symlink(fixture.on_disk(Area::Config, "u.toml"), &new_link).unwrap();
+        std::fs::rename(&new_link, &link).unwrap();
+        assert_eq!(changes(&next_batch(&mut feed).await), [("l.toml", ChangeKind::Changed)]);
+        fixture.write_directly(Area::Config, "t.toml", "t, edited");
+        assert_eq!(
+            changes_in_full(&next_batch(&mut feed).await),
+            [(Area::Config, "t.toml", ChangeKind::Changed, Origin::External)],
+        );
+    }
+
+    /// A Config File the Store can't read doesn't stop it opening. Its Revision isn't known, so
+    /// events for it are reported.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_config_file_that_cant_be_read_doesnt_stop_the_store_opening() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fs::new();
+        fixture.write_directly(Area::Config, "secret.toml", "secret");
+        let secret = fixture.on_disk(Area::Config, "secret.toml");
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let Opened { store: _store, mut feed } = fixture.open().await;
+        fixture.write_directly(Area::Config, "settings.toml", "a = 1\n");
+        assert_eq!(changes(&next_batch(&mut feed).await), [("settings.toml", ChangeKind::Changed)]);
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     /// Something on disk that isn't a File can have the name of a File a Commit writes, or of a

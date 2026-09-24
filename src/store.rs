@@ -136,8 +136,9 @@ impl Store {
     /// batch, but can be split while events keep coming, and it can arrive after this Store's own
     /// next Commit. If watching fails, or an Area's directory is removed (it is then made again),
     /// the Area gets a Resync. An Area that can't be watched, as once the platform's limit on
-    /// watches is reached, is tried again, waiting longer each time, and gets a Resync once it is
-    /// watched: the Store opens meanwhile.
+    /// watches is reached, gets a Resync straight away, since its Changes aren't reported. It is
+    /// tried again, waiting longer each time, and gets another Resync once it is watched: the
+    /// Store opens meanwhile.
     ///
     /// The filesystem has no Snapshots: see [`supports_snapshots`](Self::supports_snapshots).
     ///
@@ -151,6 +152,9 @@ impl Store {
     pub async fn open_fs(app: &AppIdentity, options: FsOptions) -> Result<(Store, ChangeFeed)> {
         let (backend, watcher) = FsBackend::open(app, options).await?;
         Ok(Store::open(Backend::Fs(backend), |feed, commit_order| {
+            for area in watcher.unwatched() {
+                feed.resync(*area);
+            }
             let watching = watch_areas(watcher, feed.clone(), Arc::clone(commit_order));
             Some(supervise("watching the Areas' directories", watching, feed))
         }))
@@ -253,7 +257,7 @@ impl Store {
     /// wouldn't change the File's contents is left out, so the File keeps its time and no Change
     /// is sent for it. The Changes arrive on the Change feed in the same batch, and a Commit
     /// that changes nothing sends none. This Store's Commits reach the feed in the order they were
-    /// applied. On SQLite, other Stores' Commits do too, in order with this Store's. On the
+    /// made. On SQLite, other Stores' Commits do too, in order with this Store's. On the
     /// filesystem, they arrive once their events have settled, so this Store's own next Commit
     /// can reach the feed first (see [`open_fs`](Self::open_fs)).
     /// On success, gives the timestamp and the new Revisions.
@@ -296,9 +300,7 @@ impl Store {
             let timestamp = Timestamp::now();
             let request = CommitRequest { timestamp, staged: staging.into_staged() };
             let outcome = inner.backend.commit(request).await?;
-            for observed in outcome.observed_before {
-                record_observed(&inner.feed, area, observed);
-            }
+            record_all_observed(&inner.feed, area, outcome.observed_before);
             inner.feed.record(area, outcome.changes, Origin::Local);
             if outcome.pending {
                 return Err(Error::Pending);
@@ -329,6 +331,13 @@ fn record_observed(feed: &FeedSender, area: Area, observed: Observed) {
     match observed {
         Observed::Changes { origin, changes } => feed.record(area, changes, origin),
         Observed::Missed => feed.resync(area),
+    }
+}
+
+/// Records each of `observed`, in order, as [`record_observed`] does.
+fn record_all_observed(feed: &FeedSender, area: Area, observed: Vec<Observed>) {
+    for observed in observed {
+        record_observed(feed, area, observed);
     }
 }
 
@@ -372,9 +381,9 @@ fn supervise(
 #[cfg(feature = "fs")]
 async fn watch_areas(mut watcher: FsWatcher, feed: FeedSender, commit_order: Arc<Mutex<()>>) {
     while let Some(burst) = watcher.next_burst().await {
-        let looks = watcher.look(burst).await;
+        let readings = watcher.read(burst).await;
         let _turn = commit_order.lock().await;
-        for (area, observed) in watcher.conclude(looks).await {
+        for (area, observed) in watcher.conclude(readings).await {
             record_observed(&feed, area, observed);
         }
     }
@@ -395,9 +404,7 @@ async fn follow_other_stores(poller: SqlitePoller, feed: FeedSender, commit_orde
             match poller.read(area).await {
                 Ok(observed) => {
                     failing.retain(|failed| *failed != area);
-                    for observed in observed {
-                        record_observed(&feed, area, observed);
-                    }
+                    record_all_observed(&feed, area, observed);
                 }
                 Err(error) => {
                     tracing::debug!("reading the change log of {area:?} failed: {error}");

@@ -125,3 +125,7 @@ silence.
   made at all. `FailurePoint::WatchingAnAreaFails { times }` tests it, and `WatchingFails` now
   also loses the Area's watches.
 - Config's Files are read when the Store opens, so identical rewrites there are dropped.
+- After the re-review: an Area that can't be watched at `open` gets a Resync straight away
+  too; a directory in an Area is never watched apart from it for a symlink, even while the Area
+  isn't watched; and a Config File that can't be read is listed with no known Revision rather
+  than stopping `open`.

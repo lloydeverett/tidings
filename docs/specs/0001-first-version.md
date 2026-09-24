@@ -391,8 +391,8 @@ other difference is *external*.
     Directories are watched under their own names only, not through symlinks to directories.
   - After a Resync for lost events or a failure, the Area is watched again from its root, since
     the platform's watcher may have lost watches. An Area that can't be watched, when the Store
-    opens or later, is tried again with a growing wait, and gets a Resync once it is watched: the
-    Store opens anyway.
+    opens or later, gets a Resync, is tried again with a growing wait, and gets another Resync
+    once it is watched: the Store opens anyway.
 
 ### SQLite Backend
 
