@@ -36,8 +36,8 @@ pub(crate) struct Staged {
     /// None is ever dropped: a later write or delete replaces the action for a Path, but not what
     /// the Staging required of it.
     preconditions: Vec<(Path, Precondition)>,
-    /// Each Prefix that must be unchanged since a Prefix Revision.
-    prefix_preconditions: Vec<(Prefix, PrefixRevision)>,
+    /// Each Prefix Revision everything under its Prefix must be unchanged since.
+    prefix_preconditions: Vec<PrefixRevision>,
 }
 
 /// What a Staging does to one Path.
@@ -178,7 +178,7 @@ impl Staging {
             "{prefix_revision:?} can't be required for {area:?} {prefix:?}: it was taken for another \
              Area or Prefix",
         );
-        self.staged.prefix_preconditions.push((prefix, prefix_revision));
+        self.staged.prefix_preconditions.push(prefix_revision);
         Ok(self)
     }
 
@@ -201,9 +201,9 @@ impl Staged {
         }
     }
 
-    /// Checks every Precondition against `current`, the Area as it is when the Commit runs. A Backend calls
-    /// this under its lock, before it writes anything. Gives [`Error::Conflict`] with every Path
-    /// where a Precondition fails. A Staging with no Preconditions reads nothing.
+    /// Checks every Precondition against `current`, the Area as it is when the Commit runs. A
+    /// Backend calls this under its lock, before it writes anything. Gives [`Error::Conflict`]
+    /// with every Path where a Precondition fails. A Staging with no Preconditions reads nothing.
     pub(crate) fn check_preconditions(&self, current: &impl AreaState) -> Result<()> {
         let mut conflicts = BTreeSet::new();
         for (path, precondition) in &self.preconditions {
@@ -211,9 +211,8 @@ impl Staged {
                 conflicts.insert(path.clone());
             }
         }
-        for (prefix, prefix_revision) in &self.prefix_preconditions {
-            let files = current.revisions_under(prefix)?;
-            let now = PrefixRevision::of(self.area, prefix.clone(), files);
+        for prefix_revision in &self.prefix_preconditions {
+            let now = current.revisions_under(prefix_revision.prefix())?;
             conflicts.extend(prefix_revision.differences(&now));
         }
         if conflicts.is_empty() {
@@ -257,7 +256,7 @@ impl Staged {
         if written.peek().is_none() {
             return Ok(());
         }
-        let fold = |name: &str| letter_case_fold(name.strip_suffix('/').unwrap_or(name));
+        let fold = |name: &str| letter_case_fold(without_trailing_slash(name));
         let deleted = |path: &Path| matches!(self.actions.get(path), Some(Action::Delete));
         let mut names = HashMap::new();
         for path in existing.into_iter().filter(|path| !deleted(path)) {
@@ -275,7 +274,7 @@ impl Staged {
                     Entry::Occupied(other) if *other.get() == name => continue,
                     Entry::Occupied(other) => *other.get(),
                 };
-                let reason = if other.trim_end_matches('/') == name.trim_end_matches('/') {
+                let reason = if without_trailing_slash(other) == without_trailing_slash(name) {
                     InvalidPathReason::FileUnderFile
                 } else {
                     InvalidPathReason::LetterCaseClash
@@ -285,6 +284,12 @@ impl Staged {
         }
         Ok(())
     }
+}
+
+/// `name` without the `/` that ends it if it is a Prefix, so that a Prefix and a Path of the
+/// same name compare equal.
+fn without_trailing_slash(name: &str) -> &str {
+    name.strip_suffix('/').unwrap_or(name)
 }
 
 /// Each Prefix `path` is under, other than the empty one, then `path` itself. For `a/b/c.txt`,

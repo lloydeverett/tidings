@@ -60,7 +60,8 @@ _Avoid_: version, etag, last_modified (that is a timestamp, not a Revision)
 
 **Prefix Revision**:
 An opaque value identifying the state of everything under a Prefix: which Paths exist there and the
-Revision of each. It changes if a File under the Prefix is added, removed or changed.
+Revision of each. It changes if a File under the Prefix is added, removed or changed. It belongs to
+one Area and one Prefix, and can only be required for those.
 _Avoid_: token, digest, listing hash
 
 **Snapshot**:

@@ -865,6 +865,25 @@ pub async fn a_file_cannot_be_under_another_file(fixture: &impl Fixture) {
             other => panic!("{paths:?} should be refused for {expected:?}, got {other:?}"),
         }
     }
+
+    // A Path staged again after a Prefix delete keeps the Prefix there.
+    let mut staging = Staging::new(Area::Data);
+    staging.delete_prefix("d/").unwrap();
+    staging.write("d/e", "e").unwrap();
+    staging.write("d", "d").unwrap();
+    match store.commit(staging).await {
+        Err(Error::InvalidPath { path, reason: FileUnderFile }) => {
+            assert!(["d", "d/e"].contains(&path.as_str()), "refused for {path:?}");
+        }
+        other => panic!("`d` beside a re-staged `d/e` should be refused, got {other:?}"),
+    }
+
+    // Preconditions are checked first, so a Commit that also breaks one is a Conflict.
+    let mut staging = Staging::new(Area::Data);
+    staging.require("a", Precondition::Absent).unwrap();
+    staging.write("a/b", "clash").unwrap();
+    assert_conflict(store.commit(staging).await, &["a"]);
+
     assert_eq!(list(&store, Area::Data, "").await, ["a", "d/e"]);
     assert_nothing_more(&mut feed).await;
 

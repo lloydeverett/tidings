@@ -454,3 +454,110 @@ Standards: 0 hard violations and 5 judgement calls. The most notable is naming d
 Clippy (all targets, with default features and with `--all-features`) is clean. `cargo test`
 passes with default features, `--no-default-features` and `--all-features`: 32 behaviour tests
 and 5 path tests.
+
+### Re-review (after the fix commit 614050e)
+
+The fixes added a new rule (a File can't sit under another File), a panic when `require_prefix` gets a mismatched Prefix Revision, and changes to the spec, the ADR and the glossary. That was substantial enough for a second two-axis review of `git diff edca4b7...614050e`.
+
+#### Standards
+
+`cargo test --all-features` passes: 32 behaviour tests and 5 path tests.
+
+#### Were the claimed fixes made?
+
+All four claimed fixes were made correctly:
+- **Standards 1:** `names_in` is now `prefixes_and_path` (src/staging.rs:~291).
+- **Standards 3:** `requirements`, `prefix_requirements` and `add_requirement` are now `preconditions`, `prefix_preconditions` and `add_precondition` (staging.rs:38-40, 197). The precondition.rs doc now says a *Staging* requires it.
+- **Standards 2:** `letter_case_key` is now `letter_case_fold` (path.rs:117). No "key" is left in src.
+- **Standards 4 and 5:** leaving these was reasonable.
+
+#### Hard violations of documented standards
+
+None.
+- **Spec Testing Decisions:** the two new tests (suite.rs:830, :882) use only the public API. The `catch_unwind` checks the documented panic and does not inspect internal state.
+- **Spec "one `#[non_exhaustive]` error type":** met. `FileUnderFile` is a new variant of the non-exhaustive `InvalidPathReason` (path.rs:152). The panic in `require_prefix` (staging.rs:176) is a behaviour choice, so it belongs to the Spec axis. It is documented under `# Panics`, and the spec already accepts panics for misuse (the blocking API), so it doesn't breach a standard.
+- **CONTEXT.md, ADR 0004, spec and ticket 07:** all updated in step with the code.
+
+#### Baseline smells (all judgement calls)
+
+1. **Possible duplicated data (new):** src/staging.rs:40 `prefix_preconditions: Vec<(Prefix, PrefixRevision)>`. The `PrefixRevision` now carries its own `prefix` (revision.rs:44-45), and `require_prefix` asserts the two are equal, so the tuple's `Prefix` is redundant. `check_preconditions` then clones it back in (staging.rs:216 `PrefixRevision::of(self.area, prefix.clone(), files)`). Fix: make it `Vec<PrefixRevision>` and ask the `PrefixRevision` for its prefix.
+2. **Minor Duplicated Code / inconsistency:** the same idea, a name without the `/` that ends a Prefix, is written two ways:
+   - staging.rs:260 `name.strip_suffix('/').unwrap_or(name)`
+   - staging.rs:278 `other.trim_end_matches('/') == name.trim_end_matches('/')`
+
+   They behave the same today, because no name contains `//`. One small helper would stop them drifting apart.
+3. **Weak Data Clump:** `(Area, Prefix)` now travels together in several places. It's local, so low priority.
+   - `PrefixRevision::of(area, prefix, …)` (revision.rs:55)
+   - `is_for(area, prefix)` (:67)
+   - the tuples used for equality and hashing (:89, :97)
+   - `stat_prefix(area, prefix)`
+4. **Glossary note, not a breach:** "directory" appears in path.rs:151 and suite.rs:838. It means the *filesystem's* directory, not a Prefix, which is consistent with CONTEXT.md's "Directories exist only as Prefixes". Leave it.
+5. **Cosmetic:** after the `current` rename, the doc comment at staging.rs:204 runs past the wrap width used in the rest of the file. rustfmt doesn't wrap comments, so no tool catches this.
+
+**Summary:** 0 hard violations. The 4 claimed naming fixes are all present and correct. The fix introduced 3 small judgement calls, the most notable being the duplicated Prefix in `prefix_preconditions` (item 1).
+
+#### Spec
+
+`cargo test --all-features` passes: 32 behaviour tests and 5 path tests. Every item the Resolution claims to have fixed was checked and holds. 9 throwaway probes were run, and all behaved correctly.
+
+**(a) Missing or partial**
+
+1. Spec line 269 says "`InvalidPath`: includes letter-case clashes." The fix updated spec lines 229, 306 and 355 but not this one, so it still doesn't mention `FileUnderFile`. Minor doc drift.
+2. CONTEXT.md:61-63 (Prefix Revision) still doesn't say that a Prefix Revision belongs to one Area and one Prefix. The rustdoc says so, but the glossary doesn't.
+
+**(b) Scope creep:** none.
+
+**(c) Implemented but possibly wrong**
+
+1. **The panic in `require_prefix`** (staging.rs:176-180) **is consistent with the spec:**
+   - The spec's error list ("`InvalidPath`, `NotText`, `Conflict`, `Pending`, `Unsupported` and `Backend`") has nothing that fits.
+   - US42's "clear InvalidPath error if one is not allowed" is about a Path or Prefix that isn't allowed. Here the Prefix is valid, so `InvalidPath` would be the wrong error.
+   - The spec already panics on programmer error in the app: US62 asks for "a clear panic if I call the blocking API from inside an async runtime".
+   - Taking the Prefix from the Prefix Revision instead would conflict with the spec's named `require_prefix(prefix, prefix_revision)`, and wouldn't cover a mismatched Area.
+   - The panic message is clear (probe 9).
+   - Gap left open, not worth fixing: a Prefix Revision taken from another Store, with the same Area and Prefix, still gives a misleading Conflict (probe 8). It can't be detected without a Store identity.
+2. **The FileUnderFile rule is correct in every edge case probed:**
+   - `delete_prefix("d/")`, then re-staging `write("d/e")`, then `write("d")` gives FileUnderFile, because the re-staged write keeps `d/` alive.
+   - A new `d/f` staged after the Prefix delete gives FileUnderFile.
+   - `delete("d")` replaced by a later `write("d")`, alongside `d/x`, gives FileUnderFile.
+   - `delete_prefix("")` followed by writes to `q` and `q/r` gives FileUnderFile.
+   - Writing `a/b` when `a/b/c` exists gives FileUnderFile. Writing `A/B` gives LetterCaseClash.
+   - A failed Precondition together with a FileUnderFile Path gives `Conflict`, as the Notes say.
+   - `delete_requiring(d/e, UnchangedSince)` plus `write(d)` succeeds when the Precondition holds.
+
+   **Test gaps** in `a_file_cannot_be_under_another_file` (suite.rs:830-880):
+   - Nothing tests the order the Notes claim: "Preconditions are checked first, so a Commit that breaks both gives `Conflict`". The letter-case test doesn't either. Tickets 07 and 09 will write their own commit paths, and the shared suite is the only thing that would pin them to this order. Add one case.
+   - A Path re-staged under a `delete_prefix`, which keeps the Prefix alive (the first case above), isn't covered.
+3. **Heads-up for ticket 09** (not a defect here, a later ticket owns it). The new move cases in the test (`a` to `a/b`, and `d/e` to `d`) mean the filesystem journal must remove the file `a` before creating the directory `a/`, and remove the emptied directory `d/` before renaming onto `d`. Ticket 09's checklist doesn't mention this. ADR 0004 made the rule to stop filesystem Commits failing partway, so this deserves a checkbox there.
+
+**Verdict:** every Resolution item is fixed correctly, and the panic is the right choice under the spec. What remains is two lines of doc drift and two missing test cases.
+
+#### Summary
+
+Standards: 0 hard violations and 3 small new judgement calls. The worst is that the Prefix is duplicated in `prefix_preconditions`. Spec: every fix verified, plus 2 lines of doc drift and 2 missing test cases. The worst is that no test holds later Backends to checking Preconditions before refusing clashing Paths.
+
+
+#### Resolution
+
+1. **Test gaps:** fixed in `a_file_cannot_be_under_another_file`.
+   - A new case has a failed `require(.., Absent)` together with a File-under-File write, and
+     expects `Conflict`. I checked that it fails if the memory Backend refuses clashing Paths
+     before checking Preconditions.
+   - Another new case stages `delete_prefix("d/")`, then `write("d/e")` again, then `write("d")`,
+     and expects `FileUnderFile`.
+2. **Doc drift:** fixed. The spec's `InvalidPath` line now mentions a File under another File.
+   The CONTEXT.md Prefix Revision entry says it belongs to one Area and one Prefix.
+3. **Standards 1, the duplicated Prefix:** fixed. `prefix_preconditions` is now
+   `Vec<PrefixRevision>`, and the check asks each one for its Prefix. `PrefixRevision::differences`
+   now takes the current Files directly and hashes them with a shared `hash` helper, so nothing
+   is cloned to build a second Prefix Revision.
+4. **Standards 2:** fixed. One helper, `without_trailing_slash`, is used in both places.
+5. **Standards 5:** fixed. The doc comment on `check_preconditions` is re-wrapped.
+6. **Ticket 09:** it has a new unticked checkbox. The journal must remove the file `a` before
+   creating the directory `a/`, and remove the emptied directory `d/` before renaming onto `d`.
+
+Left as the coordinator asked: the `(Area, Prefix)` clump.
+
+Clippy (all targets, with default features and with `--all-features`) is clean. `cargo test`
+passes with default features, `--no-default-features` and `--all-features`: 32 behaviour tests
+and 5 path tests.

@@ -266,7 +266,8 @@ SQLite database per Area, or in memory.
   - `Conflict { paths }`: nothing was written. For a failed Prefix Precondition, the paths are the
     ones under the Prefix that were added, removed or changed.
   - `Pending`: decided but not fully applied.
-  - `InvalidPath`: includes letter-case clashes.
+  - `InvalidPath`: includes letter-case clashes, and a File under another File (`a` beside
+    `a/b`).
   - `Backend`.
 - **Revision**: opaque to the app. On every Backend it is a hash of the File's contents, using a
   fast, established 128-bit hash chosen during implementation. The same hash detects writes and

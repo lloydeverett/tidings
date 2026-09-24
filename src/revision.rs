@@ -53,14 +53,12 @@ pub struct PrefixRevision {
 impl PrefixRevision {
     /// The Prefix Revision of `prefix` in `area`, given the Files under it in order of Path.
     pub(crate) fn of(area: Area, prefix: Prefix, files: Vec<(Path, Revision)>) -> PrefixRevision {
-        let mut hasher = Xxh3::new();
-        for (path, revision) in &files {
-            hasher.update(path.as_str().as_bytes());
-            // A Path can't contain a NUL, so it ends the Path unambiguously.
-            hasher.update(&[0]);
-            hasher.update(&revision.0.to_le_bytes());
-        }
-        PrefixRevision { area, prefix, hash: hasher.digest128(), files: files.into() }
+        PrefixRevision { area, prefix, hash: hash(&files), files: files.into() }
+    }
+
+    /// The Prefix it was taken for.
+    pub(crate) fn prefix(&self) -> &Prefix {
+        &self.prefix
     }
 
     /// Whether it was taken for `prefix` in `area`.
@@ -68,21 +66,34 @@ impl PrefixRevision {
         self.area == area && self.prefix == *prefix
     }
 
-    /// The Paths added, removed or changed between `self` and `now`.
-    pub(crate) fn differences<'a>(&'a self, now: &'a PrefixRevision) -> BTreeSet<Path> {
-        if self == now {
+    /// The Paths added, removed or changed since, given the Files under its Prefix now, in order
+    /// of Path.
+    pub(crate) fn differences<'a>(&'a self, now: &'a [(Path, Revision)]) -> BTreeSet<Path> {
+        if hash(now) == self.hash {
             return BTreeSet::new();
         }
         let by_path = |files: &'a [(Path, Revision)]| -> BTreeMap<&'a Path, &'a Revision> {
             files.iter().map(|(path, revision)| (path, revision)).collect()
         };
-        let (before, after) = (by_path(&self.files), by_path(&now.files));
+        let (before, after) = (by_path(&self.files), by_path(now));
         let paths = before.keys().chain(after.keys());
         paths
             .filter(|path| before.get(*path) != after.get(*path))
             .map(|path| (*path).clone())
             .collect()
     }
+}
+
+/// A 128-bit hash (XXH3) over each of `files` and its Revision, given in order of Path.
+fn hash(files: &[(Path, Revision)]) -> u128 {
+    let mut hasher = Xxh3::new();
+    for (path, revision) in files {
+        hasher.update(path.as_str().as_bytes());
+        // A Path can't contain a NUL, so it ends the Path unambiguously.
+        hasher.update(&[0]);
+        hasher.update(&revision.0.to_le_bytes());
+    }
+    hasher.digest128()
 }
 
 impl PartialEq for PrefixRevision {

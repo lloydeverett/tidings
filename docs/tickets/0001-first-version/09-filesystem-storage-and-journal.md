@@ -25,6 +25,10 @@ through the link. Snapshots are refused. The whole shared suite passes, except t
       - the journal written as `prepared`, then `committed`, each time with `atomic-write-file`;
       - temporary files next to their targets, forced to disk;
       - renames, then the journal removed.
+- [ ] The journal applies moves between a File and a Prefix of the same name, which the shared
+      suite makes (`a_file_cannot_be_under_another_file`): the file `a` is removed before the
+      directory `a/` is created for `a/b`, and the emptied directory `d/` is removed before a
+      File is renamed onto `d`.
 - [ ] Opening a Store finishes a `committed` journal left behind, and discards a `prepared` one.
       This ticket covers the basic case; ticket 10 covers every interruption point.
 - [ ] Each File's modification time on disk is set to the Commit's timestamp.
