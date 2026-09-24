@@ -111,14 +111,7 @@ impl Store {
     /// Opens a Store that keeps its Files in memory, for tests and short-lived data. Returns the
     /// Store together with its one Change feed.
     pub fn open_memory() -> (Store, ChangeFeed) {
-        let (feed, change_feed) = change::feed();
-        let inner = Inner {
-            backend: Backend::Memory(MemoryBackend::default()),
-            feed,
-            commit_order: Arc::default(),
-            following: None,
-        };
-        (Store { inner: Arc::new(inner) }, change_feed)
+        Store::open(Backend::Memory(MemoryBackend::default()), |_, _| None)
     }
 
     /// Opens a Store that keeps each Area in a SQLite database of its own, in the Area's standard
@@ -141,17 +134,23 @@ impl Store {
         options: SqliteOptions,
     ) -> Result<(Store, ChangeFeed)> {
         let (backend, poller) = SqliteBackend::open(app, options).await?;
+        Ok(Store::open(Backend::Sqlite(backend), |feed, commit_order| {
+            Some(start_following_other_stores(poller, feed, commit_order))
+        }))
+    }
+
+    /// Opens a Store on `backend`, with its Change feed. `follow` starts the task that follows
+    /// other Stores' Commits, if the Backend has one, given the Store's end of the feed and its
+    /// turn with Commits. The Store stops the task when it is dropped.
+    fn open(
+        backend: Backend,
+        follow: impl FnOnce(&FeedSender, &Arc<Mutex<()>>) -> Option<AbortHandle>,
+    ) -> (Store, ChangeFeed) {
         let (feed, change_feed) = change::feed();
         let commit_order = Arc::default();
-        let following =
-            tokio::spawn(follow_other_stores(poller, feed.clone(), Arc::clone(&commit_order)));
-        let inner = Inner {
-            backend: Backend::Sqlite(backend),
-            feed,
-            commit_order,
-            following: Some(following.abort_handle()),
-        };
-        Ok((Store { inner: Arc::new(inner) }, change_feed))
+        let following = follow(&feed, &commit_order);
+        let inner = Inner { backend, feed, commit_order, following };
+        (Store { inner: Arc::new(inner) }, change_feed)
     }
 
     /// Reads the File at `path` in `area`, or gives `Ok(None)` if there is none.
@@ -245,7 +244,7 @@ impl Store {
             let timestamp = Timestamp::now();
             let request = CommitRequest { timestamp, staged: staging.into_staged() };
             let outcome = inner.backend.commit(request).await?;
-            record_observed(&inner.feed, area, outcome.before);
+            record_observed(&inner.feed, area, outcome.observed_before);
             inner.feed.record(area, outcome.changes, Origin::Local);
             Ok(Committed::new(timestamp, outcome.revisions))
         };
@@ -278,6 +277,32 @@ fn record_observed(feed: &FeedSender, area: Area, observed: Vec<Observed>) {
     }
 }
 
+/// Starts the task that follows other Stores' Commits to the SQLite databases, and gives the handle
+/// that stops it.
+///
+/// If the task panics, their Changes stop arriving, so a second task, which waits for it, sends a
+/// Resync for every Area. When the Store stops the task, it sends nothing.
+#[cfg(feature = "sqlite")]
+fn start_following_other_stores(
+    poller: SqlitePoller,
+    feed: &FeedSender,
+    commit_order: &Arc<Mutex<()>>,
+) -> AbortHandle {
+    let following =
+        tokio::spawn(follow_other_stores(poller, feed.clone(), Arc::clone(commit_order)));
+    let stopping = following.abort_handle();
+    let feed = feed.clone();
+    tokio::spawn(async move {
+        if let Err(ended) = following.await
+            && ended.is_panic()
+        {
+            tracing::debug!("following other Stores' Commits panicked: {ended}");
+            feed.resync_every_area();
+        }
+    });
+    stopping
+}
+
 /// Records other Stores' Commits to the SQLite databases as the poller notices them, until the
 /// Store is dropped and stops it. It holds only the Store's end of the Change feed and its turn
 /// with Commits, not the Store, so that the feed still ends.
@@ -295,10 +320,12 @@ async fn follow_other_stores(poller: SqlitePoller, feed: FeedSender, commit_orde
                     failing.retain(|failed| *failed != area);
                     record_observed(&feed, area, observed);
                 }
-                Err(_) if failing.contains(&area) => {}
-                Err(_) => {
-                    failing.push(area);
-                    feed.resync(area);
+                Err(error) => {
+                    tracing::debug!("reading the change log of {area:?} failed: {error}");
+                    if !failing.contains(&area) {
+                        failing.push(area);
+                        feed.resync(area);
+                    }
                 }
             }
         }

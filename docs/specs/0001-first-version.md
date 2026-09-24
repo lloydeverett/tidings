@@ -245,7 +245,8 @@ SQLite database per Area, or in memory.
     - Choosing each Commit's timestamp (one `jiff::Timestamp` for the whole Commit).
     - Holding back external events for the debounce window and merging them.
     - Merging Changes that haven't been read yet.
-    - Tagging each Change with its Origin.
+    - Tagging each Change with its Origin, except where a Backend's change log already says it
+      (see below).
     - Letting a cancelled Commit finish: once started, a Commit continues in a background task.
 - **Staging**: an owned value for one Area, built independently of the Store. It holds:
   - writes: a Path, the new contents, and a Precondition that defaults to *any*;
@@ -315,8 +316,11 @@ Backends are private to the crate (not a public trait). Each Backend provides:
 - a stream of the raw changes it observes, each with its Revision (or *removed*), plus signals that
   watching failed or an Area root vanished.
 
-The Store tags a raw change as *local* when it matches a Commit this Store made, and *external*
-otherwise.
+A Change's Origin is decided where the knowledge is. The Store layer tags the Changes of its own
+Commits *local*. A Backend that reads other Stores' Commits from a change log (SQLite) knows which
+Store instance wrote each one, and gives its Origin with it. For raw changes a Backend observes
+without knowing who made them (the filesystem's watcher), the Store tags one *local* when it
+matches a Commit this Store made, and *external* otherwise.
 
 ### Filesystem Backend
 

@@ -27,6 +27,7 @@ rusqlite = { version = "0.40.2", features = ["bundled"], optional = true }
 sanitize-filename = "0.6.0"
 thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["rt", "sync"] }
+tracing = "0.1.44"
 unicode-normalization = "0.1.25"
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 

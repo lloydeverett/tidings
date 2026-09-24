@@ -24,16 +24,17 @@
 //! - **Pruning.** Each Commit removes the Commits in the log that are older than the retention
 //!   (10 minutes, by their timestamps, so by the wall clock), and records how far the log was
 //!   pruned. A Store that finds it was pruned past the last Commit it read has missed Changes, and
-//!   sends a Resync for the Area. Only a Store that stopped for longer than the retention, while
-//!   others committed, is behind by that much, so the log stays small without keeping track of
-//!   which Stores are open.
+//!   sends a Resync for the Area. That happens to a Store that stopped for longer than the
+//!   retention while others committed, and to Stores that haven't read the latest Commits when
+//!   the wall clock jumps forward by more than it. Either way the Resync is true, and the log
+//!   stays small without keeping track of which Stores are open.
 //!
 //! The Store reads and commits through one connection per Area. A Snapshot is a read transaction
 //! on a connection of its own, which in WAL mode neither waits for Commits nor holds them up.
 //! Every call into SQLite blocks, so each runs on tokio's blocking threads.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use jiff::Timestamp;
@@ -142,6 +143,13 @@ const MIGRATIONS: &[&str] = &[
 /// The name in `meta` of the versions of the Unicode data the folds in `files` were made with.
 const FOLD_UNICODE_VERSIONS: &str = "fold_unicode_versions";
 
+/// The name in `meta` of the number of the last Store instance opened on the database. The second
+/// migration adds it.
+const LAST_STORE: &str = "last_store";
+
+/// The name in `meta` of the last Commit pruned from the change log. The second migration adds it.
+const CHANGE_LOG_PRUNED_THROUGH: &str = "change_log_pruned_through";
+
 /// How long a Commit waits for another process's Commit to the same database to finish, before it
 /// fails.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -153,11 +161,17 @@ pub(crate) struct SqliteBackend {
     change_log_retention: Duration,
 }
 
-/// One Area's database, the connection the Store reads and commits through, and how far the
-/// Store has read the database's change log.
+/// One Area's database, and the Store's connection to it.
 #[derive(Debug)]
 struct Database {
     path: PathBuf,
+    store: StoreConnection,
+}
+
+/// The connection the Store reads and commits through for one Area, and how far the Store has
+/// read the Area's change log. The poller shares it.
+#[derive(Debug, Clone)]
+struct StoreConnection {
     connection: AreaConnection,
     log: Arc<Mutex<LogReader>>,
 }
@@ -165,6 +179,9 @@ struct Database {
 /// How far a Store has read an Area's change log. It is used with the Store's connection locked,
 /// and moved on under the Store layer's `commit_order` lock, which the Store holds until what was
 /// read is recorded on the Change feed.
+///
+/// A panic while it is locked leaves it as it was, since it changes only once a transaction is
+/// committed, so the lock is taken with [`LogReader::lock`], which carries on after one.
 #[derive(Debug)]
 struct LogReader {
     /// This Store, as the log names the Commits it made: a number no other Store opened on the
@@ -180,7 +197,7 @@ struct LogReader {
 /// Notices the Commits other Stores make to a Store's databases, by polling them.
 #[derive(Debug)]
 pub(crate) struct SqlitePoller {
-    areas: PerArea<(AreaConnection, Arc<Mutex<LogReader>>)>,
+    areas: PerArea<StoreConnection>,
     interval: Duration,
 }
 
@@ -209,33 +226,31 @@ impl SqliteBackend {
                 let path = directory.join(format!("{}.sqlite3", area.name()));
                 let (connection, log) = open_database(&path)?;
                 let connection = AreaConnection::new(connection);
-                Ok(Database { path, connection, log: Arc::new(Mutex::new(log)) })
+                let log = Arc::new(Mutex::new(log));
+                Ok(Database { path, store: StoreConnection { connection, log } })
             })
         })
         .await?;
-        let polled = PerArea::try_from_fn(|area| {
-            let database = areas.get(area);
-            Ok((database.connection.clone(), Arc::clone(&database.log)))
-        })?;
+        let polled = PerArea::try_from_fn(|area| Ok(areas.get(area).store.clone()))?;
         let poller = SqlitePoller { areas: polled, interval: options.poll_interval };
         Ok((SqliteBackend { areas, change_log_retention: options.change_log_retention }, poller))
     }
 
     pub(crate) async fn read(&self, area: Area, path: &Path) -> Result<Option<File>> {
-        self.areas.get(area).connection.read(path).await
+        self.areas.get(area).store.connection.read(path).await
     }
 
     pub(crate) async fn stat(&self, area: Area, path: &Path) -> Result<Option<Stat>> {
-        self.areas.get(area).connection.stat(path).await
+        self.areas.get(area).store.connection.stat(path).await
     }
 
     pub(crate) async fn list(&self, area: Area, prefix: &Prefix) -> Result<Vec<Path>> {
-        self.areas.get(area).connection.list(prefix).await
+        self.areas.get(area).store.connection.list(prefix).await
     }
 
     pub(crate) async fn stat_prefix(&self, area: Area, prefix: &Prefix) -> Result<PrefixRevision> {
         let prefix = prefix.clone();
-        let connection = &self.areas.get(area).connection;
+        let connection = &self.areas.get(area).store.connection;
         connection
             .call(move |connection| {
                 let files = AreaInDatabase(connection).revisions_under(&prefix)?;
@@ -265,38 +280,64 @@ impl SqliteBackend {
     /// transaction also reads what other Stores committed before it, appends the Commit to the
     /// change log and prunes the log.
     pub(crate) async fn commit(&self, request: CommitRequest) -> Result<CommitOutcome> {
-        let database = self.areas.get(request.staged.area);
-        let log = Arc::clone(&database.log);
         let retention = self.change_log_retention;
-        database
-            .connection
+        let store = &self.areas.get(request.staged.area).store;
+        let committing = move |transaction: &Connection, this_store| {
+            let timestamp = request.timestamp;
+            let plan = request.plan(&AreaInDatabase(transaction))?;
+            let outcome = plan
+                .apply(|path, planned| apply(transaction, path, planned).map_err(Error::backend))?;
+            if outcome.changes.is_empty() {
+                return Ok((outcome, None));
+            }
+            let appended = append_to_log(transaction, this_store, timestamp, &outcome.changes)
+                .map_err(Error::backend)?;
+            prune_log(transaction, timestamp, retention).map_err(Error::backend)?;
+            Ok((outcome, Some(appended)))
+        };
+        let (observed_before, mut outcome) =
+            store.read_log_and(TransactionBehavior::Immediate, committing).await?;
+        outcome.observed_before = observed_before;
+        Ok(outcome)
+    }
+}
+
+impl StoreConnection {
+    /// In one transaction begun with `behavior`, reads the change log since this Store last did,
+    /// then does `and`, which is given the transaction and this Store's number in the log, and
+    /// commits the transaction. `and` gives what it made, and the place in the log of the Commit
+    /// it appended, if any. Only once the transaction is committed does the Store move past what
+    /// was read and appended: if anything fails, the next read reads it again.
+    ///
+    /// Reading and `and` share the transaction, so that how far the log was pruned and what is
+    /// in it are seen as they stood at one moment, and a Commit sees exactly the Commits applied
+    /// before it.
+    async fn read_log_and<T: Send + 'static>(
+        &self,
+        behavior: TransactionBehavior,
+        and: impl FnOnce(&Connection, i64) -> Result<(T, Option<i64>)> + Send + 'static,
+    ) -> Result<(Vec<Observed>, T)> {
+        let log = Arc::clone(&self.log);
+        self.connection
             .call(move |connection| {
-                let transaction = connection
-                    .transaction_with_behavior(TransactionBehavior::Immediate)
-                    .map_err(Error::backend)?;
-                let mut log = log.lock().unwrap();
-                // Moved on only if the Commit is: otherwise the poller reads them again.
+                let transaction =
+                    connection.transaction_with_behavior(behavior).map_err(Error::backend)?;
+                let mut log = LogReader::lock(&log);
                 let mut seen = log.seen;
-                let before =
+                let observed =
                     read_log(&transaction, log.store, &mut seen).map_err(Error::backend)?;
-                let timestamp = request.timestamp;
-                let plan = request.plan(&AreaInDatabase(&transaction))?;
-                let mut outcome = plan.apply(|path, planned| {
-                    apply(&transaction, path, planned).map_err(Error::backend)
-                })?;
-                if !outcome.changes.is_empty() {
-                    seen = append_to_log(&transaction, log.store, timestamp, &outcome.changes)
-                        .and_then(|appended| {
-                            prune_log(&transaction, timestamp, retention).map(|()| appended)
-                        })
-                        .map_err(Error::backend)?;
-                }
+                let (made, appended) = and(&transaction, log.store)?;
                 transaction.commit().map_err(Error::backend)?;
-                log.seen = seen;
-                outcome.before = before;
-                Ok(outcome)
+                log.seen = appended.unwrap_or(seen);
+                Ok((observed, made))
             })
             .await
+    }
+}
+
+impl LogReader {
+    fn lock(log: &Mutex<LogReader>) -> MutexGuard<'_, LogReader> {
+        log.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -307,12 +348,12 @@ impl SqlitePoller {
     pub(crate) async fn wait(&self) -> Vec<Area> {
         tokio::time::sleep(self.interval).await;
         let mut changed = Vec::new();
-        for (area, (connection, log)) in self.areas.iter() {
+        for (area, StoreConnection { connection, log }) in self.areas.iter() {
             let log = Arc::clone(log);
             let checked = connection
                 .call(move |connection| {
                     let now = data_version(connection).map_err(Error::backend)?;
-                    let mut log = log.lock().unwrap();
+                    let mut log = LogReader::lock(&log);
                     Ok(std::mem::replace(&mut log.data_version, now) != now)
                 })
                 .await;
@@ -327,22 +368,10 @@ impl SqlitePoller {
     /// the Store past it. The Store layer calls it in turn with Commits, under `commit_order`, and
     /// records what it gives before its turn ends.
     pub(crate) async fn read(&self, area: Area) -> Result<Vec<Observed>> {
-        let (connection, log) = self.areas.get(area);
-        let log = Arc::clone(log);
-        connection
-            .call(move |connection| {
-                // One read transaction, so that how far the log was pruned and what is in it are
-                // seen as they stood at one moment.
-                let transaction = connection.transaction().map_err(Error::backend)?;
-                let mut log = log.lock().unwrap();
-                let mut seen = log.seen;
-                let observed =
-                    read_log(&transaction, log.store, &mut seen).map_err(Error::backend)?;
-                transaction.commit().map_err(Error::backend)?;
-                log.seen = seen;
-                Ok(observed)
-            })
-            .await
+        let store = self.areas.get(area);
+        let (observed, ()) =
+            store.read_log_and(TransactionBehavior::Deferred, |_, _| Ok(((), None))).await?;
+        Ok(observed)
     }
 }
 
@@ -474,20 +503,21 @@ fn data_version(connection: &Connection) -> rusqlite::Result<i64> {
 /// numbers in `meta` are kept as text, as everything there is.
 fn new_log_reader(connection: &Connection, data_version: i64) -> rusqlite::Result<LogReader> {
     let store = connection.query_row(
-        "UPDATE meta SET value = value + 1 WHERE name = 'last_store'
-         RETURNING CAST(value AS INTEGER)",
-        [],
+        "UPDATE meta SET value = value + 1 WHERE name = ?1 RETURNING CAST(value AS INTEGER)",
+        [LAST_STORE],
         |row| row.get(0),
     )?;
-    let seen = connection.query_row(
-        "SELECT max(
-             (SELECT CAST(value AS INTEGER) FROM meta WHERE name = 'change_log_pruned_through'),
-             (SELECT coalesce(max(id), 0) FROM change_log)
-         )",
-        [],
-        |row| row.get(0),
-    )?;
+    let last: Option<i64> =
+        connection.query_row("SELECT max(id) FROM change_log", [], |row| row.get(0))?;
+    let seen = last.unwrap_or(0).max(pruned_through(connection)?);
     Ok(LogReader { store, seen, data_version })
+}
+
+/// The last Commit pruned from the change log.
+fn pruned_through(connection: &Connection) -> rusqlite::Result<i64> {
+    connection
+        .prepare_cached("SELECT CAST(value AS INTEGER) FROM meta WHERE name = ?1")?
+        .query_row([CHANGE_LOG_PRUNED_THROUGH], |row| row.get(0))
 }
 
 /// Reads the change log after the Commit `seen`, and moves `seen` to the last Commit read. A Commit
@@ -499,11 +529,7 @@ fn read_log(
     seen: &mut i64,
 ) -> rusqlite::Result<Vec<Observed>> {
     let mut observed = Vec::new();
-    let pruned: i64 = connection
-        .prepare_cached(
-            "SELECT CAST(value AS INTEGER) FROM meta WHERE name = 'change_log_pruned_through'",
-        )?
-        .query_row([], |row| row.get(0))?;
+    let pruned = pruned_through(connection)?;
     if pruned > *seen {
         observed.push(Observed::Missed);
         *seen = pruned;
@@ -567,8 +593,8 @@ fn prune_log(connection: &Connection, now: Timestamp, retention: Duration) -> ru
         .execute([last])?;
     connection.prepare_cached("DELETE FROM change_log WHERE id <= ?1")?.execute([last])?;
     connection
-        .prepare_cached("UPDATE meta SET value = ?1 WHERE name = 'change_log_pruned_through'")?
-        .execute([last])?;
+        .prepare_cached("UPDATE meta SET value = ?2 WHERE name = ?1")?
+        .execute(params![CHANGE_LOG_PRUNED_THROUGH, last])?;
     Ok(())
 }
 

@@ -94,7 +94,7 @@ pub(crate) struct CommitOutcome {
     /// What other Stores did to the Area before this Commit that this Store hasn't recorded on
     /// its Change feed yet, in the order they did it. Only SQLite, which reads it from its change
     /// log, gives any.
-    pub(crate) before: Vec<Observed>,
+    pub(crate) observed_before: Vec<Observed>,
 }
 
 /// Something a Backend observed in an Area's change log, which Commits by every Store on the same
@@ -108,7 +108,9 @@ pub(crate) enum Observed {
     Missed,
 }
 
-/// A change a Backend made or observed, before the Store layer tags it with its Area and Origin.
+/// A change a Backend made or observed, without its Area and Origin. The Store layer adds the Area,
+/// and the Origin: local for its own Commits, and for Commits read from a change log, the Origin
+/// the Backend gives with them ([`Observed::Commit`]).
 #[derive(Debug)]
 pub(crate) struct RawChange {
     pub(crate) path: Path,
@@ -158,7 +160,7 @@ impl Plan {
             change(&path, planned)?;
             changes.push(RawChange { path, kind });
         }
-        Ok(CommitOutcome { revisions: self.revisions, changes, before: Vec::new() })
+        Ok(CommitOutcome { revisions: self.revisions, changes, observed_before: Vec::new() })
     }
 }
 

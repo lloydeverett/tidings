@@ -3,11 +3,10 @@
 //! both Stores share the Fixture's Root override. Each is listed in [`two_stores_suite!`].
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use tidings::{Area, ChangeFeed, ChangeKind, Error, FeedItem, Origin, Staging, Store};
 
-use crate::common::{assert_nothing_more, changes_in_full, next_batch};
+use crate::common::{assert_nothing_more, changes_in_full, next_batch, next_item};
 use crate::suite::{Fixture, Opened};
 
 /// Instantiates every test here for one Backend's [`Fixture`].
@@ -114,7 +113,7 @@ pub async fn another_stores_commits_are_never_split_across_batches(fixture: &imp
             let mut batches = Vec::new();
             let mut seen = 0;
             while seen < FILES * COMMITS {
-                match next_item_of(&mut second_feed).await {
+                match next_item(&mut second_feed).await {
                     FeedItem::Changes(batch) => {
                         seen += batch.len();
                         batches.push(batch);
@@ -264,12 +263,4 @@ async fn kind_until(feed: &mut ChangeFeed, path: &str, marker: &str) -> Option<C
             return kind;
         }
     }
-}
-
-/// Waits for the next item on the Change feed, failing the test if none arrives in time.
-async fn next_item_of(feed: &mut ChangeFeed) -> FeedItem {
-    tokio::time::timeout(Duration::from_secs(5), feed.next())
-        .await
-        .expect("the Change feed should have sent something by now")
-        .expect("the Change feed should not have ended")
 }

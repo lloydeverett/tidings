@@ -1000,3 +1000,124 @@ Standards: every claimed fix is verified, with 0 hard violations and 5 small new
 
 Clippy (all targets, with default features, `--no-default-features` and `--all-features`) is
 clean. `cargo test` passes with each of them.
+
+---
+
+## Ticket 08: SQLite backend, other processes' Commits
+
+Reviewed: `git diff 1872057...2182836` (commit 2182836). The Spec reviewer was also asked to check that each Commit is reported exactly once and in order, the order of the locks, how pruning detects missed Commits, that the feed still ends, the Resync design, and `data_version` polling.
+
+### Standards
+
+**Hard violations of documented standards**
+
+None found. Tests use only the public API. The `change_log_retention` option is behind `testing`, and the spec's `testing` line now names it. No public Backend trait was added. "transaction" and "version" refer to SQLite's own transactions and to `data_version`/`user_version`, not to the domain concepts CONTEXT.md defines.
+
+**Soft points against documented standards (judgement calls)**
+
+1. **src/store.rs:298-302:** errors from the poller's reads are dropped (`Err(_)`) without being logged. docs/specs/0001-first-version.md:391 says to use `tracing` at debug level, and story 69 wants watcher errors to be diagnosable. `tracing` isn't a dependency yet, so this isn't a breach today, but it is the obvious place for a `debug!` once it is.
+2. **src/backend/mod.rs:96-97 and :111:** the spec (lines 312-316) says "The Store tags a raw change as *local* when it matches a Commit this Store made". Now the Backend supplies the Origin in `Observed::Commit { origin, .. }`, while the `RawChange` doc comment at :111 still says the Store layer tags it. The ticket notes chose this on purpose, but the spec text and the doc comment have drifted from the code.
+3. **CONTEXT.md:113:** the edited Resync line is 156 characters long and wasn't rewrapped. The rest of the file wraps at about 100.
+
+**Baseline smells (all judgement calls)**
+
+- **Duplicated Code, tests/behaviour/two_stores.rs:270:** `next_item_of` is an exact copy of `common::next_item` (tests/common/mod.rs:10), and `crate::common` is already imported. Delete it and use `next_item`.
+- **Duplicated Code, src/backend/sqlite.rs:279/295 and :338/342:** `commit` and `SqlitePoller::read` repeat the same sequence: lock `log`, copy `seen`, `read_log`, commit the transaction, write `seen` back. The `change_log_pruned_through` SELECT also appears twice, at :484 and :504.
+- **Primitive Obsession, src/backend/sqlite.rs:138/477/484/504/570:** the `meta` names `'last_store'` and `'change_log_pruned_through'` are written inline as string literals. The file's own convention is a named const, such as `FOLD_UNICODE_VERSIONS` at :143, bound as `?1`.
+- **Data Clumps, src/backend/sqlite.rs:183 vs :161-162:** `PerArea<(AreaConnection, Arc<Mutex<LogReader>>)>` is the same connection-plus-log pair that `Database` holds. One small struct shared by both would give it a name.
+- **Duplicated Code, src/store.rs:114-121 and :144-154:** with `Store::open(backend)` removed, the sequence `change::feed()` → `Inner {..}` → `Store { inner: Arc::new(..) }` now appears twice, and ticket 09's filesystem open would make three. Consider one helper that takes `backend` and `following`.
+- **Mysterious Name, src/backend/mod.rs:97:** `CommitOutcome::before` only makes sense with its doc comment. `observed_before` would say it without one.
+
+**Not flagged**
+
+- `Observed` is compiled without `sqlite` behind `expect(dead_code)`, and `FeedSender` is now `Clone`. Both are seams that tickets 09 and 11 need, so they are not Speculative Generality.
+
+### Spec
+
+Verified by reading the code, by running `cargo test` (default features and `--no-default-features --features "sqlite testing"` pass, plus a `--no-default-features` check), and with a probe. The probe had two Stores make 400 Commits each at a 1 ms poll interval, with write-back Conflicts and cancelled Commits mixed in. Across 6 runs every Path arrived exactly once, with the correct Origin.
+
+**(a) Missing or partial:** none. All six checklist items are met.
+
+**(b) Scope creep:** none. The Resync code in `src/change.rs` is what ticket 05 set aside "for tickets 08 and 11".
+
+**(c) Implemented, but wrong or overclaimed:**
+
+1. **Pruning by wall-clock time contradicts what the docs claim** (low severity). The spec says "The log is pruned." `sqlite.rs:27-29` and ticket line 71 add: "A Store is only that far behind if it stopped running … for 10 minutes." That is false after a forward jump of the wall clock by more than the retention period. The next Commit that changes something (`prune_log`, `sqlite.rs:558`) then deletes entries written moments earlier, and every other Store that hasn't polled yet gets a Resync. Missed Commits are still detected exactly and the Resync is truthful, so this is a wording problem, not lost Changes.
+2. **A poller that dies does so silently** (low severity, an edge case). The spec says the feed "says so explicitly (a Resync) if it cannot keep that promise". If `follow_other_stores` (`store.rs:288`) panics, external Changes simply stop, with no Resync. One path to this: a Backend panic inside the Commit closure while it holds the `LogReader` lock (`sqlite.rs:277`) poisons that lock, and the poller's `unwrap` then panics.
+
+**Answers to the concurrency questions (no defects found):**
+
+1. **Exactly once, in order.**
+   - The last-read position (`seen`) moves only inside the one closure that holds both the connection lock and the `LogReader` lock (`sqlite.rs:277-295` for a Commit, `:337-342` for the poller), and only after `transaction.commit()` succeeds.
+   - Changes are recorded on the feed under `commit_order`, which both Commits and the poller hold (`store.rs:248`, `:292`).
+   - After a Conflict, `seen` doesn't move and the poller reads those Commits instead.
+   - A cancelled Commit carries its owned `commit_order` guard into the task that finishes it, so it still records in turn.
+2. **Lock order and starvation.**
+   - Every path takes the locks in the same order (`commit_order` → connection → `LogReader`), so nothing can deadlock.
+   - The poller holds `commit_order` only across a short read transaction, never across its sleep or the `data_version` check.
+   - The lock is FIFO, and the poller only takes it when `data_version` has changed, so Commits aren't starved.
+3. **Missed Commits are detected exactly.**
+   - `AUTOINCREMENT` ids have no gaps (a rollback also rolls back the counter), and a Store's own Commits advance its `seen`. So `pruned > seen` holds exactly when entries it never recorded were deleted.
+   - The prune point is read in the same transaction as the log, and only ever grows.
+   - Each Commit's log rows, data changes and pruning happen in one `BEGIN IMMEDIATE` transaction.
+4. **The feed still ends.** `Inner`'s Drop aborts the poller (`store.rs:104`). The poller holds only a `FeedSender` clone, and the suite's tests for the feed ending pass on SQLite.
+5. **Resync matches ticket 05's design.**
+   - A Resync replaces the Area's unread Changes, absorbs any recorded before it is read (`change.rs:162`), and a second Resync for the same Area adds nothing.
+   - `next` hands out Resyncs first, one Area at a time (`change.rs:182`).
+6. **`data_version` is checked on the right connection.**
+   - Only the Store's own connection for each Area commits. Snapshots open read-only connections (`sqlite.rs:251`), and the poller shares the Store's connection (`sqlite.rs:218`).
+   - Another Store opening the database changes `data_version`, which only causes one harmless empty read.
+   - After a poller read fails, the Area is read again only once `data_version` changes again. The Resync sent on the failure covers the gap, and any leftover entries arrive later as harmless extra Changes.
+
+### Summary
+
+Standards: 0 hard violations, 3 soft points against documented standards and 6 smells. The most notable soft point is drift between the spec and the code over who sets a Change's Origin. Spec: 0 missing, and every concurrency question came back sound. There are 2 low-severity overclaims. The worse is that a poller that dies stops external Changes silently, without the Resync the spec promises.
+
+
+
+### Resolution
+
+1. **Spec c1, wall-clock pruning:** fixed the wording, and kept the pruning as it is. The
+   sqlite.rs module doc and the ticket's Notes now say that a forward jump of the clock by more
+   than the retention also prunes Commits written moments earlier. Stores that haven't read those
+   Commits then get a Resync, which is true, and nothing is missed silently. Keeping the newest N
+   Commits as well would need a second `testing` knob so that the Resync test could still prune past
+   a Store, and it would only trade a rare spurious Resync for more machinery.
+2. **Spec c2, a poller that dies silently:** fixed in two ways.
+   - `LogReader::lock` recovers a poisoned lock. `LogReader` changes only once a transaction
+     commits, so a panic leaves it consistent.
+   - `start_following_other_stores` spawns the poller, plus a small task that awaits its
+     `JoinHandle`. If the poller panicked, that task logs it and sends a Resync for every Area
+     (`FeedSender::resync_every_area`). When the Store drops and aborts the poller, the join is
+     cancelled rather than panicked, so nothing is sent. A guard inside the poller couldn't tell a
+     panic from an abort: tokio drops the future only after it has caught the panic, so
+     `thread::panicking()` is false by then.
+   - Nothing can make SQLite fail or the poller panic on demand, so neither is tested. The ticket
+     Notes say so.
+3. **Standards 2, who tags Origin:** the spec now says the Origin is decided where the knowledge is.
+   - The Store layer tags its own Commits' Changes as local.
+   - A Backend that reads a change log gives each Commit's Origin with it.
+   - For raw changes a watcher observes, the Store matches them against its own Commits.
+
+   The Store-layer bullet points to this. The `RawChange` doc comment says the same.
+4. **Standards 3:** CONTEXT.md's Resync entry is rewrapped.
+5. **Standards 1, silent read errors:** `tracing` (0.1.44) is now a dependency. A failed log read and
+   a panicked poller are both logged at debug level.
+6. **Smells:** all fixed.
+   - `next_item_of` is gone. The split test uses `common::next_item`.
+   - `StoreConnection::read_log_and(behavior, and)` is now the one sequence: lock, copy `seen`,
+     `read_log`, `and`, commit, write `seen` back. Commits use it with `IMMEDIATE`, and the poller
+     with `DEFERRED` and an empty `and`. `pruned_through()` holds the only SELECT of
+     `change_log_pruned_through`.
+   - `LAST_STORE` and `CHANGE_LOG_PRUNED_THROUGH` are consts, bound as parameters. Only the
+     migration's fixed SQL still spells them out.
+   - `StoreConnection { connection, log }` is the pair that `Database` holds and the poller
+     shares.
+   - `Store::open(backend, follow)` builds the feed, `Inner` and `Store` for every opener.
+     `follow` starts the task that follows other Stores, if the Backend has one.
+   - `CommitOutcome::before` is renamed to `observed_before`.
+
+Clippy (all targets, with default features, `--all-features` and `--no-default-features`) is
+clean, and so is rustdoc. `cargo test` passes with each: 96 behaviour tests (45 without `sqlite`),
+5 path tests, 3 Store-layer tests and the SQLite unit test. The SQLite tests pass on repeated
+runs. Removing the gap check still fails the Resync test.

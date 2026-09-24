@@ -48,9 +48,10 @@ arrive in one batch.
   another Store writes `x` and then this Store deletes it before the poller runs, the local Removed
   is recorded first and the external Changed after it, so the merged kind is wrong. So:
   - A Commit reads the log since the Store's last-read position inside its `BEGIN IMMEDIATE`
-    transaction, before its own changes. It returns those Commits in `CommitOutcome::before`
-    (`Observed::Commit { origin, changes }` or `Observed::Missed`), and the Store layer records them,
-    then its own Changes, under `commit_order`. The position moves past them and the Commit only if
+    transaction, before its own changes. It returns those Commits in
+    `CommitOutcome::observed_before` (`Observed::Commit { origin, changes }` or
+    `Observed::Missed`), and the Store layer records them, then its own Changes, under
+    `commit_order`. The position moves past them and the Commit only if
     the Commit succeeds; after a Conflict the poller reads them instead.
   - The poller reads and records under `commit_order` too, so the two never interleave.
   - A Store's own Commits in the log are tagged local. Normally the Store never reads them from the
@@ -68,9 +69,12 @@ arrive in one batch.
   that id as `change_log_pruned_through`. A Store whose position is before that has missed
   Commits: reading the log gives `Observed::Missed` first, and the Store sends a Resync for the
   Area, then moves on. No registry of open Stores is needed, and a crashed process can't hold the
-  log up. A Store is only that far behind if it stopped running (a stopped process, a blocked
-  runtime) for 10 minutes while others committed, and then the spec's Resync is the honest answer.
-  The log's size is bounded by the commit rate over the retention.
+  log up. A Store falls that far behind if it stopped running (a stopped process, a blocked
+  runtime) for 10 minutes while others committed. Because the timestamps come from the wall clock,
+  a forward jump of the clock by more than the retention also prunes Commits written moments
+  earlier, and Stores that haven't read them yet get a Resync. Either way the Resync is the honest
+  answer, and nothing is missed silently. The log's size is bounded by the commit rate over the
+  retention.
   - The Resync is built as ticket 05's notes designed it: `Unread` holds, per Area, either merged
     Changes or a Resync (`UnreadInArea`). A Resync replaces the Area's unread Changes and absorbs
     those recorded after it until it is read; `next` gives Resyncs first, one Area at a time, then
@@ -78,7 +82,11 @@ arrive in one batch.
     tests/behaviour/main.rs, since it needs SQLite options) checks all of that, and fails with the
     gap check removed.
   - If the poller can't read an Area's log, it sends a Resync for that Area, once until a read
-    succeeds again. Nothing can make SQLite fail on demand, so this isn't tested.
+    succeeds again, and logs the error through `tracing` at debug level (`tracing` is now a
+    dependency). If the poller task panics, a second task waiting for it sends a Resync for every
+    Area, since external Changes stop. The `LogReader` lock carries on after a panic poisoned it,
+    because it only changes once a transaction commits. Nothing can make SQLite fail or the poller
+    panic on demand, so none of this is tested.
 - **Busy.** The busy timeout is now set explicitly to 30 s (rusqlite's default of 5 s "may
   change"). `BEGIN IMMEDIATE` takes the write lock first, so a Commit waits for the other Store's
   Commit rather than failing. `concurrent_commits_from_both_stores_keep_preconditions_exact` has
@@ -92,7 +100,7 @@ arrive in one batch.
   Store), Commits before `open` not reported, a large external Commit never split (with a reader on
   its own thread; recording each Change separately fails it 3 of 3), the ordering test above, and
   the Preconditions test.
-- **For later tickets.** `CommitOutcome::before` and `Observed` are how a Backend hands the Store
-  layer other Stores' Commits it saw under its lock; memory never gives any, and they are compiled
+- **For later tickets.** `CommitOutcome::observed_before` and `Observed` are how a Backend hands
+  the Store layer other Stores' Commits it saw under its lock; memory never gives any, and they are compiled
   without `sqlite` only so the Store layer needs no `cfg`. Ticket 11 records watched events itself
   and can send `FeedSender::resync` for a failed watcher or a vanished Area root.

@@ -110,6 +110,6 @@ _Avoid_: subscription, listener, watcher
 
 **Resync**:
 An item on the Change feed saying that Changes to one Area may have been missed, because watching
-failed, the Area itself disappeared, or the Store fell too far behind other processes' Commits. The app should read everything it relies on in that Area
-again.
+failed, the Area itself disappeared, or the Store fell too far behind other processes' Commits.
+The app should read everything it relies on in that Area again.
 _Avoid_: lost, overflow, reset
