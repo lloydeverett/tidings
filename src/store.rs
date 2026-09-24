@@ -11,7 +11,7 @@ use crate::backend::{Backend, CommitRequest, memory::MemoryBackend};
 use crate::change::{self, FeedSender};
 use crate::{
     Area, ChangeFeed, Committed, File, IntoPath, IntoPrefix, Origin, Path, PrefixRevision, Result,
-    Staging, Stat,
+    Snapshot, Staging, Stat,
 };
 
 /// What an application opens to reach its Files: all three Areas, held by one Backend.
@@ -95,6 +95,22 @@ impl Store {
     pub async fn stat_prefix(&self, area: Area, prefix: impl IntoPrefix) -> Result<PrefixRevision> {
         let prefix = prefix.into_prefix()?;
         self.inner.backend.stat_prefix(area, &prefix).await
+    }
+
+    /// Whether this Store's Backend provides Snapshots. Memory and SQLite do. The filesystem
+    /// doesn't, because other programs can change its Files while they are being read.
+    pub fn supports_snapshots(&self) -> bool {
+        self.inner.backend.supports_snapshots()
+    }
+
+    /// Takes a [`Snapshot`] of `area`: a view of it as it stands now, for reading several Files
+    /// that belong together. Commits made afterwards don't show in it, and holding it doesn't hold
+    /// them up.
+    ///
+    /// Gives [`Error::Unsupported`](crate::Error::Unsupported) if the Backend has no Snapshots.
+    /// Check [`supports_snapshots`](Self::supports_snapshots) when the app starts.
+    pub async fn snapshot(&self, area: Area) -> Result<Snapshot> {
+        Ok(Snapshot::new(self.inner.backend.snapshot(area).await?))
     }
 
     /// Commits `staging`: applies all of its writes and deletes, or none of them. Prefix deletes

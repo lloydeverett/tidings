@@ -22,6 +22,10 @@ pub enum Error {
         /// were added, removed or changed.
         paths: Vec<Path>,
     },
+    /// The Store's Backend can't do this. A Snapshot on the filesystem gives it: check
+    /// [`Store::supports_snapshots`](crate::Store::supports_snapshots) first.
+    #[error("not supported by this Store's Backend")]
+    Unsupported,
 }
 
 /// A `Result` whose error is tidings' [`Error`].

@@ -15,6 +15,7 @@ mod path;
 mod precondition;
 mod prefix;
 mod revision;
+mod snapshot;
 mod staging;
 mod store;
 
@@ -27,5 +28,6 @@ pub use path::{IntoPath, InvalidPathReason, Path};
 pub use precondition::Precondition;
 pub use prefix::{IntoPrefix, Prefix};
 pub use revision::{PrefixRevision, Revision};
+pub use snapshot::Snapshot;
 pub use staging::Staging;
 pub use store::Store;

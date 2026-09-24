@@ -1,11 +1,11 @@
 //! What the Store layer does the same way on every Backend, tested once on memory rather than
 //! through the behaviour suite: how it merges external Changes, which memory can only have
-//! injected, and that a Store can be shared between threads.
+//! injected, and that a Store and its Snapshots can be shared between threads.
 
 mod common;
 
 use common::{assert_nothing_more, changes_in_full, next_batch};
-use tidings::{Area, ChangeFeed, ChangeKind, Origin, Staging, Store};
+use tidings::{Area, ChangeFeed, ChangeKind, Origin, Snapshot, Staging, Store};
 
 #[test]
 fn a_store_and_its_futures_can_be_shared_between_threads() {
@@ -14,6 +14,7 @@ fn a_store_and_its_futures_can_be_shared_between_threads() {
     fn send<T: Send>(_: T) {}
     clone_send_sync::<Store>();
     send_sync::<ChangeFeed>();
+    send_sync::<Snapshot>();
 
     // Every future a Store or its Change feed gives, without running it.
     let (store, mut feed) = Store::open_memory();
@@ -22,7 +23,19 @@ fn a_store_and_its_futures_can_be_shared_between_threads() {
     send(store.list(Area::Config, ""));
     send(store.stat_prefix(Area::Config, ""));
     send(store.commit(Staging::new(Area::Config)));
+    send(store.snapshot(Area::Config));
     send(feed.next());
+}
+
+/// And every future a Snapshot gives.
+#[tokio::test]
+async fn a_snapshots_futures_can_be_sent_between_threads() {
+    fn send<T: Send>(_: T) {}
+    let (store, _feed) = Store::open_memory();
+    let snapshot = store.snapshot(Area::Config).await.unwrap();
+    send(snapshot.read("a"));
+    send(snapshot.stat("a"));
+    send(snapshot.list(""));
 }
 
 /// Memory never observes external Changes, so they are injected into the Store layer, with the

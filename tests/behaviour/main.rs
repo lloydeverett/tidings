@@ -19,4 +19,12 @@ mod memory {
     }
 
     behaviour_suite!(Memory);
+
+    /// The suite's Snapshot tests run only where Snapshots are supported, so this makes sure they
+    /// run on memory.
+    #[test]
+    fn memory_supports_snapshots() {
+        let (store, _feed) = tidings::Store::open_memory();
+        assert!(store.supports_snapshots());
+    }
 }

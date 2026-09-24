@@ -6,7 +6,7 @@ use std::time::Duration;
 use jiff::Timestamp;
 use tidings::{
     Area, ChangeFeed, ChangeKind, Committed, Error, FeedItem, File, InvalidPathReason, Origin,
-    Precondition, Staging, Store,
+    Precondition, Snapshot, Staging, Store,
 };
 
 use crate::common::{assert_ended, assert_nothing_more, changes, changes_in_full, next_batch};
@@ -65,6 +65,11 @@ macro_rules! behaviour_suite {
             a_commit_made_before_the_feed_is_first_read_is_reported,
             a_commits_changes_are_never_split_across_batches,
             concurrent_commits_reach_the_feed_in_the_order_they_were_made,
+            a_snapshot_reads_the_area_as_it_was_when_taken,
+            reads_through_a_snapshot_never_mix_commits,
+            holding_a_snapshot_does_not_hold_up_commits,
+            a_snapshot_outlives_the_store_without_keeping_the_feed_open,
+            a_backend_without_snapshots_refuses_one,
         );
     };
     (@tests $fixture:expr; $($test:ident),* $(,)?) => {
@@ -395,6 +400,11 @@ pub async fn a_dropped_staging_writes_nothing(fixture: &impl Fixture) {
 
 pub async fn an_invalid_path_is_refused_wherever_it_is_used(fixture: &impl Fixture) {
     let Opened { store, feed: _feed } = fixture.open().await;
+    let snapshot = if store.supports_snapshots() {
+        Some(store.snapshot(Area::Data).await.unwrap())
+    } else {
+        None
+    };
 
     // One Path for each rule. tests/paths.rs has the full table.
     let refused = [
@@ -422,6 +432,12 @@ pub async fn an_invalid_path_is_refused_wherever_it_is_used(fixture: &impl Fixtu
         assert_refused("writing", path, expected, writing);
         let deleting = staging.delete_requiring(path, Precondition::Absent).map(drop);
         assert_refused("deleting", path, expected, deleting);
+        if let Some(snapshot) = &snapshot {
+            let reading = snapshot.read(path).await.map(drop);
+            assert_refused("reading a Snapshot at", path, expected, reading);
+            let stat = snapshot.stat(path).await.map(drop);
+            assert_refused("stat through a Snapshot of", path, expected, stat);
+        }
     }
 
     // One Prefix for each rule a Prefix can break. tests/paths.rs has the full table.
@@ -445,6 +461,10 @@ pub async fn an_invalid_path_is_refused_wherever_it_is_used(fixture: &impl Fixtu
         assert_refused("stat of", prefix, expected, stat.map(drop));
         let requiring = staging.require_prefix(prefix, prefix_revision).map(drop);
         assert_refused("requiring", prefix, expected, requiring);
+        if let Some(snapshot) = &snapshot {
+            let listing = snapshot.list(prefix).await.map(drop);
+            assert_refused("listing a Snapshot under", prefix, expected, listing);
+        }
     }
 }
 
@@ -1119,6 +1139,170 @@ pub async fn concurrent_commits_reach_the_feed_in_the_order_they_were_made(fixtu
     assert_nothing_more(&mut feed).await;
 }
 
+pub async fn a_snapshot_reads_the_area_as_it_was_when_taken(fixture: &impl Fixture) {
+    let Opened { store, feed: _feed } = fixture.open().await;
+    if !store.supports_snapshots() {
+        return;
+    }
+    let mut staging = Staging::new(Area::Data);
+    staging.write("changed.txt", "before").unwrap();
+    staging.write("removed.txt", "removed").unwrap();
+    staging.write("dir/kept.txt", "kept").unwrap();
+    store.commit(staging).await.unwrap();
+    let mut other_area = Staging::new(Area::Config);
+    other_area.write("elsewhere.toml", "").unwrap();
+    store.commit(other_area).await.unwrap();
+    let changed_before = read(&store, Area::Data, "changed.txt").await;
+    let removed_before = read(&store, Area::Data, "removed.txt").await;
+
+    let snapshot = store.snapshot(Area::Data).await.unwrap();
+    let mut staging = Staging::new(Area::Data);
+    staging.write("changed.txt", "after").unwrap();
+    staging.delete("removed.txt").unwrap();
+    staging.write("dir/added.txt", "added").unwrap();
+    store.commit(staging).await.unwrap();
+
+    // The Snapshot still gives the Area as it was, with each File's time and Revision...
+    assert_eq!(snapshot.read("changed.txt").await.unwrap(), Some(changed_before.clone()));
+    assert_eq!(snapshot.read("removed.txt").await.unwrap(), Some(removed_before.clone()));
+    assert_eq!(snapshot.read("dir/added.txt").await.unwrap(), None);
+    let stat = snapshot.stat("changed.txt").await.unwrap().unwrap();
+    assert_eq!(
+        (stat.modified(), stat.revision()),
+        (changed_before.modified(), changed_before.revision()),
+    );
+    assert_eq!(snapshot.stat("dir/added.txt").await.unwrap(), None);
+    assert_eq!(snapshot_list(&snapshot, "").await, ["changed.txt", "dir/kept.txt", "removed.txt"]);
+    assert_eq!(snapshot_list(&snapshot, "dir/").await, ["dir/kept.txt"]);
+    // ...and only that Area.
+    assert_eq!(snapshot.read("elsewhere.toml").await.unwrap(), None);
+
+    // The Store gives the Area as it is now.
+    assert_eq!(read(&store, Area::Data, "changed.txt").await.contents(), "after");
+    assert_eq!(store.read(Area::Data, "removed.txt").await.unwrap(), None);
+    assert_eq!(list(&store, Area::Data, "dir/").await, ["dir/added.txt", "dir/kept.txt"]);
+}
+
+pub async fn reads_through_a_snapshot_never_mix_commits(fixture: &impl Fixture) {
+    let Opened { store, feed: _feed } = fixture.open().await;
+    if !store.supports_snapshots() {
+        return;
+    }
+    // Every Commit writes the same number to both Files, so they belong together.
+    let commit_pair = async |store: &Store, n: usize| {
+        let mut staging = Staging::new(Area::Data);
+        staging.write("pair/a.txt", n.to_string()).unwrap();
+        staging.write("pair/b.txt", n.to_string()).unwrap();
+        store.commit(staging).await.unwrap();
+    };
+    let read_pair = async |snapshot: &Snapshot| {
+        let a = snapshot.read("pair/a.txt").await.unwrap().unwrap();
+        tokio::task::yield_now().await;
+        let b = snapshot.read("pair/b.txt").await.unwrap().unwrap();
+        (a.contents().to_owned(), b.contents().to_owned())
+    };
+    commit_pair(&store, 0).await;
+
+    // A Commit lands between reading one File and the other.
+    let snapshot = store.snapshot(Area::Data).await.unwrap();
+    let a = snapshot.read("pair/a.txt").await.unwrap().unwrap();
+    commit_pair(&store, 1).await;
+    let b = snapshot.read("pair/b.txt").await.unwrap().unwrap();
+    assert_eq!((a.contents(), b.contents()), ("0", "0"));
+
+    // Commits land from another task while Snapshots are taken and read.
+    const COMMITS: usize = 500;
+    let committer = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            for n in 2..COMMITS {
+                commit_pair(&store, n).await;
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    while !committer.is_finished() {
+        let snapshot = store.snapshot(Area::Data).await.unwrap();
+        let (a, b) = read_pair(&snapshot).await;
+        assert_eq!(a, b, "a Snapshot mixed two Commits");
+    }
+    committer.await.unwrap();
+    let last = (COMMITS - 1).to_string();
+    let snapshot = store.snapshot(Area::Data).await.unwrap();
+    assert_eq!(read_pair(&snapshot).await, (last.clone(), last));
+}
+
+pub async fn holding_a_snapshot_does_not_hold_up_commits(fixture: &impl Fixture) {
+    let Opened { store, feed: _feed } = fixture.open().await;
+    if !store.supports_snapshots() {
+        return;
+    }
+    let mut staging = Staging::new(Area::Data);
+    staging.write("held.txt", "before").unwrap();
+    store.commit(staging).await.unwrap();
+
+    // One task keeps reading through the Snapshot while another commits to the same Area.
+    let snapshot = store.snapshot(Area::Data).await.unwrap();
+    let committer = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            for i in 0..20 {
+                let mut staging = Staging::new(Area::Data);
+                staging.write("held.txt", format!("after {i}")).unwrap();
+                staging.write(format!("new/{i}.txt"), "new").unwrap();
+                store.commit(staging).await.unwrap();
+            }
+        })
+    };
+    let reading = async {
+        while !committer.is_finished() {
+            let file = snapshot.read("held.txt").await.unwrap().unwrap();
+            assert_eq!(file.contents(), "before");
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), reading)
+        .await
+        .expect("Commits should not wait for the Snapshot");
+    committer.await.unwrap();
+
+    assert_eq!(read(&store, Area::Data, "held.txt").await.contents(), "after 19");
+    assert_eq!(snapshot_list(&snapshot, "").await, ["held.txt"]);
+}
+
+pub async fn a_snapshot_outlives_the_store_without_keeping_the_feed_open(fixture: &impl Fixture) {
+    let Opened { store, mut feed } = fixture.open().await;
+    if !store.supports_snapshots() {
+        return;
+    }
+    let mut staging = Staging::new(Area::Config);
+    staging.write("settings.toml", "a = 1\n").unwrap();
+    store.commit(staging).await.unwrap();
+    next_batch(&mut feed).await;
+
+    let snapshot = store.snapshot(Area::Config).await.unwrap();
+    drop(store);
+    assert_ended(&mut feed).await;
+    let file = snapshot.read("settings.toml").await.unwrap().unwrap();
+    assert_eq!(file.contents(), "a = 1\n");
+    assert_eq!(snapshot_list(&snapshot, "").await, ["settings.toml"]);
+}
+
+pub async fn a_backend_without_snapshots_refuses_one(fixture: &impl Fixture) {
+    let Opened { store, feed: _feed } = fixture.open().await;
+    // Skipped where Snapshots are supported: the tests above cover them there.
+    if store.supports_snapshots() {
+        return;
+    }
+
+    for area in [Area::Config, Area::Data, Area::Cache] {
+        match store.snapshot(area).await {
+            Err(Error::Unsupported) => {}
+            other => panic!("a Snapshot of {area:?} should be unsupported, got {other:?}"),
+        }
+    }
+}
+
 // Helpers shared by the tests above.
 
 /// Reads a File that the test expects to exist.
@@ -1133,6 +1317,12 @@ async fn read(store: &Store, area: Area, path: &str) -> File {
 /// Lists the Paths under `prefix`, as strings.
 async fn list(store: &Store, area: Area, prefix: &str) -> Vec<String> {
     let paths = store.list(area, prefix).await.unwrap();
+    paths.iter().map(|path| path.as_str().to_owned()).collect()
+}
+
+/// Lists the Paths under `prefix` in a Snapshot, as strings.
+async fn snapshot_list(snapshot: &Snapshot, prefix: &str) -> Vec<String> {
+    let paths = snapshot.list(prefix).await.unwrap();
     paths.iter().map(|path| path.as_str().to_owned()).collect()
 }
 
