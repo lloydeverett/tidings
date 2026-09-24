@@ -15,7 +15,7 @@ pub enum Area {
 impl Area {
     /// The Area's name in lower case, which names its directory under a Root override, and its
     /// database.
-    #[cfg(feature = "sqlite")]
+    #[cfg(any(feature = "fs", feature = "sqlite"))]
     pub(crate) fn name(self) -> &'static str {
         match self {
             Area::Config => "config",
@@ -33,7 +33,7 @@ impl<T> PerArea<T> {
     const AREAS: [Area; 3] = [Area::Config, Area::Data, Area::Cache];
 
     /// One `T` for each Area, made by `make`, or the first error it gives.
-    #[cfg(feature = "sqlite")]
+    #[cfg(any(feature = "fs", feature = "sqlite"))]
     pub(crate) fn try_from_fn(
         mut make: impl FnMut(Area) -> crate::Result<T>,
     ) -> crate::Result<PerArea<T>> {
@@ -50,7 +50,7 @@ impl<T> PerArea<T> {
     }
 
     /// Each Area with its `T`, in order of Area.
-    #[cfg(feature = "sqlite")]
+    #[cfg(any(feature = "fs", feature = "sqlite"))]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (Area, &T)> {
         Self::AREAS.into_iter().zip(&self.0)
     }

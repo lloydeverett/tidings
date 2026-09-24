@@ -12,8 +12,8 @@ use crate::{Error, Result};
 /// A Path follows the strictest platform's rules, on every Backend, so a Path that works on one
 /// platform works on all of them. It is relative and `/`-separated, with no empty, `.` or `..`
 /// segments. Each segment is a name Windows accepts, the whole Path is in Unicode NFC form, and
-/// nothing is under `.tidings/`, which tidings keeps for itself. [`InvalidPathReason`] lists the
-/// rules.
+/// nothing is under `.tidings/` or named like tidings' temporary files, which tidings keeps for
+/// itself. [`InvalidPathReason`] lists the rules.
 ///
 /// It can only be made by validating a string, with [`Path::new`] or through [`IntoPath`].
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -61,7 +61,9 @@ pub(crate) fn refusal(path: &str) -> Option<InvalidPathReason> {
         Some(InvalidPathReason::DotSegment)
     } else if segments.clone().any(|segment| !is_portable_name(segment.as_str())) {
         Some(InvalidPathReason::UnportableName)
-    } else if segments.clone().next().is_some_and(|first| is_reserved(first.as_str())) {
+    } else if segments.clone().next().is_some_and(|first| is_reserved(first.as_str()))
+        || segments.clone().any(|segment| is_temporary_file_name(segment.as_str()))
+    {
         Some(InvalidPathReason::Reserved)
     } else if !unicode_normalization::is_nfc(path) {
         Some(InvalidPathReason::NotNfc)
@@ -116,6 +118,34 @@ fn is_reserved(name: &str) -> bool {
     letter_case_fold(name) == RESERVED
 }
 
+/// How many hexadecimal digits a Commit's number has in a temporary file's name.
+const COMMIT_ID_DIGITS: usize = 32;
+
+/// The name of the temporary file a filesystem Commit numbered `commit_id` writes for its `n`th
+/// write, to the File named `name`: `.<name>.tidings-<commit-id>-<n>`. `name` is cut short if it
+/// is long, so that the name stays within what every platform allows.
+#[cfg(feature = "fs")]
+pub(crate) fn temporary_file_name(name: &str, commit_id: u128, n: usize) -> String {
+    let mut end = name.len().min(200);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(".{}.tidings-{commit_id:0width$x}-{n}", &name[..end], width = COMMIT_ID_DIGITS)
+}
+
+/// Whether `name` is the name of a temporary file, as [`temporary_file_name`] makes them. No
+/// Path has such a name, so that a File is never taken for a temporary file.
+fn is_temporary_file_name(name: &str) -> bool {
+    let Some((before, id)) = name.rsplit_once(".tidings-") else { return false };
+    let Some((commit_id, n)) = id.split_once('-') else { return false };
+    before.len() > 1
+        && before.starts_with('.')
+        && commit_id.len() == COMMIT_ID_DIGITS
+        && commit_id.bytes().all(|digit| matches!(digit, b'0'..=b'9' | b'a'..=b'f'))
+        && !n.is_empty()
+        && n.bytes().all(|digit| digit.is_ascii_digit())
+}
+
 /// A form of `name` that is the same for two names some platform treats as the same apart from
 /// letter case, so that such names can be refused on every platform.
 ///
@@ -167,7 +197,9 @@ pub enum InvalidPathReason {
     /// The Path is not in Unicode NFC form. macOS treats different forms of the same character as
     /// one name, so only one form is allowed.
     NotNfc,
-    /// The Path is under `.tidings/`, which tidings keeps for itself.
+    /// The Path is under `.tidings/`, which tidings keeps for itself, or has a name like those of
+    /// the temporary files a filesystem Commit writes: `.<name>.tidings-<commit-id>-<n>`, where
+    /// `<commit-id>` is 32 lower-case hexadecimal digits and `<n>` a number.
     Reserved,
     /// A Prefix other than the empty one doesn't end with `/`.
     NoTrailingSlash,
@@ -192,7 +224,8 @@ impl fmt::Display for InvalidPathReason {
             InvalidPathReason::UnportableName => "a segment is not a name every platform accepts",
             InvalidPathReason::NotNfc => "it is not in Unicode NFC form",
             InvalidPathReason::Reserved => {
-                "it is under `.tidings/`, which tidings keeps for itself"
+                "it is under `.tidings/`, or named like a temporary file, which tidings keeps for \
+                 itself"
             }
             InvalidPathReason::NoTrailingSlash => "it is a Prefix that doesn't end with `/`",
             InvalidPathReason::LetterCaseClash => {

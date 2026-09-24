@@ -1,6 +1,8 @@
 //! What actually holds a Store's Files. Backends are private to the crate: the Store layer does
 //! everything that is the same for all of them, and calls into the Backend for the rest.
 
+#[cfg(feature = "fs")]
+pub(crate) mod fs;
 pub(crate) mod memory;
 #[cfg(feature = "sqlite")]
 pub(crate) mod sqlite;
@@ -9,12 +11,16 @@ use std::collections::BTreeMap;
 
 use jiff::Timestamp;
 
+#[cfg(feature = "fs")]
+use crate::Error;
 use crate::staging::{Action, Staged};
 use crate::{Area, ChangeKind, File, Origin, Path, Prefix, PrefixRevision, Result, Revision, Stat};
 
 /// The Backend a Store was opened on.
 #[derive(Debug)]
 pub(crate) enum Backend {
+    #[cfg(feature = "fs")]
+    Fs(fs::FsBackend),
     Memory(memory::MemoryBackend),
     #[cfg(feature = "sqlite")]
     Sqlite(sqlite::SqliteBackend),
@@ -25,7 +31,7 @@ pub(crate) enum Backend {
 /// It holds only what the Backend needs to read that view, never the Store's shared state, so a
 /// Snapshot doesn't keep the Change feed open after the last Store handle goes, and it can still
 /// be read after that. Memory holds the Area's Files. SQLite holds a read transaction on a
-/// connection of its own.
+/// connection of its own. The filesystem has none (ADR 0006).
 #[derive(Debug)]
 pub(crate) enum BackendSnapshot {
     Memory(memory::MemorySnapshot),
@@ -167,6 +173,8 @@ impl Plan {
 impl Backend {
     pub(crate) async fn read(&self, area: Area, path: &Path) -> Result<Option<File>> {
         match self {
+            #[cfg(feature = "fs")]
+            Backend::Fs(backend) => backend.read(area, path).await,
             Backend::Memory(backend) => Ok(backend.read(area, path)),
             #[cfg(feature = "sqlite")]
             Backend::Sqlite(backend) => backend.read(area, path).await,
@@ -175,6 +183,8 @@ impl Backend {
 
     pub(crate) async fn stat(&self, area: Area, path: &Path) -> Result<Option<Stat>> {
         match self {
+            #[cfg(feature = "fs")]
+            Backend::Fs(backend) => backend.stat(area, path).await,
             Backend::Memory(backend) => Ok(backend.stat(area, path)),
             #[cfg(feature = "sqlite")]
             Backend::Sqlite(backend) => backend.stat(area, path).await,
@@ -184,6 +194,8 @@ impl Backend {
     /// The Paths under `prefix`, in order.
     pub(crate) async fn list(&self, area: Area, prefix: &Prefix) -> Result<Vec<Path>> {
         match self {
+            #[cfg(feature = "fs")]
+            Backend::Fs(backend) => backend.list(area, prefix).await,
             Backend::Memory(backend) => Ok(backend.list(area, prefix)),
             #[cfg(feature = "sqlite")]
             Backend::Sqlite(backend) => backend.list(area, prefix).await,
@@ -193,6 +205,8 @@ impl Backend {
     /// The Prefix Revision of everything under `prefix`.
     pub(crate) async fn stat_prefix(&self, area: Area, prefix: &Prefix) -> Result<PrefixRevision> {
         match self {
+            #[cfg(feature = "fs")]
+            Backend::Fs(backend) => backend.stat_prefix(area, prefix).await,
             Backend::Memory(backend) => backend.stat_prefix(area, prefix),
             #[cfg(feature = "sqlite")]
             Backend::Sqlite(backend) => backend.stat_prefix(area, prefix).await,
@@ -203,6 +217,8 @@ impl Backend {
     /// `Unsupported` from it instead.
     pub(crate) fn supports_snapshots(&self) -> bool {
         match self {
+            #[cfg(feature = "fs")]
+            Backend::Fs(_) => false,
             Backend::Memory(_) => true,
             #[cfg(feature = "sqlite")]
             Backend::Sqlite(_) => true,
@@ -213,6 +229,8 @@ impl Backend {
     /// doesn't hold them up.
     pub(crate) async fn snapshot(&self, area: Area) -> Result<BackendSnapshot> {
         match self {
+            #[cfg(feature = "fs")]
+            Backend::Fs(_) => Err(Error::Unsupported),
             Backend::Memory(backend) => Ok(BackendSnapshot::Memory(backend.snapshot(area))),
             #[cfg(feature = "sqlite")]
             Backend::Sqlite(backend) => Ok(BackendSnapshot::Sqlite(backend.snapshot(area).await?)),
@@ -223,6 +241,8 @@ impl Backend {
     /// [`CommitRequest::plan`] works them out.
     pub(crate) async fn commit(&self, request: CommitRequest) -> Result<CommitOutcome> {
         match self {
+            #[cfg(feature = "fs")]
+            Backend::Fs(backend) => backend.commit(request).await,
             Backend::Memory(backend) => backend.commit(request),
             #[cfg(feature = "sqlite")]
             Backend::Sqlite(backend) => backend.commit(request).await,
@@ -254,5 +274,20 @@ impl BackendSnapshot {
             #[cfg(feature = "sqlite")]
             BackendSnapshot::Sqlite(snapshot) => snapshot.list(prefix).await,
         }
+    }
+}
+
+/// Runs `call` on one of tokio's blocking threads, so that it doesn't hold up the async runtime.
+#[cfg(any(feature = "fs", feature = "sqlite"))]
+async fn off_runtime<T: Send + 'static>(
+    call: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    match tokio::task::spawn_blocking(call).await {
+        Ok(result) => result,
+        Err(error) => match error.try_into_panic() {
+            Ok(panic) => std::panic::resume_unwind(panic),
+            // The runtime is shutting down.
+            Err(error) => Err(crate::Error::backend(error)),
+        },
     }
 }

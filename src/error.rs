@@ -14,6 +14,13 @@ pub enum Error {
         /// Which rule it breaks.
         reason: InvalidPathReason,
     },
+    /// The File at `path` isn't valid UTF-8, so it can't be read as text. It is still listed. Only
+    /// the filesystem can hold one, written there by another program.
+    #[error("{path} is not valid UTF-8 text")]
+    NotText {
+        /// The File's Path.
+        path: Path,
+    },
     /// A Commit was refused because at least one of its Preconditions didn't hold. Nothing was
     /// written.
     #[error("conflict: a Precondition failed for {paths:?}")]
@@ -34,7 +41,7 @@ pub enum Error {
 
 impl Error {
     /// The Backend failed with `error`.
-    #[cfg(feature = "sqlite")]
+    #[cfg(any(feature = "fs", feature = "sqlite"))]
     pub(crate) fn backend(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Error {
         Error::Backend(error.into())
     }

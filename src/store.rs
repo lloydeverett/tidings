@@ -8,16 +8,22 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
 
+#[cfg(any(feature = "fs", feature = "sqlite"))]
+use crate::AppIdentity;
 #[cfg(feature = "testing")]
 use crate::ChangeKind;
+#[cfg(feature = "fs")]
+use crate::FsOptions;
+#[cfg(feature = "sqlite")]
+use crate::SqliteOptions;
 #[cfg(feature = "testing")]
 use crate::backend::RawChange;
+#[cfg(feature = "fs")]
+use crate::backend::fs::FsBackend;
 #[cfg(feature = "sqlite")]
 use crate::backend::sqlite::{SqliteBackend, SqlitePoller};
 use crate::backend::{Backend, CommitRequest, Observed, memory::MemoryBackend};
 use crate::change::{self, FeedSender};
-#[cfg(feature = "sqlite")]
-use crate::{AppIdentity, SqliteOptions};
 use crate::{
     Area, ChangeFeed, Committed, File, IntoPath, IntoPrefix, Origin, Path, PrefixRevision, Result,
     Snapshot, Staging, Stat,
@@ -112,6 +118,31 @@ impl Store {
     /// Store together with its one Change feed.
     pub fn open_memory() -> (Store, ChangeFeed) {
         Store::open(Backend::Memory(MemoryBackend::default()), |_, _| None)
+    }
+
+    /// Opens a Store that keeps each Area in a directory, and each File in a file in it, so that
+    /// people can see and edit them. The directories are the Area's standard directory for `app`,
+    /// or are under the Root override in `options`. Opening makes each of them, and the
+    /// `.tidings/` directory tidings keeps in each, if they don't exist. If a crash interrupted a
+    /// Commit, opening finishes it if it had happened, and discards it if it hadn't. Returns the
+    /// Store together with its one Change feed.
+    ///
+    /// Other processes can open the same directories, and commit to them safely: Commits are
+    /// applied one at a time. Their Commits, and edits made to the Files by other programs, don't
+    /// arrive on the Change feed yet.
+    ///
+    /// The filesystem has no Snapshots: see [`supports_snapshots`](Self::supports_snapshots).
+    ///
+    /// Gives [`Error::Backend`](crate::Error::Backend) if a directory can't be made, or an
+    /// interrupted Commit can't be finished.
+    ///
+    /// # Panics
+    ///
+    /// If it isn't called from within a tokio runtime.
+    #[cfg(feature = "fs")]
+    pub async fn open_fs(app: &AppIdentity, options: FsOptions) -> Result<(Store, ChangeFeed)> {
+        let backend = FsBackend::open(app, options).await?;
+        Ok(Store::open(Backend::Fs(backend), |_, _| None))
     }
 
     /// Opens a Store that keeps each Area in a SQLite database of its own, in the Area's standard

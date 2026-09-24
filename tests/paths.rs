@@ -28,6 +28,13 @@ const ACCEPTED: &[&str] = &[
     "notes/.tidings",
     ".tidings2",
     ".tidings.toml",
+    // Names only like those of tidings' temporary files.
+    ".settings.toml.tidings-backup",
+    "settings.toml.tidings-0123456789abcdef0123456789abcdef-0",
+    ".settings.toml.tidings-0123456789abcdef-0",
+    ".settings.toml.tidings-0123456789abcdef0123456789abcdef",
+    ".settings.toml.tidings-0123456789abcdef0123456789abcdef-x",
+    "..tidings-0123456789abcdef0123456789abcdef-0",
 ];
 
 /// Strings that are refused as a Path, with the rule each one breaks.
@@ -93,6 +100,10 @@ const REFUSED: &[(&str, InvalidPathReason)] = &[
     // Long s and dotless i, which uppercase to `S` and `I`.
     (".tiding\u{17f}/lock", InvalidPathReason::Reserved),
     (".t\u{131}dings", InvalidPathReason::Reserved),
+    // The names of tidings' temporary files, anywhere, so that no File can be taken for one.
+    (".settings.toml.tidings-0123456789abcdef0123456789abcdef-0", InvalidPathReason::Reserved),
+    ("themes/.dark.toml.tidings-0123456789abcdef0123456789abcdef-12", InvalidPathReason::Reserved),
+    (".a.tidings-0123456789abcdef0123456789abcdef-3/b.txt", InvalidPathReason::Reserved),
 ];
 
 #[test]

@@ -1,6 +1,10 @@
 //! Tests for Backends where a second Store can be opened on the same storage, standing in for
 //! another process: SQLite and the filesystem. Each test calls its Fixture's `open` twice, and
 //! both Stores share the Fixture's Root override. Each is listed in [`two_stores_suite!`].
+#![cfg_attr(
+    not(feature = "sqlite"),
+    expect(dead_code, reason = "so far, only SQLite tells a Store about another Store's Commits")
+)]
 
 use std::collections::BTreeMap;
 
@@ -9,16 +13,26 @@ use tidings::{Area, ChangeFeed, ChangeKind, Error, FeedItem, Origin, Staging, St
 use crate::common::{assert_nothing_more, changes_in_full, next_batch, next_item};
 use crate::suite::{Fixture, Opened};
 
-/// Instantiates every test here for one Backend's [`Fixture`].
+/// Instantiates every test here for one Backend's [`Fixture`]. `committing:` instantiates only
+/// the tests of Commits from both Stores, and `seeing_each_other:` only those of each Store
+/// telling its Change feed about the other's Commits, for a Backend that can't do that yet.
 macro_rules! two_stores_suite {
-    ($fixture:expr) => {
+    (committing: $fixture:expr) => {
+        two_stores_suite!(@tests $fixture;
+            concurrent_commits_from_both_stores_keep_preconditions_exact,
+        );
+    };
+    (seeing_each_other: $fixture:expr) => {
         two_stores_suite!(@tests $fixture;
             another_stores_commit_arrives_as_one_batch_of_external_changes,
             commits_made_before_a_store_is_opened_are_not_reported_to_it,
             another_stores_commits_are_never_split_across_batches,
             commits_from_both_stores_reach_each_feed_in_the_order_they_were_applied,
-            concurrent_commits_from_both_stores_keep_preconditions_exact,
         );
+    };
+    ($fixture:expr) => {
+        two_stores_suite!(committing: $fixture);
+        two_stores_suite!(seeing_each_other: $fixture);
     };
     (@tests $fixture:expr; $($test:ident),* $(,)?) => {
         $(

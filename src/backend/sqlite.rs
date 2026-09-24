@@ -40,7 +40,7 @@ use std::time::Duration;
 use jiff::Timestamp;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
 
-use super::{AreaState, CommitOutcome, CommitRequest, Observed, Planned, RawChange};
+use super::{AreaState, CommitOutcome, CommitRequest, Observed, Planned, RawChange, off_runtime};
 use crate::app::AppIdentity;
 use crate::area::PerArea;
 use crate::path::{letter_case_fold, letter_case_fold_unicode_versions, range_under};
@@ -402,20 +402,6 @@ impl AreaConnection {
     ) -> Result<T> {
         let connection = Arc::clone(&self.0);
         off_runtime(move || call(&mut connection.lock().unwrap())).await
-    }
-}
-
-/// Runs `call` on one of tokio's blocking threads, so that it doesn't hold up the async runtime.
-async fn off_runtime<T: Send + 'static>(
-    call: impl FnOnce() -> Result<T> + Send + 'static,
-) -> Result<T> {
-    match tokio::task::spawn_blocking(call).await {
-        Ok(result) => result,
-        Err(error) => match error.try_into_panic() {
-            Ok(panic) => std::panic::resume_unwind(panic),
-            // The runtime is shutting down.
-            Err(error) => Err(Error::backend(error)),
-        },
     }
 }
 

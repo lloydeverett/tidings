@@ -5,7 +5,7 @@
 //! The terms used throughout (Store, Area, Path, Staging, Commit, Change...) are defined in the
 //! crate's `CONTEXT.md`.
 
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "fs", feature = "sqlite"))]
 mod app;
 mod area;
 mod backend;
@@ -21,9 +21,13 @@ mod snapshot;
 mod staging;
 mod store;
 
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "fs", feature = "sqlite"))]
 pub use app::AppIdentity;
 pub use area::Area;
+#[cfg(all(feature = "fs", feature = "testing"))]
+pub use backend::fs::FailurePoint;
+#[cfg(feature = "fs")]
+pub use backend::fs::FsOptions;
 #[cfg(feature = "sqlite")]
 pub use backend::sqlite::SqliteOptions;
 pub use change::{Change, ChangeFeed, ChangeKind, FeedItem, Origin};

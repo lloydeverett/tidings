@@ -17,7 +17,13 @@ pub struct Revision(u128);
 impl Revision {
     /// The Revision of a File with these contents.
     pub(crate) fn of(contents: &str) -> Revision {
-        Revision(xxh3_128(contents.as_bytes()))
+        Revision::of_bytes(contents.as_bytes())
+    }
+
+    /// The Revision of a File holding `bytes`, which on the filesystem need not be text. For
+    /// text, it is the same as [`of`](Self::of).
+    pub(crate) fn of_bytes(bytes: &[u8]) -> Revision {
+        Revision(xxh3_128(bytes))
     }
 
     /// The Revision as bytes, for a Backend to store.

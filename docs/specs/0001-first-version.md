@@ -330,7 +330,7 @@ matches a Commit this Store made, and *external* otherwise.
   - an exclusive `std::fs::File::lock` on `.tidings/lock`;
   - a two-state (`prepared` / `committed`) journal written with `atomic-write-file`;
   - temporary files next to each target, after resolving symlinks, named
-    `.<name>.tidings-<commit-id>`;
+    `.<name>.tidings-<commit-id>-<n>`, a name no Path can have;
   - renames, then removing the journal;
   - recovery during `open`.
 - **When renames fail.** They are retried briefly, then `Pending` is returned. While a committed

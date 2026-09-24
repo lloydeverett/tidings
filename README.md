@@ -4,10 +4,13 @@ Text files for an application, in three areas (config, data, cache), stored on t
 SQLite or in memory. Writes happen only through staged commits. Every change is reported on a
 change feed.
 
-Status: early. Stores in memory and on SQLite exist so far: reading, stat and listing, commits of
-writes and deletes with preconditions, checked paths, the change feed, snapshots, and on SQLite,
-seeing other processes' commits to the same databases. Still to come: the filesystem backend,
-with its watching and the resyncs that come with it, and the blocking API. See
+Status: early. Stores in memory, on SQLite and on the filesystem exist so far: reading, stat and
+listing, commits of writes and deletes with preconditions, checked paths, the change feed,
+snapshots (not on the filesystem), and on SQLite, seeing other processes' commits to the same
+databases. On the filesystem, commits are journaled, and opening a store recovers one a crash
+interrupted. Still to come on the filesystem: recovery tested at every step, `Pending` when a
+rename keeps failing, and watching, so that other processes' commits and people's edits reach the
+change feed, with the resyncs that come with it. Then the blocking API. See
 [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
 
 ## Consistency
@@ -32,17 +35,20 @@ with its watching and the resyncs that come with it, and the blocking API. See
   changes may have been missed (watching failed, an area's directory was removed, or on SQLite,
   the store fell too far behind other processes' commits), the feed sends a resync for that area
   instead: read it all again.
-- On SQLite, several processes can open the same store and commit to it. Their commits are applied
-  one at a time, and preconditions hold exactly between them. Each store checks for the others'
-  commits every poll interval (100 ms by default, set in `SqliteOptions`) and reports them as
-  external changes, each commit's in one batch, in the order they were applied. They are kept
-  for 10 minutes for stores that haven't seen them yet: a store that falls further behind than
-  that, because its process was stopped, say, gets a resync instead.
+- Several processes can open the same store on SQLite or the filesystem, and commit to it. Their
+  commits are applied one at a time, and preconditions hold exactly between them. On SQLite, each
+  store checks for the others' commits every poll interval (100 ms by default, set in
+  `SqliteOptions`) and reports them as external changes, each commit's in one batch, in the order
+  they were applied. They are kept for 10 minutes for stores that haven't seen them yet: a store
+  that falls further behind than that, because its process was stopped, say, gets a resync
+  instead.
 - The store can be cloned and shared between tasks. The change feed ends once every clone has
   been dropped, even if a snapshot is still held. Dropping the change feed leaves the store
   working.
 - Changes say which path changed, not what it now contains.
 - A read always returns a whole file, never a partly written one.
+- On the filesystem, a commit that a crash interrupts is finished when a store next opens the area
+  or commits to it, if it had happened, and discarded if it hadn't.
 - A commit can require that files, or everything under a prefix, are unchanged since you read
   them, and fails with a conflict otherwise, writing nothing and naming the paths that differ. A
   precondition you stage always has to hold, even if something staged later replaces the write or
@@ -52,19 +58,31 @@ with its watching and the resyncs that come with it, and the blocking API. See
 
 ## Limitations
 
-- Text only (UTF-8). No binary files.
+- Text only (UTF-8). No binary files. On the filesystem, a file another program wrote that isn't
+  UTF-8 is still listed, but reading it gives `Error::NotText`.
 - Paths follow the strictest platform's rules on every backend, so a path that works on one
   platform works on all of them. Names Windows reserves (such as `CON`, `aux.txt` or `COM¹`),
   control characters, a trailing dot or space, `.` and `..`, and paths not in Unicode NFC form are
-  refused, as is anything under `.tidings/`. A commit can't create a path that differs only in
-  letter case from another in the same area (`Themes/a.toml` against `themes/b.toml` counts too),
-  because some platforms treat them as the same name. Nor can it put a file under another file:
-  `a` and `a/b` can't both exist, as on a filesystem.
+  refused, as is anything under `.tidings/` and any name like those of tidings' temporary files
+  (`.<name>.tidings-<commit-id>-<n>`). A commit can't create a path that differs only in letter
+  case from another in the same area (`Themes/a.toml` against `themes/b.toml` counts too), because
+  some platforms treat them as the same name. Nor can it put a file under another file: `a` and
+  `a/b` can't both exist, as on a filesystem.
 - No moving a store's data from one backend to another.
 - No size limit or eviction for the cache area.
 - Backends are defined in this crate. You cannot plug in your own.
 - On the filesystem, other programs can see a commit half-applied. Readers going through tidings
   can't.
+- On the filesystem, files other programs make are read and listed like any other, but names that
+  aren't valid paths (not in NFC form, not UTF-8, or reserved on Windows) are left out of listings,
+  prefix revisions and prefix deletes. Two names that differ only in letter case, made by another
+  program on a case-sensitive filesystem, are both listed.
+- On the filesystem, a write to a symlinked file goes through the link to the file it points to,
+  and the link stays. Reads and listings follow symlinks.
+- On the filesystem, stat reads the whole file, to hash it, and a prefix revision reads every file
+  under the prefix.
+- On the filesystem, the change feed doesn't report other processes' commits, or edits made by
+  other programs, yet.
 - On SQLite, each area is a database (`config.sqlite3`, `data.sqlite3` or `cache.sqlite3`) in the
   area's directory, written only by tidings. Other programs writing to it directly aren't
   supported.

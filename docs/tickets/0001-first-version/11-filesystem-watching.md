@@ -28,3 +28,13 @@ silence.
 - [ ] If the watcher fails (tested with a failure point from ticket 10), a Resync for the
       affected Area is sent.
 - [ ] Dropped events and watcher errors are logged through `tracing` at debug level.
+
+**Notes from ticket 09:**
+
+- No Path can be named like a temporary file (`InvalidPathReason::Reserved`), nor be under
+  `.tidings/`. So the watcher can ignore both by dropping events whose name isn't a valid Path,
+  which listings already do for every name that isn't one.
+- `two_stores_suite!` has a `seeing_each_other:` group that only SQLite runs so far. Once other
+  Stores' Commits arrive on the filesystem, instantiate the whole suite for `Fs` in
+  tests/behaviour/main.rs, and drop the `expect(dead_code)` at the top of two_stores.rs.
+- `Store::open_fs` passes no follower to `Store::open` yet.

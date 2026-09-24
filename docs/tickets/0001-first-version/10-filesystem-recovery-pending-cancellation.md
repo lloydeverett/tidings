@@ -37,3 +37,20 @@ Named failure points in test builds make every one of these cases testable on Li
       `a_cancelled_commit_finishes_or_never_happens_and_is_reported_if_it_finishes` covers it on
       every Backend. The pause point lets a test drop the future mid-journal for certain.
 - [ ] Journal recovery is logged through `tracing` at debug level.
+
+**Notes from ticket 09:**
+
+- Failure points already exist in a small form: with `testing`, `FsOptions::fail_at(FailurePoint)`
+  stops every Commit through that Store at the point, as if the process had died (it gives
+  `Backend` and leaves the disk as it is). `FailurePoint` is `#[non_exhaustive]` and has
+  `AfterPreparedJournal`, `AfterTemporaryFile(n)` and `AfterCommittedJournal`; add the rest as
+  variants, checked with `stop_at` in src/backend/fs.rs (the rename points belong in
+  `Journal::finish`, in src/backend/fs/journal.rs). It is per
+  Store, so crash tests can run in parallel. Replace it with the `fail` crate only if that is
+  better for some reason.
+- Recovery already runs on `open` and at the start of every Commit, under the lock, and logs at
+  debug level. Finishing a journal is idempotent. A step after `committed` that fails currently
+  gives `Backend` and leaves the journal for the next Commit or `open`: that is where `Pending`
+  and the retries go. Reads don't yet look at a committed journal.
+- A Commit that only deletes writes its journal once, as `committed`, so `AfterPreparedJournal`
+  and `AfterTemporaryFile` never stop it.

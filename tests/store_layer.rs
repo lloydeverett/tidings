@@ -25,6 +25,11 @@ fn a_store_and_its_futures_can_be_shared_between_threads() {
     send(store.commit(Staging::new(Area::Config)));
     send(store.snapshot(Area::Config));
     send(feed.next());
+    #[cfg(feature = "fs")]
+    {
+        let app = tidings::AppIdentity::new("tidings tests", "tidings", "org");
+        send(Store::open_fs(&app, tidings::FsOptions::default()));
+    }
     #[cfg(feature = "sqlite")]
     {
         let app = tidings::AppIdentity::new("tidings tests", "tidings", "org");
