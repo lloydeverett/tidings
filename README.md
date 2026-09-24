@@ -4,7 +4,8 @@ Text files for an application, in three areas (config, data, cache), stored on t
 SQLite or in memory. Writes happen only through staged commits. Every change is reported on a
 change feed.
 
-Status: design only. No code yet. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
+Status: early. Only the in-memory Store, with plain writes and reads, exists so far. See
+[CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
 
 ## Consistency
 

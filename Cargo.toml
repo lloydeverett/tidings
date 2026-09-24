@@ -1,0 +1,28 @@
+[package]
+name = "tidings"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+description = "Text files for an application in config, data and cache areas, written through all-or-nothing commits, with a change feed."
+readme = "README.md"
+
+[features]
+default = ["fs", "sqlite"]
+# The filesystem Backend.
+fs = []
+# The SQLite Backend.
+sqlite = []
+# `blocking::Store`, for synchronous code.
+blocking = []
+# Failure points and helpers for tidings' own tests.
+testing = []
+
+[dependencies]
+jiff = "0.2.37"
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["sync"] }
+xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }

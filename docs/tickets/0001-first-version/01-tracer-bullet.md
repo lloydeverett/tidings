@@ -10,20 +10,20 @@ later ticket adds to and every Backend must pass.
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Cargo project: edition 2024, `rust-version` 1.94, Apache-2.0. The `fs`, `sqlite` (both on by
+- [x] Cargo project: edition 2024, `rust-version` 1.94, Apache-2.0. The `fs`, `sqlite` (both on by
       default), `blocking` and `testing` features are declared, even if still empty.
-- [ ] `Area` is a closed enum of Config, Data and Cache.
-- [ ] `Path` exists as a type that can only be created by validation. Minimal checks for now:
+- [x] `Area` is a closed enum of Config, Data and Cache.
+- [x] `Path` exists as a type that can only be created by validation. Minimal checks for now:
       relative, `/`-separated, non-empty segments. The full rules are ticket 02.
-- [ ] `Store::open_memory()` returns the Store and its Change feed.
-- [ ] A Staging for one Area can hold writes, and is built without borrowing the Store.
+- [x] `Store::open_memory()` returns the Store and its Change feed.
+- [x] A Staging for one Area can hold writes, and is built without borrowing the Store.
       Committing it applies the writes. A Staging that is dropped writes nothing.
-- [ ] `read` returns the File with its contents, a `jiff::Timestamp` last-modified time, and a
+- [x] `read` returns the File with its contents, a `jiff::Timestamp` last-modified time, and a
       Revision that is a hash of the contents.
-- [ ] Each Commit produces one batch on the Change feed containing a *changed*, *local* Change
+- [x] Each Commit produces one batch on the Change feed containing a *changed*, *local* Change
       for each Path it wrote.
-- [ ] The error type exists as `#[non_exhaustive]`, with the variants this ticket needs.
-- [ ] The shared backend test suite is set up so it can later run on every Backend, and runs on
+- [x] The error type exists as `#[non_exhaustive]`, with the variants this ticket needs.
+- [x] The shared backend test suite is set up so it can later run on every Backend, and runs on
       memory. It tests only through the public API.
