@@ -20,6 +20,10 @@ Status: design only. No code yet. See [CONTEXT.md](CONTEXT.md) and [docs/adr](do
   feed sends a resync for that area instead: read it all again.
 - Changes say which path changed, not what it now contains.
 - A read always returns a whole file, never a partly written one.
+- A commit can require that files, or everything under a prefix, are unchanged since you read
+  them, and fails with a conflict otherwise. On the filesystem this holds against other tidings
+  commits. A program outside tidings that writes a file while a commit is being applied can have
+  its edit overwritten.
 
 ## Limitations
 

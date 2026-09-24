@@ -55,6 +55,11 @@ An opaque value identifying one state of a File, as returned when the File is re
 tell whether the File has changed since then.
 _Avoid_: version, etag, last_modified (that is a timestamp, not a Revision)
 
+**Prefix Revision**:
+An opaque value identifying the state of everything under a Prefix: which Paths exist there and the
+Revision of each. It changes if a File under the Prefix is added, removed or changed.
+_Avoid_: token, digest, listing hash
+
 **Snapshot**:
 A view of one Area as it stood at a single moment, so that reading several Files through it never
 mixes the results of different Commits. Only some Backends can provide one.
@@ -67,8 +72,10 @@ An owned set of staged writes and deletes for one Area. Nothing happens until it
 _Avoid_: transaction, changeset, batch, draft
 
 **Precondition**:
-What a staged write or delete requires to hold when the Staging is committed: *any*, *absent*,
-or *unchanged since* a given Revision.
+Something a Staging requires to hold when it is committed. A staged write or delete carries one:
+*any*, *absent*, or *unchanged since* a given Revision. A Staging can also carry Preconditions on
+Files it does not write, and on a whole Prefix (*unchanged since* a given Prefix Revision).
+_Avoid_: guard, assertion
 
 **Commit**:
 Applying a Staging all-or-nothing: either every staged write and delete happens, or none do. Every

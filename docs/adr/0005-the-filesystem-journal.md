@@ -38,5 +38,11 @@ scattered across the Area that nothing knows about. The watcher ignores the temp
   finished, reads through tidings of those Paths come from the temporary files, and the next Commit
   or `open` tries the renames again. So the all-or-nothing guarantee holds for everything that
   reads through tidings.
+- The lock only keeps out other tidings Commits. A program outside tidings that writes a File
+  between step 1 and the end of step 5 is not detected by the Preconditions, and if the Commit
+  writes that File, its edit is overwritten. The filesystem has no way to replace a File only if
+  it is unchanged, so we document this window rather than trying to close it. Checking the
+  Preconditions after step 3 instead would narrow the window only by a few writes to disk, so the
+  order stays as it is.
 - We rely on tests that kill the process at every step and check what `open` recovers, not on
   reasoning alone.
