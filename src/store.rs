@@ -1,3 +1,4 @@
+use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -51,7 +52,7 @@ struct Inner {
 
 /// A Commit that has started. It runs in place while the app waits for it. If the app stops
 /// waiting, by dropping it, the rest of the Commit is handed to a task on the runtime, which
-/// finishes it. Spawning a task only then keeps the Commits nobody cancels as cheap as before.
+/// finishes it. So a task is spawned only for a Commit that is dropped, not for every Commit.
 struct Started {
     /// The rest of the Commit, until it has finished.
     commit: Option<Pin<Box<dyn Future<Output = Result<Committed>> + Send>>>,
@@ -63,9 +64,19 @@ impl Future for Started {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let commit = self.commit.as_mut().expect("a Commit is not polled once it has finished");
-        let result = std::task::ready!(commit.as_mut().poll(cx));
-        self.commit = None;
-        Poll::Ready(result)
+        let polled = panic::catch_unwind(AssertUnwindSafe(|| commit.as_mut().poll(cx)));
+        match polled {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(result)) => {
+                self.commit = None;
+                Poll::Ready(result)
+            }
+            // The Backend panicked. The Commit is over, so it is not handed on when dropped.
+            Err(panic) => {
+                self.commit = None;
+                panic::resume_unwind(panic)
+            }
+        }
     }
 }
 
@@ -185,6 +196,8 @@ impl Store {
     /// dropped while the Commit waits for the Commits before it to finish, the Commit never
     /// happens. Once the Commit has started, dropping this future hands the rest of it to a task
     /// on the tokio runtime, which finishes it: its Changes arrive on the Change feed as usual.
+    /// If the runtime is shutting down, that task can't run: the Commit may then have been
+    /// applied, or not, without its Changes being reported.
     ///
     /// # Panics
     ///

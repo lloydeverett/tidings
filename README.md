@@ -15,7 +15,8 @@ the same SQLite databases. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr)
   discarded.
 - A commit you cancel, by dropping its future (with a timeout, say), either never happens, if it
   was still waiting for earlier commits, or finishes in the background and is reported on the
-  change feed as usual. `commit` must be called from within a tokio runtime.
+  change feed as usual. `commit` must be called from within a tokio runtime. If that runtime shuts
+  down while a cancelled commit is finishing, the commit can be applied without being reported.
 - Every file a commit writes gets the same last-modified time. A write that wouldn't change a
   file's contents is left out: the file keeps its time, and no change is reported.
 - Reads are one file at a time. Reading several files can mix states from different commits.

@@ -115,5 +115,8 @@ does, the SQLite Backend does too, and the whole shared suite passes on it, incl
   Commits once and drops it, then checks that the Changes reported are exactly the Files written. On
   SQLite it failed before the fix (Files written, nothing reported), and fails again if `Started`
   drops the rest instead of spawning it. On memory it only checks the reporting, since nothing is
-  left unfinished. Ticket 10's cancellation checkbox now asks only for the filesystem test with its
-  pause point.
+  left unfinished. After the re-review, the same test also checks that a Commit dropped while
+  another holds its turn never happens (on Backends whose Commits take more than one poll). A
+  Commit dropped as the runtime shuts down can be applied unreported, which the `commit` rustdoc,
+  the README and a ticket 12 checkbox record. Ticket 10's cancellation checkbox now asks only for
+  the filesystem test with its pause point.

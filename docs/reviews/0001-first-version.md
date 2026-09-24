@@ -905,3 +905,98 @@ Standards: 1 hard violation, a justified but only partly recorded one: a unit te
 Clippy (all targets, with default features, `--no-default-features` and `--all-features`) is
 clean. `cargo test` passes with each of them: 45 behaviour tests per Backend, 5 path tests,
 3 Store-layer tests, and the SQLite unit test where `sqlite` is on.
+
+### Re-review (after the fix commit f44bcf7)
+
+The fix added a Store-layer mechanism that lets a started Commit finish after its caller drops it, plus several refactors. That is substantial, so `git diff a5c740e...f44bcf7` was reviewed again on both axes.
+
+#### Standards
+
+**Hard violations: none.**
+
+**Verification of the claimed fixes**
+
+1. **Spec (a)1, the cancelled Commit (src/store.rs:39-80, 180-210):** conforms to the standards.
+   - The fix lives in the Store layer, as spec :249 says: "once started, a Commit continues in a background task".
+   - There are no `tracing` calls and no public trait.
+   - The new test (tests/behaviour/suite.rs:1145-1180) uses only the public API: it polls the future by hand, then checks `list` and the feed.
+   - The new tokio-runtime requirement is recorded in the `# Panics` section and in a README Consistency bullet.
+   - Making tokio `rt` unconditional (Cargo.toml:29) doesn't conflict with the spec's list of features (:383-387).
+2. **The direct database edit in a unit test:** now recorded as a third exception in spec :398-400. The hard-coded `'fold_unicode_versions'` is replaced with `FOLD_UNICODE_VERSIONS` (sqlite.rs:458, 582-583). Closed.
+3. **The range trick:** properly fixed. A single `path::range_under` (path.rs:130-136) carries the explanation, and all four sites use it: memory.rs:142 and sqlite.rs:510, 536 and 540. The SQL no longer builds the range with `|| '/'`.
+4. **`Option<Written>`:** replaced by `Planned::Write | Remove` (mod.rs:126-131). No doc comment has to explain `None` any more. Fixed.
+5. **Names:** `off_runtime`, `AreaInMemory` and `AreaInDatabase` are all in place. Fixed.
+6. **`unexpected()`:** removed. `open_database` returns `crate::Result` and uses `Error::backend` (sqlite.rs:399-427). Fixed.
+7. **`paths_named_like`:** the reasoning for leaving it is sound. Not re-raised.
+8. **Duplicated read/stat/list:** now one `AreaConnection` (sqlite.rs:216-224, 337-375). Fixed.
+
+**New smells (judgement calls)**
+
+- **Possible Middle Man / Divergent Change: `error::joined`** (error.rs:595-606). It has one caller, `off_runtime` (sqlite.rs:390), is gated on `sqlite`, and moves tokio task-join handling into the error module. Before the fix this code was inline in `off_runtime`. The Resolution calls it "one helper", but nothing else shares it. Inline it back, or give it a second caller, such as the `Started` spawn.
+- **Mysterious Name: `joined(joined: …)`** (error.rs:597). The parameter shadows the function's own name, and the doc comment "What a tokio task gave, as it `joined`" reads awkwardly. `join_result` or `task_result` would be clearer.
+- **Mysterious Name (mild): `AreaConnection::call`** (sqlite.rs:365) is a generic name. `SqliteSnapshot` is now just a type alias of `AreaConnection` (sqlite.rs:224), so `Backend::Snapshot::Sqlite` holds a type whose name doesn't say it is in a read transaction. Acceptable, because the alias's doc comment says so.
+- **Comment refers to history:** `Started`'s doc comment says Commits nobody cancels stay "as cheap as before" (store.rs:673). "Before" means nothing to a later reader. Say what it avoids instead: a task for every Commit.
+- **Minor:** `paths_named_like` uses `name.to_owned()..name.to_owned()` as a deliberately empty range when the name is a File's (sqlite.rs:541). A comment explains it, but an `Option` range, with the `path` condition added only when it is `Some`, would be plainer. Low priority.
+
+No word from CONTEXT.md's `_Avoid_` lists is newly used for a domain concept. `Planned::Remove` and `AreaConnection` stay clear of them.
+
+#### Spec
+
+The Resolution's one Spec finding, (a)1, is fixed correctly, with no blocking problems. The testing was done in a scratch copy made with `git archive`; the repo was not touched.
+
+**Resolution (a)1: verified fixed.**
+- **Started at the right moment.** At `src/store.rs:193-210` there is no await point between `lock_owned()` resolving and the first poll of `Started`. The Backend's work, including `spawn_blocking`, lives only inside the async block that `Started` owns. So a Commit can't be dropped after the Backend has begun applying it but before `Started` owns it. If `Handle::current()` panics, the guard is released before anything is applied.
+- **Handoff on drop.** The boxed future is `'static + Send`. The guard moves into the async block when the block is created (`:199`), so it goes into the spawned task too. tokio's `Mutex` is FIFO, and the guard is released only after `record`, so the feed sees Commits in the order they were applied.
+- **The test catches the bug.** With the pre-fix `commit` body restored, it failed on SQLite 3 runs out of 3: 100 Files written, 0 reported. It also fails if `Started::drop` doesn't spawn, as the Resolution claims. With the fix it passed 40 runs out of 40, plus a full suite run. It is deterministic, because the first poll always parks on `spawn_blocking`.
+- **Always-on `rt` is justified.** The spec says "The API is async on tokio" (spec:40), and it places "once started, a Commit continues in a background task" in the Store layer for every Backend (spec:249). The features list (spec:382-387) says nothing about tokio's features.
+
+**(a) Missing or partial.** None.
+
+**(b) Scope creep.** None.
+
+**(c) New issues from the fix (all minor)**
+1. **A Commit can be applied but never reported when the runtime shuts down.** The spec says "once started, a Commit continues in a background task". `Started::drop` (`store.rs:72-80`) calls `Handle::spawn`, and after runtime shutdown that call silently drops the rest of the Commit. Probe: a SQLite Commit was polled once, then the runtime was dropped, then the future. `y.txt` was written, and nothing reached the still-open feed.
+   - The drop never panicked: not on current_thread, not on multi_thread with `shutdown_background`, and not outside any runtime. It uses the saved `Handle`, not `Handle::current()`.
+   - This is acceptable for an async Store that outlives its runtime. The `commit` rustdoc (`:184-187`) and the README Consistency section should say so.
+   - It matters for ticket 12's `blocking::Store`, which owns its runtime and must not drop it before its Commits finish.
+2. **The test checks only half its name.** The test is `a_cancelled_commit_finishes_or_never_happens_and_is_reported_if_it_finishes` (`tests/behaviour/suite.rs:1145`). With `lock_owned` moved inside the handed-off block, a Commit dropped while waiting its turn would still happen, and the test still passed. It checks that what was reported equals what was written, not "never happens". So the `commit` rustdoc's promise ("dropped while … waits … the Commit never happens") has no test. The fix is to check that every Commit that was `Poll::Pending`, after the first, is missing from the listing.
+3. **Memory `commit` now panics outside tokio** (probe: "no reactor running", `store.rs:210`). Before, it worked on any executor. This is documented under `# Panics` and matches spec:40, so it's a note, not a defect.
+4. **A panicking Backend is polled again in a task.** If the Backend panics (resumed through `error::joined`), `Started` is dropped during unwinding with `commit` still `Some`. It then spawns the poisoned future, and the task panics a second time ("resumed after panicking"). That's harmless but noisy. Setting `commit` to `None` before re-raising would avoid it.
+
+`--no-default-features --features testing` also passes: 45 + 5 + 3 tests.
+
+#### Summary
+
+Standards: every claimed fix is verified, with 0 hard violations and 5 small new judgement calls. The most notable is `error::joined`, a helper with only one caller. Spec: the cancelled-Commit fix is verified correct and deterministic, with 4 minor new issues. The worst is that a Commit started just before the runtime shuts down can be applied but never reported. That is acceptable, but it has to be documented, and ticket 12's blocking Store must allow for it.
+
+
+#### Resolution
+
+1. **Spec c1, the runtime shutting down:** documented, not changed.
+   - The `commit` rustdoc now says that if the runtime is shutting down, a cancelled Commit may
+     have been applied, or not, without its Changes being reported.
+   - The README Consistency bullet on cancelling says the same.
+   - Ticket 12 has a new unticked checkbox: `blocking::Store` must not shut its runtime down
+     while a Commit is in flight.
+2. **Spec c2, the "never happens" half:** now tested, in the same suite test. A Commit
+   `holding.txt` is polled once and kept. If it is still unfinished, it holds its turn. A second
+   Commit, `waiting.txt`, is then polled once, must be pending, and is dropped. Once `holding`
+   finishes, `waiting.txt` must not exist.
+   - On memory, a Commit finishes in one poll, so this part has nothing to wait for and checks
+     nothing more there.
+   - With `lock_owned` moved inside the handed-off block, the test failed on SQLite in 5 of 5
+     runs ("a Commit dropped waiting happened"). With the fix it passed 20 of 20.
+3. **Spec c4, a panicking Backend polled again:** fixed. `Started::poll` catches a panic from
+   the Commit, sets `commit` to `None`, and raises it again. So `Started::drop` has nothing to
+   hand on.
+4. **`error::joined`:** inlined back into `off_runtime`, its only caller.
+5. **The `Started` doc comment:** now says what it avoids: a task is spawned only for a Commit
+   that is dropped, not for every Commit.
+6. **Left as they are:**
+   - `AreaConnection::call`. It is private, and "call this with the connection" is what it does.
+     The `SqliteSnapshot` alias's doc says the connection is in a read transaction.
+   - The empty range in `paths_named_like`. An `Option` would mean two SQL statements, or a
+     condition built at runtime, for what one commented line does now.
+
+Clippy (all targets, with default features, `--no-default-features` and `--all-features`) is
+clean. `cargo test` passes with each of them.

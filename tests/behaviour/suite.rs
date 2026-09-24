@@ -1154,10 +1154,27 @@ pub async fn a_cancelled_commit_finishes_or_never_happens_and_is_reported_if_it_
     for i in 0..100 {
         let mut staging = Staging::new(Area::Data);
         staging.write(format!("cancelled/{i}.txt"), "x").unwrap();
-        let mut commit = std::pin::pin!(store.commit(staging));
-        let polled = std::future::poll_fn(|cx| Poll::Ready(commit.as_mut().poll(cx))).await;
-        if let Poll::Ready(result) = polled {
+        if let Poll::Ready(result) = poll_once(std::pin::pin!(store.commit(staging))).await {
             result.unwrap();
+        }
+    }
+
+    // A Commit dropped while it waits for its turn never happens. While `holding` is kept and
+    // not finished, it holds its turn, so `waiting` must wait. Where a Backend's Commit finishes
+    // in one poll, as memory's does, `holding` is already done and there is nothing to wait for.
+    let mut staging = Staging::new(Area::Data);
+    staging.write("cancelled/holding.txt", "x").unwrap();
+    let mut holding = std::pin::pin!(store.commit(staging));
+    let mut waited = false;
+    match poll_once(holding.as_mut()).await {
+        Poll::Ready(result) => drop(result.unwrap()),
+        Poll::Pending => {
+            let mut staging = Staging::new(Area::Data);
+            staging.write("cancelled/waiting.txt", "x").unwrap();
+            let waiting = poll_once(std::pin::pin!(store.commit(staging))).await;
+            assert!(waiting.is_pending(), "a Commit can't finish while another holds its turn");
+            holding.await.unwrap();
+            waited = true;
         }
     }
     // Commits are applied in turn, so once this one returns, every one that started has
@@ -1177,6 +1194,10 @@ pub async fn a_cancelled_commit_finishes_or_never_happens_and_is_reported_if_it_
     reported.remove("last.txt");
     let written: BTreeSet<_> = list(&store, Area::Data, "cancelled/").await.into_iter().collect();
     assert_eq!(reported, written, "every Commit that happened, and only those, is reported");
+    assert!(written.contains("cancelled/holding.txt"));
+    if waited {
+        assert!(!written.contains("cancelled/waiting.txt"), "a Commit dropped waiting happened");
+    }
 }
 
 pub async fn a_snapshot_reads_the_area_as_it_was_when_taken(fixture: &impl Fixture) {
@@ -1365,6 +1386,11 @@ async fn list(store: &Store, area: Area, prefix: &str) -> Vec<String> {
 /// Paths as strings, for comparing.
 fn as_strings(paths: &[Path]) -> Vec<String> {
     paths.iter().map(|path| path.as_str().to_owned()).collect()
+}
+
+/// Polls `future` once, and gives what that gave.
+async fn poll_once<F: Future>(mut future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
+    std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await
 }
 
 /// Checks that a Commit failed with a Conflict on exactly `expected`.

@@ -21,3 +21,7 @@ can wait for the Change feed on a plain thread.
       blocking Store. Holding the Store would keep the Change feed open while the Snapshot is
       held, and holding nothing would leave it unable to read once the Store is dropped (ticket
       06 decided a Snapshot outlives its Store without keeping the feed open).
+- [ ] `blocking::Store` doesn't shut its runtime down while a Commit is in flight. A Commit whose
+      future is dropped once it has started finishes in a task on the runtime (ticket 07's
+      review). If the runtime is gone by then, the Commit can be applied without its Changes
+      being reported.

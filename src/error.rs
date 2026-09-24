@@ -40,18 +40,5 @@ impl Error {
     }
 }
 
-/// What a tokio task gave, as it `joined`: its own result, or its panic, raised again here.
-#[cfg(feature = "sqlite")]
-pub(crate) fn joined<T>(joined: Result<Result<T>, tokio::task::JoinError>) -> Result<T> {
-    match joined {
-        Ok(result) => result,
-        Err(error) => match error.try_into_panic() {
-            Ok(panic) => std::panic::resume_unwind(panic),
-            // The runtime is shutting down.
-            Err(error) => Err(Error::backend(error)),
-        },
-    }
-}
-
 /// A `Result` whose error is tidings' [`Error`].
 pub type Result<T, E = Error> = std::result::Result<T, E>;

@@ -20,7 +20,6 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavio
 use super::{AreaState, CommitOutcome, CommitRequest, Planned};
 use crate::app::AppIdentity;
 use crate::area::PerArea;
-use crate::error::joined;
 use crate::path::{letter_case_fold, letter_case_fold_unicode_versions, range_under};
 use crate::{Area, Error, File, Path, Prefix, PrefixRevision, Result, Revision, Stat};
 
@@ -199,7 +198,14 @@ impl AreaConnection {
 async fn off_runtime<T: Send + 'static>(
     call: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    joined(tokio::task::spawn_blocking(call).await)
+    match tokio::task::spawn_blocking(call).await {
+        Ok(result) => result,
+        Err(error) => match error.try_into_panic() {
+            Ok(panic) => std::panic::resume_unwind(panic),
+            // The runtime is shutting down.
+            Err(error) => Err(Error::backend(error)),
+        },
+    }
 }
 
 /// Opens the database at `path`, creating it if it doesn't exist, in WAL mode, with its schema
