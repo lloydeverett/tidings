@@ -30,7 +30,8 @@ processes' commits reach the change feed. Still to come: the blocking API. See
   `supports_snapshots()`.
 - Every change after `open` returns is reported. Unread changes to the same path are merged into
   one: the latest kind wins, and it counts as external if any of them was, so skipping your own
-  changes never hides anyone else's. A commit's changes always arrive in the same batch. If
+  changes never hides anyone else's. A commit's changes always arrive in the same batch, if the
+  store made it, or on SQLite (on the filesystem, see below for other processes' commits). If
   changes may have been missed (watching failed, an area's directory was removed, or on SQLite,
   the store fell too far behind other processes' commits), the feed sends a resync for that area
   instead: read it all again.
@@ -53,8 +54,11 @@ processes' commits reach the change feed. Still to come: the blocking API. See
   keep changing for longer than four windows. Unlike on SQLite, a store's own commit can reach
   its feed before another process's commits made just before it, which arrive once they settle.
   If watching fails or loses track of events, or an area's directory is removed or renamed away
-  (the cache cleared, say), that area gets a resync, and a removed directory is made again, and
-  watched again.
+  (the cache cleared, say), that area gets a resync, and is watched again, a removed directory
+  being made again first. If an area can't be watched, when the store opens or later (as when
+  the platform's limit on watches is reached), the store still opens and works, and watching the
+  area is tried again, after the debounce window, then twice as long each time, up to half a
+  minute. Changes to it are missed meanwhile, so it gets a resync once it is watched.
 - The store can be cloned and shared between tasks. The change feed ends once every clone has
   been dropped, even if a snapshot is still held. Dropping the change feed leaves the store
   working.
@@ -117,17 +121,20 @@ processes' commits reach the change feed. Still to come: the blocking API. See
 - On the filesystem, stat reads the whole file, to hash it, and a prefix revision reads every file
   under the prefix.
 - On the filesystem, watching remembers every file in each area, to tell what an event changed:
-  memory in proportion to the number of files. It learns a file's contents only when it changes,
-  so until then, writing a file that was there when the store opened again with the same
-  contents, or setting only its modification time, reports a change.
+  memory in proportion to the number of files. It reads the config area's files when the store
+  opens, but in the data and cache areas, which can be large, it learns a file's contents only
+  when it changes. So until then, writing a file there that was there when the store opened again
+  with the same contents, or setting only its modification time, reports a change.
 - On the filesystem, an edit to the file a symlinked file points to is reported for the link,
-  wherever that file is, and links made, changed or removed while the store runs are followed.
-  If that file is outside the areas and its directory is removed or replaced, edits there are no
-  longer seen until the link changes or a store opens again. Symlinks to directories aren't watched through: edits
-  under a link to a directory elsewhere in the area are reported under that directory's own
-  prefix only, and edits under a link to a directory outside the areas aren't reported. Where a
-  commit writes a file through a symlink, another path that is the same file gets an external
-  change.
+  wherever that file is, and so is retargeting any link on the way, through a chain of links.
+  Links made, changed or removed while the store runs are followed. If a link or file on the way
+  is outside the areas and its directory is removed or replaced, edits there are no longer seen
+  until the link in the area changes or a store opens again. Symlinks to directories aren't
+  watched through, whether in an area or on the way to a linked file: edits under a link to a
+  directory elsewhere in the area are reported under that directory's own prefix only, edits
+  under a link to a directory outside the areas aren't reported, and neither is retargeting a
+  directory link on the way to a linked file. Where a commit writes a file through a symlink,
+  another path that is the same file gets an external change.
 - On SQLite, each area is a database (`config.sqlite3`, `data.sqlite3` or `cache.sqlite3`) in the
   area's directory, written only by tidings. Other programs writing to it directly aren't
   supported.

@@ -146,8 +146,8 @@ impl FsOptions {
     /// interrupted Commit is recovered.
     ///
     /// [`FailurePoint::RenameFails`] and [`FailurePoint::CommittedJournalFails`] are different:
-    /// each makes a step fail, as described there. [`FailurePoint::WatchingFails`] makes watching
-    /// fail.
+    /// each makes a step fail, as described there. [`FailurePoint::WatchingFails`] and
+    /// [`FailurePoint::WatchingAnAreaFails`] make watching fail.
     #[cfg(feature = "testing")]
     pub fn fail_at(mut self, point: FailurePoint) -> FsOptions {
         self.fail_at = Some(point);
@@ -217,7 +217,8 @@ impl Pause {
 /// A named point in a filesystem Commit, where [`FsOptions::fail_at`] stops it and
 /// [`FsOptions::pause_at`] holds it, or with [`RenameFails`](Self::RenameFails) and
 /// [`CommittedJournalFails`](Self::CommittedJournalFails), a step that fails, or with
-/// [`WatchingFails`](Self::WatchingFails), watching. For tidings' own tests.
+/// [`WatchingFails`](Self::WatchingFails) and [`WatchingAnAreaFails`](Self::WatchingAnAreaFails),
+/// watching. For tidings' own tests.
 #[cfg(feature = "testing")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -247,9 +248,16 @@ pub enum FailurePoint {
     /// if forcing its directory to disk failed.
     CommittedJournalFails,
     /// Watching the Areas' directories fails: the first events that could change a File are
-    /// replaced by an error naming them, as the platform's watcher gives when it fails. Not a
-    /// point in a Commit.
+    /// replaced by an error naming them, as the platform's watcher gives when it fails, and the
+    /// watches of the Areas they are in are lost, as they can be then. Not a point in a Commit.
     WatchingFails,
+    /// Watching an Area's directory, when the Store opens or again later, fails the first `times`
+    /// times, as it does once the platform's limit on watches is reached. The Areas are watched
+    /// in order of Area. Not a point in a Commit.
+    WatchingAnAreaFails {
+        /// How many times it fails.
+        times: usize,
+    },
 }
 
 /// What [`FsOptions::fail_at`] and [`FsOptions::pause_at`] set up, for each Area of a Store.
@@ -309,7 +317,13 @@ impl FsBackend {
         let roots = app.area_directories(options.root_override.as_deref())?;
         let window = options.debounce_window.unwrap_or(watch::DEFAULT_WINDOW);
         #[cfg(feature = "testing")]
-        let watching_fails = options.fail_at == Some(FailurePoint::WatchingFails);
+        let watch_failures = watch::WatchFailures {
+            first_events: options.fail_at == Some(FailurePoint::WatchingFails),
+            watching_an_area: match options.fail_at {
+                Some(FailurePoint::WatchingAnAreaFails { times }) => times,
+                _ => 0,
+            },
+        };
         #[cfg(feature = "testing")]
         let failures = FailureSetup {
             fail_at: options.fail_at,
@@ -348,7 +362,7 @@ impl FsBackend {
                 watching,
                 window,
                 #[cfg(feature = "testing")]
-                watching_fails,
+                watch_failures,
             )
         })
         .await?;
@@ -397,7 +411,7 @@ impl FsBackend {
     pub(crate) async fn commit(&self, request: CommitRequest) -> Result<CommitOutcome> {
         let area = request.staged.area;
         let outcome = self.off_runtime(area, move |root| root.commit(request)).await?;
-        watch::lock(self.reported.get(area)).committed(&outcome);
+        watch::lock_ignoring_poison(self.reported.get(area)).committed(&outcome);
         Ok(outcome)
     }
 

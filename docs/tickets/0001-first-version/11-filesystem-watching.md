@@ -18,7 +18,11 @@ silence.
       *changed* or *removed* Change.
 - [x] Changes from this Store's own Commits are tagged *local*, by matching the Revisions it
       committed.
-- [x] External events that turn out not to change a File's contents are dropped.
+- [x] External events that turn out not to change a File's contents are dropped. (Partly: in
+      Config, whose Files are read when the Store opens, and elsewhere once a File has changed.
+      A File in Data or Cache untouched since `open` has no known Revision, so rewriting it with
+      the same contents, or setting only its mtime, reports a Change. Reading every File there
+      at `open` would mean reading the whole Cache. Documented in the README's Limitations.)
 - [x] Events for `.tidings/` and tidings' temporary files are ignored.
 - [x] The target of a symlinked File is watched, so edits made through the target arrive as
       Changes for the linking Path.
@@ -108,3 +112,16 @@ silence.
   filesystem suite running alongside; the made-apart test failed every time under that load
   before slow Commits were waited for, and never after. Linux (inotify) is the only platform
   tested.
+
+**Changed after the review** (see its Resolution in docs/reviews/0001-first-version.md):
+
+- The watcher no longer reads a burst holding the Commit turn. It reads without it, while
+  `Reported` notes the Paths the Store's Commits change meanwhile, then takes the turn to read
+  those again, compare and record.
+- Every link in a chain of symlinks is watched and followed again when any of them changes.
+- After a Resync for lost events or an error, the Area is watched again from its root. An Area
+  that can't be watched, at `open` or later, is retried with backoff (a window, doubling, up to
+  30 s) and gets a Resync once watched; `open` no longer fails for it, only if no watcher can be
+  made at all. `FailurePoint::WatchingAnAreaFails { times }` tests it, and `WatchingFails` now
+  also loses the Area's watches.
+- Config's Files are read when the Store opens, so identical rewrites there are dropped.

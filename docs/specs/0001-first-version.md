@@ -368,13 +368,16 @@ other difference is *external*.
   Settled while building it (ticket 11; the watcher's module doc has the detail):
   - For each name that events settled for, the watcher reads the File as reads through tidings
     see it, and compares it with what the Change feed was last told of it. So edits that don't
-    change the contents, and the Store's own Commits, give nothing. It looks at the names in turn
-    with the Store's Commits, so each Commit is recorded before its events are looked at.
-  - What was reported is kept for every File in each Area, listed when the Store opens without
-    reading the Files: memory in proportion to the number of Files. A File's Revision is known
-    once it changes, so rewriting a File that hasn't changed since the Store opened with the same
-    contents reports a Change. Events that can't be writes (a File read, touched, or its
-    permissions changed) are dropped before that.
+    change the contents, and the Store's own Commits, give nothing. It reads without the Store's
+    turn with Commits, then takes the turn only to read again the Files the Store's Commits
+    changed meanwhile, compare, and record, so that a flood of external Files doesn't hold up
+    Commits.
+  - What was reported is kept for every File in each Area, listed when the Store opens:
+    memory in proportion to the number of Files. Config's Files are read then; in Data and Cache,
+    which can be large, a File's Revision is known once it changes. So rewriting a File there
+    that hasn't changed since the Store opened with the same contents reports a Change. Events
+    that can't be writes (a File read, touched, or its permissions changed) are dropped before
+    that.
   - A Commit left `Pending` is reported once, by the Store that made it, and by other Stores once
     its journal has settled, since reads show it finished. Its renames landing later give
     nothing.
@@ -384,7 +387,12 @@ other difference is *external*.
     before it. So on the filesystem, "a Commit's Changes are never split across batches" holds
     for the Store's own Commits, as ADR 0003 says. SQLite, which reads other Stores' Commits from
     its log, keeps both promises for them too.
-  - Directories are watched under their own names only, not through symlinks to directories.
+  - Every link in a chain of symlinks to a File is watched, not only the file at the end.
+    Directories are watched under their own names only, not through symlinks to directories.
+  - After a Resync for lost events or a failure, the Area is watched again from its root, since
+    the platform's watcher may have lost watches. An Area that can't be watched, when the Store
+    opens or later, is tried again with a growing wait, and gets a Resync once it is watched: the
+    Store opens anyway.
 
 ### SQLite Backend
 

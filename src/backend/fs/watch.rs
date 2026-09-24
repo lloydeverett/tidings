@@ -29,19 +29,27 @@
 //! looked at, so that it is reported whole: whatever came before that File's events has settled
 //! too.
 //!
-//! **Local and external.** The Store's own Commits are reported by the Store, as local, and each
-//! one updates [`Reported`] as it does. The watcher looks at a burst holding the Store's turn with
-//! Commits, as they do, so it sees each of them done and reported, or not started: their events
-//! then find the Files as reported, and give nothing. The same goes for a Commit that gave
-//! `Pending`, whose renames land later. So every Change the watcher gives is external.
+//! **Local and external, without holding up Commits.** The Store's own Commits are reported by the
+//! Store, as local, and each one updates [`Reported`] while it holds the Store's turn with Commits.
+//! The watcher looks at a burst in two steps. First, without the turn, it reads and hashes what
+//! the events name ([`Looked`]), while [`Reported`] notes each Path the Store's Commits change
+//! meanwhile. Then, holding the turn, it reads those Paths again, compares everything with
+//! [`Reported`], and records the difference. So a Commit waits only for that second step, which
+//! reads just the Files the Store's own Commits changed during the first. What the watcher
+//! compares is then as if it had read it all holding the turn: a Commit that updated [`Reported`]
+//! before the first step began had changed the disk before it too, and one that updated it after
+//! noted its Paths, which are read again. So the Store's own Commits, and a Commit that gave
+//! `Pending`, whose renames land later, find the Files as reported, and give nothing, and every
+//! Change the watcher gives is external.
 //!
 //! **What is remembered.** [`Reported`] holds every File in the Area, so that removing a
 //! directory, or a File no event names, can be told apart from nothing: memory in proportion to
-//! the number of Files. It starts from a listing when the Store opens, which doesn't read the
-//! Files, so it knows no Revision until a File changes. Until then, an event that rewrites a File
-//! with the same contents gives a Change, and so does setting only its modification time, which
-//! inotify reports as a write. (It is known for the Files of a Commit in the journal,
-//! which are read, so that finishing it later gives nothing.)
+//! the number of Files. It starts from a listing when the Store opens. Config's Files are read
+//! then, so their Revisions are known; the other Areas' aren't, since a Cache can be large, so it
+//! knows no Revision until a File changes. Until then, an event that rewrites a File there with
+//! the same contents gives a Change, and so does setting only its modification time, which
+//! inotify reports as a write. (The Revisions of the Files of a Commit in the journal are known
+//! in every Area, so that finishing it later gives nothing.)
 //!
 //! **Removals the debouncer drops.** The debouncer drops the events of a name that was created and
 //! then removed within the window. But a File replaced by a rename looks created, so one replaced
@@ -49,19 +57,25 @@
 //! takes every name the debouncer saw removed or renamed away, through its file ID cache, and
 //! looks at it once it has settled.
 //!
-//! **Symlinks.** A symlinked File is read through its link, but an edit to the file it points to
-//! gives events for that file only. So the watcher keeps each link's target, watches the target's
-//! directory if it is outside the Areas, and looks at the linking Path whenever its target has
-//! events. It notices links made, changed or removed from their Paths' events. Symlinks to
-//! directories aren't followed by watching: each directory is watched under its own name only,
-//! so a directory reachable under two Prefixes isn't reported under both. So edits under a link to
-//! a directory elsewhere in the Area arrive under that directory's own Prefix, and edits under a
-//! link to a directory outside the Areas aren't reported.
+//! **Symlinks.** A symlinked File is read through its links, but an edit to the file at the end
+//! gives events for that file only, and so does retargeting a link on the way. So the watcher keeps
+//! each chain of links, watches the directory of each link and of the file at the end if it is
+//! outside the Areas, and looks at the linking Path whenever any of them has events, following the
+//! chain again. It notices links made, changed or removed from their Paths' events. Symlinks to
+//! directories aren't followed by watching, and neither are those on the way to a link: each
+//! directory is watched under its own name only, so a directory reachable under two Prefixes
+//! isn't reported under both. So edits under a link to a directory elsewhere in the Area arrive
+//! under that directory's own Prefix, and edits under a link to a directory outside the Areas
+//! aren't reported.
 //!
-//! **Resyncs.** If the watcher reports an error, or that it lost track of events, the Areas it
-//! concerns get a Resync, and what was reported of them is listed again. If an Area's root is
-//! removed, or renamed away, it is made again, with its `.tidings/`, watched again, and gets a
-//! Resync.
+//! **Resyncs, and watching again.** If the watcher reports an error, or that it lost track of
+//! events, the Areas it concerns get a Resync, and each is watched again from its root, since the
+//! platform's watcher may have lost watches, or missed directories made meanwhile. If an Area's
+//! root is removed, or renamed away, it is made again, with its `.tidings/`, watched again, and
+//! gets a Resync. Either way, the Area is listed again. If watching an Area fails, when the Store
+//! opens or again later, as it does once the platform's limit on watches is reached, it is tried
+//! again after a window, then after twice as long each time up to half a minute, and the Area gets
+//! a Resync once it is watched.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -78,7 +92,7 @@ use notify_debouncer_full::{
 use tokio::sync::{Notify, mpsc};
 
 use super::journal::AsFinished;
-use super::{AreaRoot, failed, through_links};
+use super::{AreaRoot, failed};
 use crate::area::PerArea;
 use crate::backend::{CommitOutcome, Observed, RawChange, off_runtime};
 use crate::path::{is_temporary_file_name, range_under};
@@ -90,13 +104,20 @@ const JOURNAL: &str = ".tidings/journal";
 /// The debounce window when [`FsOptions`](super::FsOptions) doesn't set one.
 pub(super) const DEFAULT_WINDOW: Duration = Duration::from_millis(150);
 
+/// The longest the watcher waits before trying again to watch an Area that it couldn't.
+const LONGEST_RETRY: Duration = Duration::from_secs(30);
+
 /// What the Change feed has been told of an Area's Files: each File there, with its Revision if it
 /// is known. The Store's Commits and the watcher keep it up to date as they report Changes, both
 /// holding the Store's turn with Commits.
 #[derive(Debug, Default)]
 pub(super) struct Reported {
-    /// Each File's Path, and its Revision if it is known.
+    /// Each File's Path, and its Revision if it is known. Keyed by the Path's string, so that the
+    /// Files under a Prefix are a range of keys ([`range_under`]).
     files: BTreeMap<String, Option<Revision>>,
+    /// While the watcher looks at a burst without the turn, each Path the Store's Commits changed
+    /// since it began.
+    changed_while_looking: Option<BTreeSet<Path>>,
 }
 
 impl Reported {
@@ -112,78 +133,134 @@ impl Reported {
                     self.files.remove(path.as_str());
                 }
             }
+            if let Some(changed) = &mut self.changed_while_looking {
+                changed.insert(path.clone());
+            }
         }
     }
 
-    /// Compares what was reported of `name`, and of the Files under it if it is or was a
-    /// directory, with how reads through tidings see them now (`finished`). Adds each difference
-    /// to `changes`, takes it as reported, and adds each File it found or lost to `looked_at`.
-    fn catch_up(
-        &mut self,
-        finished: &AsFinished<'_>,
-        name: &str,
-        changes: &mut BTreeMap<Path, ChangeKind>,
-        looked_at: &mut Vec<Path>,
-    ) -> Result<()> {
-        let path = Path::stored(name.to_owned());
-        let now = revision_of(finished, &path)?;
-        match (self.files.get(name), now) {
-            (Some(Some(before)), Some(now)) if *before == now => {}
-            (_, Some(now)) => {
-                self.files.insert(name.to_owned(), Some(now));
-                changes.insert(path.clone(), ChangeKind::Changed);
-            }
-            (Some(_), None) => {
-                self.files.remove(name);
-                changes.insert(path.clone(), ChangeKind::Removed);
-            }
-            (None, None) => {}
-        }
-        looked_at.push(path);
+    fn is_reported(&self, path: &Path) -> bool {
+        self.files.contains_key(path.as_str())
+    }
 
-        let there = finished.paths_under(&Prefix::new(format!("{name}/"))?)?;
-        let reported_under = self.files.range(range_under(name));
-        let gone: Vec<String> = reported_under
-            .map(|(under, _)| under)
-            .filter(|under| there.binary_search_by(|path| path.as_str().cmp(under)).is_err())
-            .cloned()
-            .collect();
-        for gone in gone {
-            self.files.remove(&gone);
-            let path = Path::stored(gone);
-            changes.insert(path.clone(), ChangeKind::Removed);
-            looked_at.push(path);
+    /// Starts noting the Paths the Store's Commits change, as the watcher starts looking.
+    fn start_looking(&mut self) {
+        self.changed_while_looking = Some(BTreeSet::new());
+    }
+
+    /// Stops noting the Paths the Store's Commits change, and gives them.
+    fn stop_looking(&mut self) -> BTreeSet<Path> {
+        self.changed_while_looking.take().unwrap_or_default()
+    }
+
+    /// Compares what the watcher `looked` at with what was reported, takes the difference as
+    /// reported, and gives it.
+    fn catch_up(&mut self, looked: Looked) -> Vec<RawChange> {
+        let mut changes = BTreeMap::new();
+        for (path, now) in &looked.files {
+            match (self.files.get(path.as_str()), *now) {
+                (Some(Some(before)), Now::There(Some(now))) if *before == now => {}
+                (_, Now::There(None)) | (None, Now::Absent) => {}
+                (_, Now::There(Some(now))) => {
+                    self.files.insert(path.as_str().to_owned(), Some(now));
+                    changes.insert(path.clone(), ChangeKind::Changed);
+                }
+                (Some(_), Now::Absent) => {
+                    self.files.remove(path.as_str());
+                    changes.insert(path.clone(), ChangeKind::Removed);
+                }
+            }
         }
-        for path in there {
-            if self.files.contains_key(path.as_str()) {
-                continue;
+        let looked_at: BTreeSet<&str> = looked.files.keys().map(Path::as_str).collect();
+        for name in &looked.under {
+            let reported_under = self.files.range(range_under(name.as_str()));
+            let gone: Vec<String> = reported_under
+                .map(|(under, _)| under)
+                .filter(|under| !looked_at.contains(under.as_str()))
+                .cloned()
+                .collect();
+            for gone in gone {
+                self.files.remove(&gone);
+                changes.insert(Path::stored(gone), ChangeKind::Removed);
             }
-            // Removed again since it was listed, it was never there as far as the feed knows.
-            if let Some(revision) = revision_of(finished, &path)? {
-                self.files.insert(path.as_str().to_owned(), Some(revision));
-                changes.insert(path.clone(), ChangeKind::Changed);
-                looked_at.push(path);
-            }
+        }
+        changes.into_iter().map(|(path, kind)| RawChange { path, kind }).collect()
+    }
+
+    /// Takes the Files `listed` as reported, in place of what was.
+    fn replace(&mut self, listed: Looked) {
+        let there = listed.files.into_iter().filter_map(|(path, now)| match now {
+            Now::There(revision) => Some((path.as_str().to_owned(), revision)),
+            Now::Absent => None,
+        });
+        self.files = there.collect();
+    }
+}
+
+/// What the watcher saw of some Files of an Area, looking without the Store's turn with Commits.
+#[derive(Debug, Default)]
+struct Looked {
+    /// Each File looked at, and how reads through tidings saw it.
+    files: BTreeMap<Path, Now>,
+    /// Each name every File under which was looked at: a File reported under one of them that
+    /// isn't in `files` is gone.
+    under: Vec<Path>,
+    /// Whether every File in the Area was looked at, listing it.
+    everything: bool,
+}
+
+/// How reads through tidings saw a File.
+#[derive(Debug, Clone, Copy)]
+enum Now {
+    Absent,
+    /// There, with its Revision. When looking at the Files under a name, one reported already
+    /// isn't read, and has none: its own events say if it changed. In a listing, a File not
+    /// read has none.
+    There(Option<Revision>),
+}
+
+impl Looked {
+    /// Whether `path` was among what was looked at.
+    fn covers(&self, path: &Path) -> bool {
+        self.everything
+            || self.files.contains_key(path)
+            || self.under.iter().any(|name| {
+                let rest = path.as_str().strip_prefix(name.as_str());
+                rest.is_some_and(|rest| rest.starts_with('/'))
+            })
+    }
+
+    /// Reads again each of `changed`, which the Store's Commits changed while the watcher looked,
+    /// that was among what was looked at.
+    fn look_again(&mut self, root: &AreaRoot, changed: &BTreeSet<Path>) -> Result<()> {
+        let changed: Vec<&Path> = changed.iter().filter(|path| self.covers(path)).collect();
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let finished = root.as_finished()?;
+        for path in changed {
+            self.files.insert(path.clone(), now(&finished, path)?);
         }
         Ok(())
     }
 }
 
-/// The Revision of the File at `path`, as reads through tidings see it, or `None` if there is
-/// none.
-fn revision_of(finished: &AsFinished<'_>, path: &Path) -> Result<Option<Revision>> {
-    Ok(finished.read(path)?.map(|(contents, _)| Revision::of_bytes(&contents)))
+/// How reads through tidings see the File at `path` now.
+fn now(finished: &AsFinished<'_>, path: &Path) -> Result<Now> {
+    let read = finished.read(path)?;
+    Ok(read.map_or(Now::Absent, |(contents, _)| Now::There(Some(Revision::of_bytes(&contents)))))
 }
 
-/// `reported`, locked. It holds no invariant a panic could break half way, so a poisoned lock is
-/// used as it is.
-pub(super) fn lock<T>(reported: &Mutex<T>) -> MutexGuard<'_, T> {
-    reported.lock().unwrap_or_else(PoisonError::into_inner)
+/// `mutex`, locked. Nothing locked with it holds an invariant a panic could break half way, so a
+/// poisoned lock is used as it is.
+pub(super) fn lock_ignoring_poison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The watcher of a Store's Areas, started when the Store opens. The Store runs it in a task of
-/// its own: [`next_burst`](Self::next_burst) waits for events, and [`observe`](Self::observe)
-/// works out what they changed. Dropping it stops watching.
+/// its own: [`next_burst`](Self::next_burst) waits for events, [`look`](Self::look) reads what
+/// they name, and [`conclude`](Self::conclude), called holding the Store's turn with Commits, works
+/// out what changed. Dropping it stops watching.
 #[derive(Debug)]
 pub(crate) struct FsWatcher {
     /// What the debouncer reports.
@@ -191,7 +268,7 @@ pub(crate) struct FsWatcher {
     removals: Arc<Removals>,
     watched: Arc<Mutex<Watched>>,
     /// Each Area's root, to wait for a Commit being applied to it.
-    roots: Vec<Arc<AreaRoot>>,
+    area_roots: Vec<Arc<AreaRoot>>,
     window: Duration,
 }
 
@@ -202,12 +279,39 @@ pub(crate) struct Burst {
     errors: Vec<notify::Error>,
     /// Paths the debouncer saw removed or renamed away, which have settled since.
     removed: Vec<PathBuf>,
+    /// Whether it is time to try again to watch an Area that couldn't be.
+    retrying: bool,
 }
 
 impl Burst {
     fn is_empty(&self) -> bool {
-        self.events.is_empty() && self.errors.is_empty() && self.removed.is_empty()
+        self.events.is_empty()
+            && self.errors.is_empty()
+            && self.removed.is_empty()
+            && !self.retrying
     }
+}
+
+/// What the watcher saw of each Area in a burst, before comparing it with what was reported.
+#[derive(Debug)]
+pub(crate) struct Looks(Vec<(Area, Look)>);
+
+/// What the watcher saw of one Area in a burst.
+#[derive(Debug)]
+enum Look {
+    Changes(Looked),
+    /// Changes may have been missed. The Area as listed again, if it could be.
+    Missed(Option<Looked>),
+}
+
+/// How [`FailurePoint`](super::FailurePoint)s make watching fail.
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+pub(super) struct WatchFailures {
+    /// [`WatchingFails`](super::FailurePoint::WatchingFails).
+    pub(super) first_events: bool,
+    /// [`WatchingAnAreaFails`](super::FailurePoint::WatchingAnAreaFails).
+    pub(super) watching_an_area: usize,
 }
 
 /// The paths the debouncer saw removed or renamed away, which it may drop the events of. Its file
@@ -223,7 +327,7 @@ struct Removals {
 impl Removals {
     /// When the first of the paths settles, if there are any.
     fn first_settles(&self, window: Duration) -> Option<Instant> {
-        lock(&self.paths).values().min().map(|removed| *removed + window)
+        lock_ignoring_poison(&self.paths).values().min().map(|removed| *removed + window)
     }
 
     /// Takes the paths that have settled: removed a window ago or more. A path made again since
@@ -234,7 +338,7 @@ impl Removals {
     /// events like any other.
     fn take_settled(&self, window: Duration) -> Vec<PathBuf> {
         let now = Instant::now();
-        let mut paths = lock(&self.paths);
+        let mut paths = lock_ignoring_poison(&self.paths);
         paths.extract_if(|_, removed| *removed + window <= now).map(|(path, _)| path).collect()
     }
 }
@@ -252,7 +356,7 @@ impl FileIdCache for RemovalHook {
     fn add_path(&mut self, _path: &FsPath, _recursive_mode: RecursiveMode) {}
 
     fn remove_path(&mut self, path: &FsPath) {
-        lock(&self.0.paths).insert(path.to_owned(), Instant::now());
+        lock_ignoring_poison(&self.0.paths).insert(path.to_owned(), Instant::now());
         self.0.added.notify_one();
     }
 }
@@ -260,9 +364,13 @@ impl FileIdCache for RemovalHook {
 /// What the watcher looks after, used from the blocking threads that read the Areas.
 #[derive(Debug)]
 struct Watched {
-    debouncer: Debouncer<RecommendedWatcher, RemovalHook>,
+    watches: Watches,
     areas: PerArea<WatchedArea>,
     links: Links,
+    /// Whether the first error loses the watches of the Areas it names, as a watcher that fails
+    /// can, with [`FailurePoint::WatchingFails`](super::FailurePoint::WatchingFails).
+    #[cfg(feature = "testing")]
+    loses_watches: bool,
 }
 
 /// One Area, as the watcher sees it.
@@ -270,16 +378,34 @@ struct Watched {
 struct WatchedArea {
     root: Arc<AreaRoot>,
     reported: Arc<Mutex<Reported>>,
-    /// The root as [`fs::canonicalize`] gave it when it was watched: the paths of its events
-    /// start with it.
-    watched: PathBuf,
+}
+
+/// What `notify` watches: the Areas, and the directories outside them that symlinks lead to.
+#[derive(Debug)]
+struct Watches {
+    debouncer: Debouncer<RecommendedWatcher, RemovalHook>,
+    /// What the debouncer's file ID cache adds to, which unwatching adds to as well.
+    removals: Arc<Removals>,
+    /// Each Area's root as [`fs::canonicalize`] gave it when it was watched, which the paths of
+    /// its events start with, or `None` while it isn't watched.
+    area_paths: PerArea<Option<PathBuf>>,
+    /// For each Area that couldn't be watched, when to try again, and how long it waited last.
+    retrying: PerArea<Option<(Instant, Duration)>>,
+    /// Each directory outside the Areas that is watched for the links and files in it that
+    /// symlinks lead to, with how many there are.
+    outside: HashMap<PathBuf, usize>,
+    window: Duration,
+    /// How many more times watching an Area fails, with
+    /// [`FailurePoint::WatchingAnAreaFails`](super::FailurePoint::WatchingAnAreaFails).
+    #[cfg(feature = "testing")]
+    fails: usize,
 }
 
 /// What a burst holds for one Area.
 #[derive(Debug, Default)]
 struct Seen {
     /// The names under the root, that are Paths, that events named.
-    names: BTreeSet<String>,
+    names: BTreeSet<Path>,
     /// Whether any event was in the Area, even for names that aren't Paths.
     touched: bool,
     /// Whether the journal had events, and has settled since.
@@ -293,36 +419,54 @@ struct Seen {
 impl FsWatcher {
     /// Starts watching each Area in `areas`, given its root and what was reported of it, which
     /// the watcher lists now. Events come in from here on, so nothing that happens after this
-    /// returns is missed. `fails` is [`FailurePoint::WatchingFails`](super::FailurePoint).
+    /// returns is missed, except in an Area that couldn't be watched: it is tried again, and gets
+    /// a Resync once it is watched. Fails only if no watcher can be made at all.
     pub(super) fn start(
         areas: PerArea<(Arc<AreaRoot>, Arc<Mutex<Reported>>)>,
         window: Duration,
-        #[cfg(feature = "testing")] fails: bool,
+        #[cfg(feature = "testing")] failures: WatchFailures,
     ) -> Result<FsWatcher> {
         let (sender, results) = mpsc::unbounded_channel();
         let removals = Arc::new(Removals::default());
         let handler = handler(
             sender,
             #[cfg(feature = "testing")]
-            fails,
+            failures.first_events,
         );
         // Each directory is watched under its own name only: see the module's doc.
         let config = notify::Config::default().with_follow_symlinks(false);
         let hook = RemovalHook(Arc::clone(&removals));
-        let mut debouncer = new_debouncer_opt(window, None, handler, hook, config)
+        let debouncer = new_debouncer_opt(window, None, handler, hook, config)
             .map_err(|error| Error::backend(format!("watching for changes failed: {error}")))?;
-        let roots = areas.iter().map(|(_, (root, _))| Arc::clone(root)).collect();
+        let mut watches = Watches {
+            debouncer,
+            removals: Arc::clone(&removals),
+            area_paths: PerArea::default(),
+            retrying: PerArea::default(),
+            outside: HashMap::new(),
+            window,
+            #[cfg(feature = "testing")]
+            fails: failures.watching_an_area,
+        };
+        let area_roots = areas.iter().map(|(_, (root, _))| Arc::clone(root)).collect();
         let areas = PerArea::try_from_fn(|area| {
             let (root, reported) = areas.get(area);
-            let watched = watch_root(&mut debouncer, root)?;
-            Ok(WatchedArea { root: Arc::clone(root), reported: Arc::clone(reported), watched })
+            watches.watch_area(area, root);
+            Ok(WatchedArea { root: Arc::clone(root), reported: Arc::clone(reported) })
         })?;
-        let mut watched = Watched { debouncer, areas, links: Links::default() };
+        let mut watched = Watched {
+            watches,
+            areas,
+            links: Links::default(),
+            #[cfg(feature = "testing")]
+            loses_watches: failures.first_events,
+        };
         for area in [Area::Config, Area::Data, Area::Cache] {
-            watched.list(area)?;
+            let listed = watched.list(area)?;
+            lock_ignoring_poison(&watched.areas.get(area).reported).replace(listed);
         }
         let watched = Arc::new(Mutex::new(watched));
-        Ok(FsWatcher { results, removals, watched, roots, window })
+        Ok(FsWatcher { results, removals, watched, area_roots, window })
     }
 
     /// Waits for events, then gathers them until they settle, and gives them. Gives `None` if
@@ -330,15 +474,18 @@ impl FsWatcher {
     pub(crate) async fn next_burst(&mut self) -> Option<Burst> {
         let window = self.window;
         // How long to wait for more once something comes: for the debouncer's next report, a
-        // quarter of a window away, and for a removal to settle.
-        let (settle, removal_settles) = (window / 2, window + window / 4);
+        // quarter of a window away; for a removal's events to settle; and for the renames of a
+        // slow Commit, once it is applied, to settle.
+        let settle = window / 2;
+        let (until_removal_settles, until_renames_settle) =
+            (window + window / 4, window + window / 4);
         loop {
             let mut burst = Burst::default();
-            let first_removal_settles = self.removals.first_settles(window);
+            let wake = earliest(self.removals.first_settles(window), self.first_retry());
             let mut until = tokio::select! {
                 result = self.results.recv() => add(&mut burst, result?, settle),
-                () = self.removals.added.notified() => Instant::now() + removal_settles,
-                () = sleep_until(first_removal_settles) => Instant::now(),
+                () = self.removals.added.notified() => Instant::now() + until_removal_settles,
+                () = sleep_until(wake) => Instant::now(),
             };
             let mut latest = Instant::now() + 4 * window;
             let (mut looked_for_commits, mut waited_late) = (0, false);
@@ -349,7 +496,7 @@ impl FsWatcher {
                         None => break,
                     },
                     () = self.removals.added.notified() => {
-                        until = until.max(Instant::now() + removal_settles);
+                        until = until.max(Instant::now() + until_removal_settles);
                         continue;
                     }
                     () = tokio::time::sleep_until(until.min(latest).into()) => {}
@@ -367,19 +514,26 @@ impl FsWatcher {
                 }
                 waited_late = Instant::now() >= latest;
                 self.wait_for_commits().await;
-                until = Instant::now() + removal_settles;
+                until = Instant::now() + until_renames_settle;
                 latest = latest.max(until);
             }
             burst.removed = self.removals.take_settled(window);
+            burst.retrying = self.first_retry().is_some_and(|at| at <= Instant::now());
             if !burst.is_empty() {
                 return Some(burst);
             }
         }
     }
 
+    /// When to try again to watch an Area that couldn't be, if there is one.
+    fn first_retry(&self) -> Option<Instant> {
+        let watched = lock_ignoring_poison(&self.watched);
+        watched.watches.retrying.iter().filter_map(|(_, retry)| retry.map(|(at, _)| at)).min()
+    }
+
     /// Waits until no Commit is being applied to any Area, by taking the lock of each in turn.
     async fn wait_for_commits(&self) {
-        let roots = self.roots.clone();
+        let roots = self.area_roots.clone();
         let waited = off_runtime(move || {
             for root in &roots {
                 drop(root.lock()?);
@@ -391,15 +545,29 @@ impl FsWatcher {
         }
     }
 
-    /// What `burst` changed: for each Area, the Changes, all external, or that Changes to it may
-    /// have been missed. It reads the Areas, so the Store calls it holding its turn with Commits.
-    pub(crate) async fn observe(&self, burst: Burst) -> Vec<(Area, Observed)> {
+    /// Reads what `burst` names, without the Store's turn with Commits, for
+    /// [`conclude`](Self::conclude) to compare.
+    pub(crate) async fn look(&self, burst: Burst) -> Looks {
         let watched = Arc::clone(&self.watched);
-        match off_runtime(move || Ok(lock(&watched).observe(burst))).await {
-            Ok(observed) => observed,
+        match off_runtime(move || Ok(lock_ignoring_poison(&watched).look(burst))).await {
+            Ok(looks) => looks,
             // The runtime is shutting down, and the Store with it.
             Err(error) => {
                 tracing::debug!("looking at what changed in the Areas failed: {error}");
+                Looks(Vec::new())
+            }
+        }
+    }
+
+    /// What changed, given what [`look`](Self::look) saw: for each Area, the Changes, all
+    /// external, or that Changes to it may have been missed. The Store calls it holding its turn
+    /// with Commits, and records what it gives before letting go.
+    pub(crate) async fn conclude(&self, looks: Looks) -> Vec<(Area, Observed)> {
+        let watched = Arc::clone(&self.watched);
+        match off_runtime(move || Ok(lock_ignoring_poison(&watched).conclude(looks))).await {
+            Ok(observed) => observed,
+            Err(error) => {
+                tracing::debug!("working out what changed in the Areas failed: {error}");
                 Vec::new()
             }
         }
@@ -422,6 +590,11 @@ fn is_of_a_slow_commit(event: &DebouncedEvent) -> bool {
         let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
         is_temporary_file_name(name) || path.ends_with(JOURNAL)
     })
+}
+
+/// The earlier of `a` and `b`, of those there are.
+fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    a.into_iter().chain(b).min()
 }
 
 /// Waits until `at`, or forever if it is `None`.
@@ -479,23 +652,106 @@ fn may_be_gone(kind: &EventKind) -> bool {
     matches!(kind, EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_)))
 }
 
-/// Makes the root of `area`, and its `.tidings/`, if they don't exist, and watches it and every
-/// directory under it. Gives the root as it watches it.
-fn watch_root(
-    debouncer: &mut Debouncer<RecommendedWatcher, RemovalHook>,
-    area: &AreaRoot,
-) -> Result<PathBuf> {
-    drop(area.lock_file()?);
-    let watched = fs::canonicalize(&area.root).map_err(|error| failed(&area.root, error))?;
-    debouncer.watch(&watched, RecursiveMode::Recursive).map_err(|error| {
-        Error::backend(format!("watching {} for changes failed: {error}", watched.display()))
-    })?;
-    Ok(watched)
+impl Watches {
+    /// Watches `area`, whose root is `root`, from its root down, making the root and its
+    /// `.tidings/` first if they don't exist. Anything watched of it before is unwatched first, so
+    /// that every directory there now is watched once. Gives whether it is watched. If it isn't,
+    /// it is tried again later, once [`retry_due`](Self::retry_due).
+    fn watch_area(&mut self, area: Area, root: &AreaRoot) -> bool {
+        if let Some(path) = self.area_paths.get_mut(area).take() {
+            self.unwatch(&path);
+        }
+        match self.watch_root(root) {
+            Ok(path) => {
+                *self.area_paths.get_mut(area) = Some(path);
+                *self.retrying.get_mut(area) = None;
+                true
+            }
+            Err(error) => {
+                let waited = self.retrying.get(area).map(|(_, waited)| waited);
+                let wait = waited.map_or(self.window, |waited| (waited * 2).min(LONGEST_RETRY));
+                tracing::debug!("watching {area:?} failed, trying again in {wait:?}: {error}");
+                *self.retrying.get_mut(area) = Some((Instant::now() + wait, wait));
+                false
+            }
+        }
+    }
+
+    /// Makes `root` and its `.tidings/` if they don't exist, and watches it and every directory
+    /// under it. Gives the root as it is watched.
+    fn watch_root(&mut self, root: &AreaRoot) -> Result<PathBuf> {
+        #[cfg(feature = "testing")]
+        if self.fails > 0 {
+            self.fails -= 1;
+            return Err(Error::backend("failed at FailurePoint::WatchingAnAreaFails"));
+        }
+        drop(root.lock_file()?);
+        let path = fs::canonicalize(&root.root).map_err(|error| failed(&root.root, error))?;
+        self.debouncer.watch(&path, RecursiveMode::Recursive).map_err(|error| {
+            Error::backend(format!("watching {} for changes failed: {error}", path.display()))
+        })?;
+        Ok(path)
+    }
+
+    /// Whether it is time to try again to watch `area`.
+    fn retry_due(&self, area: Area) -> bool {
+        self.retrying.get(area).is_some_and(|(at, _)| at <= Instant::now())
+    }
+
+    /// Watches `directory`, which holds a link or file a symlink leads to, if it is outside the
+    /// Areas, and counts the links and files there that it is watched for.
+    fn watch_outside(&mut self, directory: &FsPath) -> Result<()> {
+        if self.in_an_area(directory) {
+            return Ok(());
+        }
+        let count = self.outside.entry(directory.to_owned()).or_default();
+        *count += 1;
+        if *count == 1
+            && let Err(error) = self.debouncer.watch(directory, RecursiveMode::NonRecursive)
+        {
+            self.outside.remove(directory);
+            return Err(Error::backend(format!(
+                "watching {} failed: {error}",
+                directory.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Undoes one [`watch_outside`](Self::watch_outside) of `directory`: once no link or file
+    /// there is watched for, it is unwatched.
+    fn unwatch_outside(&mut self, directory: &FsPath) {
+        let Some(count) = self.outside.get_mut(directory) else { return };
+        *count -= 1;
+        if *count == 0 {
+            self.outside.remove(directory);
+            self.unwatch(directory);
+        }
+    }
+
+    /// Stops watching `path`, which the platform's watcher may have stopped watching already.
+    /// The debouncer tells its file ID cache that `path` was removed then, which it wasn't.
+    fn unwatch(&mut self, path: &FsPath) {
+        if let Err(error) = self.debouncer.unwatch(path) {
+            tracing::debug!("unwatching {} failed: {error}", path.display());
+        }
+        lock_ignoring_poison(&self.removals.paths).remove(path);
+    }
+
+    /// Whether `directory` is in an Area, and so watched with it.
+    fn in_an_area(&self, directory: &FsPath) -> bool {
+        self.area_paths
+            .iter()
+            .any(|(_, path)| path.as_ref().is_some_and(|path| directory.starts_with(path)))
+    }
 }
 
 impl Watched {
-    /// What `burst` changed in each Area, as [`FsWatcher::observe`] gives it.
-    fn observe(&mut self, burst: Burst) -> Vec<(Area, Observed)> {
+    /// Reads what `burst` names in each Area, as [`FsWatcher::look`] gives it.
+    fn look(&mut self, burst: Burst) -> Looks {
+        for (_, area) in self.areas.iter() {
+            lock_ignoring_poison(&area.reported).start_looking();
+        }
         let mut seen = PerArea::<Seen>::default();
         for error in &burst.errors {
             tracing::debug!("watching for changes failed: {error}");
@@ -514,31 +770,90 @@ impl Watched {
         for path in &burst.removed {
             self.locate(path, true, &mut seen);
         }
+        #[cfg(feature = "testing")]
+        self.lose_watches(&seen);
 
-        let mut observed = Vec::new();
-        for (area, seen) in seen.iter_mut() {
-            let seen = std::mem::take(seen);
-            if seen.root_gone {
-                tracing::debug!(
-                    "the directory of {area:?} was removed: making and watching it again"
-                );
-                self.watch_again(area);
-                observed.push((area, Observed::Missed));
-            } else if seen.missed {
-                self.list_or_forget(area);
-                observed.push((area, Observed::Missed));
+        let mut looks = Vec::new();
+        for area in [Area::Config, Area::Data, Area::Cache] {
+            let seen = std::mem::take(seen.get_mut(area));
+            let root = Arc::clone(&self.areas.get(area).root);
+            let lost = seen.root_gone || seen.missed;
+            if lost || self.watches.retry_due(area) {
+                if seen.root_gone {
+                    tracing::debug!("the directory of {area:?} was removed or renamed away");
+                }
+                // Once it failed, the Area had a Resync, and gets another once it is watched.
+                if self.watches.watch_area(area, &root) || lost {
+                    looks.push((area, Look::Missed(self.list_or_log(area))));
+                }
             } else if seen.touched {
-                match self.compare(area, seen.names, seen.journal) {
-                    Ok(changes) if changes.is_empty() => {}
-                    Ok(changes) => {
-                        observed
-                            .push((area, Observed::Changes { origin: Origin::External, changes }));
+                match self.look_at(area, &seen.names, seen.journal) {
+                    Ok(looked) => looks.push((area, Look::Changes(looked))),
+                    Err(error) => {
+                        tracing::debug!("looking at what changed in {area:?} failed: {error}");
+                        looks.push((area, Look::Missed(self.list_or_log(area))));
+                    }
+                }
+            }
+        }
+        Looks(looks)
+    }
+
+    /// Loses the watches of the Areas the first error names, with
+    /// [`FailurePoint::WatchingFails`](super::FailurePoint::WatchingFails).
+    #[cfg(feature = "testing")]
+    fn lose_watches(&mut self, seen: &PerArea<Seen>) {
+        if !self.loses_watches {
+            return;
+        }
+        for (area, seen) in seen.iter() {
+            if seen.missed
+                && let Some(path) = self.watches.area_paths.get(area).clone()
+            {
+                self.loses_watches = false;
+                self.watches.unwatch(&path);
+            }
+        }
+    }
+
+    /// Compares what `looks` saw with what was reported, reading again what the Store's Commits
+    /// changed meanwhile, and takes the difference as reported, as [`FsWatcher::conclude`] gives
+    /// it.
+    fn conclude(&mut self, Looks(looks): Looks) -> Vec<(Area, Observed)> {
+        let mut changed = PerArea::<BTreeSet<Path>>::default();
+        for (area, watched) in self.areas.iter() {
+            *changed.get_mut(area) = lock_ignoring_poison(&watched.reported).stop_looking();
+        }
+        let mut observed = Vec::new();
+        for (area, look) in looks {
+            let WatchedArea { root, reported } = self.areas.get(area);
+            let mut reported = lock_ignoring_poison(reported);
+            match look {
+                Look::Changes(mut looked) => match looked.look_again(root, changed.get(area)) {
+                    Ok(()) => {
+                        let changes = reported.catch_up(looked);
+                        if !changes.is_empty() {
+                            let origin = Origin::External;
+                            observed.push((area, Observed::Changes { origin, changes }));
+                        }
                     }
                     Err(error) => {
                         tracing::debug!("looking at what changed in {area:?} failed: {error}");
-                        self.list_or_forget(area);
+                        // So that every event for a File from here on is reported.
+                        reported.files.clear();
                         observed.push((area, Observed::Missed));
                     }
+                },
+                Look::Missed(listed) => {
+                    let listed = listed.and_then(|mut listed| {
+                        listed.look_again(root, changed.get(area)).ok()?;
+                        Some(listed)
+                    });
+                    match listed {
+                        Some(listed) => reported.replace(listed),
+                        None => reported.files.clear(),
+                    }
+                    observed.push((area, Observed::Missed));
                 }
             }
         }
@@ -546,16 +861,19 @@ impl Watched {
     }
 
     /// Adds what `path`, which an event named, is to `seen`: a name under an Area's root, or the
-    /// root itself, and the Paths symlinked to it. `gone` says whether the event can mean that it
-    /// is gone.
+    /// root itself, and the Paths symlinked through it. `gone` says whether the event can mean
+    /// that it is gone.
     fn locate(&self, path: &FsPath, gone: bool, seen: &mut PerArea<Seen>) {
         for (area, linking) in self.links.linking(path) {
             let seen = seen.get_mut(*area);
             seen.touched = true;
-            seen.names.insert(linking.as_str().to_owned());
+            seen.names.insert(linking.clone());
         }
-        for (area, watched) in self.areas.iter() {
-            let Ok(under) = path.strip_prefix(&watched.watched) else { continue };
+        for (area, area_path) in self.watches.area_paths.iter() {
+            let Some(under) = area_path.as_ref().and_then(|root| path.strip_prefix(root).ok())
+            else {
+                continue;
+            };
             let seen = seen.get_mut(area);
             seen.touched = true;
             if under.as_os_str().is_empty() {
@@ -563,11 +881,12 @@ impl Watched {
                 continue;
             }
             let name: Option<Vec<&str>> = under.iter().map(|segment| segment.to_str()).collect();
-            match name.map(|name| name.join("/")) {
-                Some(name) if Path::new(name.as_str()).is_ok() => {
-                    seen.names.insert(name);
+            let name = name.map(|name| name.join("/"));
+            match name.as_deref().map(Path::new) {
+                Some(Ok(path)) => {
+                    seen.names.insert(path);
                 }
-                Some(name) if name == JOURNAL => seen.journal = true,
+                _ if name.as_deref() == Some(JOURNAL) => seen.journal = true,
                 _ => tracing::debug!("dropped an event for {}, which is no Path", path.display()),
             }
         }
@@ -588,197 +907,202 @@ impl Watched {
         }
     }
 
-    /// What changed in `area` at `names` since what was reported. So that a Commit in the
-    /// journal is reported whole, its Paths are looked at too if `journal` (its events have
-    /// settled), or if it is being applied and one of them is looked at. It takes the Changes as
-    /// reported, and keeps the symlinks of the Files it looks at up to date.
-    fn compare(
+    /// Reads `names` in `area`, and the Files under each. So that a Commit in the journal is
+    /// reported whole, its Paths are read too if `journal` (its events have settled), or if it is
+    /// being applied and one of them is looked at. Keeps the symlinks of the Files it reads up to
+    /// date.
+    fn look_at(&mut self, area: Area, names: &BTreeSet<Path>, journal: bool) -> Result<Looked> {
+        let WatchedArea { root, reported } = self.areas.get(area);
+        let (root, reported) = (Arc::clone(root), Arc::clone(reported));
+        let finished = root.as_finished()?;
+        let in_journal: BTreeSet<Path> = finished.paths().cloned().collect();
+        let mut looked = Looked::default();
+        for name in names {
+            look_under(&finished, &reported, name, &mut looked)?;
+        }
+        if journal || looked.files.keys().any(|path| in_journal.contains(path)) {
+            for name in in_journal.difference(names) {
+                look_under(&finished, &reported, name, &mut looked)?;
+            }
+        }
+        self.relink(area, &root, looked.files.keys())?;
+        Ok(looked)
+    }
+
+    /// Lists every File in `area`. Config's Files are read, and so are those of a Commit in the
+    /// journal. Keeps track of their symlinks.
+    fn list(&mut self, area: Area) -> Result<Looked> {
+        self.links.forget(&mut self.watches, area);
+        let root = Arc::clone(&self.areas.get(area).root);
+        let finished = root.as_finished()?;
+        let in_journal: BTreeSet<&Path> = finished.paths().collect();
+        let mut listed = Looked { everything: true, ..Looked::default() };
+        for path in finished.paths_under(&Prefix::new("")?)? {
+            let now = if area == Area::Config || in_journal.contains(&path) {
+                now(&finished, &path)?
+            } else {
+                Now::There(None)
+            };
+            listed.files.insert(path, now);
+        }
+        if let Err(error) = self.relink(area, &root, listed.files.keys()) {
+            tracing::debug!("following the symlinks in {area:?} failed: {error}");
+        }
+        Ok(listed)
+    }
+
+    /// [`list`](Self::list)s `area`, or logs why it can't be.
+    fn list_or_log(&mut self, area: Area) -> Option<Looked> {
+        self.list(area).map_err(|error| tracing::debug!("listing {area:?} failed: {error}")).ok()
+    }
+
+    /// Follows the symlinks of `paths` in `area`, whose root is `root`, again. Gives the first
+    /// error, having followed the rest.
+    fn relink<'a>(
         &mut self,
         area: Area,
-        names: BTreeSet<String>,
-        journal: bool,
-    ) -> Result<Vec<RawChange>> {
-        let WatchedArea { root, reported, .. } = self.areas.get(area);
-        let (root, reported) = (Arc::clone(root), Arc::clone(reported));
-        let mut reported = lock(&reported);
-        let finished = root.as_finished()?;
-        let in_journal: BTreeSet<String> =
-            finished.paths().map(|path| path.as_str().to_owned()).collect();
-        let (mut changes, mut looked_at) = (BTreeMap::new(), Vec::<Path>::new());
-        for name in &names {
-            reported.catch_up(&finished, name, &mut changes, &mut looked_at)?;
-        }
-        if journal || looked_at.iter().any(|path| in_journal.contains(path.as_str())) {
-            for name in in_journal.difference(&names) {
-                reported.catch_up(&finished, name, &mut changes, &mut looked_at)?;
-            }
-        }
-        let roots = self.roots();
-        for path in looked_at {
-            let file = root.file(path.as_str());
-            self.links.relink(&mut self.debouncer, &roots, area, path, &file)?;
-        }
-        Ok(changes.into_iter().map(|(path, kind)| RawChange { path, kind }).collect())
-    }
-
-    /// Takes the Files in `area` now as reported, with the Revisions of those of a Commit left in
-    /// its journal, which are read, and keeps track of their symlinks.
-    fn list(&mut self, area: Area) -> Result<()> {
-        self.links.forget(&mut self.debouncer, area);
-        let WatchedArea { root, reported, .. } = self.areas.get(area);
-        let (root, reported) = (Arc::clone(root), Arc::clone(reported));
-        let finished = root.as_finished()?;
-        let paths = finished.paths_under(&Prefix::new("")?)?;
-        let mut files: BTreeMap<String, Option<Revision>> =
-            paths.iter().map(|path| (path.as_str().to_owned(), None)).collect();
-        for path in finished.paths() {
-            if let Some(revision) = revision_of(&finished, path)? {
-                files.insert(path.as_str().to_owned(), Some(revision));
-            }
-        }
-        lock(&reported).files = files;
-        let roots = self.roots();
+        root: &AreaRoot,
+        paths: impl Iterator<Item = &'a Path>,
+    ) -> Result<()> {
+        let mut first_error = Ok(());
         for path in paths {
             let file = root.file(path.as_str());
-            if let Err(error) = self.links.relink(&mut self.debouncer, &roots, area, path, &file) {
-                tracing::debug!("watching a symlink's target failed: {error}");
+            let relinked = self.links.relink(&mut self.watches, area, path.clone(), &file);
+            if first_error.is_ok() {
+                first_error = relinked;
             }
         }
-        Ok(())
-    }
-
-    /// [`list`](Self::list)s `area` again, after Changes to it may have been missed. If it can't be
-    /// listed, nothing is taken as reported: an event for a File then gives a Change.
-    fn list_or_forget(&mut self, area: Area) {
-        if let Err(error) = self.list(area) {
-            tracing::debug!("listing {area:?} again failed: {error}");
-            lock(&self.areas.get(area).reported).files.clear();
-        }
-    }
-
-    /// Makes the root of `area` again, with its `.tidings/`, once it was removed or renamed away,
-    /// watches it again, and lists it.
-    fn watch_again(&mut self, area: Area) {
-        let watched = self.areas.get_mut(area);
-        // The platform's watcher may have stopped watching it already.
-        if let Err(error) = self.debouncer.unwatch(&watched.watched) {
-            tracing::debug!("unwatching the old directory of {area:?} failed: {error}");
-        }
-        match watch_root(&mut self.debouncer, &watched.root) {
-            Ok(root) => watched.watched = root,
-            Err(error) => tracing::debug!("watching {area:?} again failed: {error}"),
-        }
-        self.list_or_forget(area);
-    }
-
-    /// Each Area's root, as watched.
-    fn roots(&self) -> Vec<PathBuf> {
-        self.areas.iter().map(|(_, watched)| watched.watched.clone()).collect()
+        first_error
     }
 }
 
-/// The symlinked Files in the Areas and the files they point to, so that the watcher can look at a
-/// linking Path when its target has events.
+/// Reads the File at `name`, and the Files under it if it is a directory, into `looked`. A File
+/// under it that was reported isn't read: its own events say if it changed.
+fn look_under(
+    finished: &AsFinished<'_>,
+    reported: &Mutex<Reported>,
+    name: &Path,
+    looked: &mut Looked,
+) -> Result<()> {
+    looked.files.insert(name.clone(), now(finished, name)?);
+    looked.under.push(name.clone());
+    for path in finished.paths_under(&Prefix::new(format!("{name}/"))?)? {
+        if looked.files.contains_key(&path) {
+            continue;
+        }
+        let now = if lock_ignoring_poison(reported).is_reported(&path) {
+            Now::There(None)
+        } else {
+            now(finished, &path)?
+        };
+        // One removed again since it was listed was never there, as far as the feed knows.
+        if let Now::There(_) = now {
+            looked.files.insert(path, now);
+        }
+    }
+    Ok(())
+}
+
+/// The symlinked Files in the Areas and the links and files they lead through, so that the
+/// watcher can look at a linking Path when any of those has events.
 #[derive(Debug, Default)]
 struct Links {
-    /// The file each symlinked File points to, with its directories as [`fs::canonicalize`]
-    /// gives them, as event paths name it.
-    targets: HashMap<(Area, Path), PathBuf>,
-    /// The Paths linked to each target.
+    /// Each link after a symlinked File's own, and the file at the end, with their directories as
+    /// [`fs::canonicalize`] gives them, as event paths name them.
+    chains: HashMap<(Area, Path), Vec<PathBuf>>,
+    /// The Paths whose chains lead through each link or file.
     linking: HashMap<PathBuf, BTreeSet<(Area, Path)>>,
-    /// Each directory outside the Areas that is watched for targets in it, with how many there
-    /// are.
-    directories: HashMap<PathBuf, usize>,
 }
 
 impl Links {
-    /// The Paths linked to `target`.
-    fn linking(&self, target: &FsPath) -> impl Iterator<Item = &(Area, Path)> {
-        self.linking.get(target).into_iter().flatten()
+    /// The Paths whose chains lead through `path`.
+    fn linking(&self, path: &FsPath) -> impl Iterator<Item = &(Area, Path)> {
+        self.linking.get(path).into_iter().flatten()
     }
 
-    /// Notes where `path` in `area`, which is `file` on disk, points now, if it is a symlink to
-    /// something other than a directory, and watches the directory that is in if it is outside the
-    /// Areas, whose `roots` are watched already.
+    /// Notes where `path` in `area`, which is `file` on disk, leads now, if it is a symlink to
+    /// something other than a directory, and watches the directories outside the Areas on the
+    /// way.
     fn relink(
         &mut self,
-        debouncer: &mut Debouncer<RecommendedWatcher, RemovalHook>,
-        roots: &[PathBuf],
+        watches: &mut Watches,
         area: Area,
         path: Path,
         file: &FsPath,
     ) -> Result<()> {
-        let now = link_target(file);
+        let now = link_chain(file);
         let linked = (area, path);
-        if self.targets.get(&linked) == now.as_ref() {
+        if self.chains.get(&linked) == now.as_ref() {
             return Ok(());
         }
-        if let Some(before) = self.targets.remove(&linked) {
-            self.unlink(debouncer, &linked, &before);
+        if let Some(before) = self.chains.remove(&linked) {
+            self.unlink(watches, &linked, &before);
         }
-        let Some(target) = now else { return Ok(()) };
-        self.linking.entry(target.clone()).or_default().insert(linked.clone());
-        self.targets.insert(linked, target.clone());
-        let Some(directory) = target.parent() else { return Ok(()) };
-        if roots.iter().any(|root| directory.starts_with(root)) {
-            return Ok(());
-        }
-        let count = self.directories.entry(directory.to_owned()).or_default();
-        *count += 1;
-        if *count == 1 {
-            debouncer.watch(directory, RecursiveMode::NonRecursive).map_err(|error| {
-                Error::backend(format!("watching {} failed: {error}", directory.display()))
-            })?;
-        }
-        Ok(())
-    }
-
-    /// Forgets that `linked` points to `target`, and stops watching the directory `target` is in if
-    /// no other target there is watched.
-    fn unlink(
-        &mut self,
-        debouncer: &mut Debouncer<RecommendedWatcher, RemovalHook>,
-        linked: &(Area, Path),
-        target: &FsPath,
-    ) {
-        if let Some(linking) = self.linking.get_mut(target) {
-            linking.remove(linked);
-            if linking.is_empty() {
-                self.linking.remove(target);
+        let Some(chain) = now else { return Ok(()) };
+        let mut watched = Ok(());
+        for hop in &chain {
+            self.linking.entry(hop.clone()).or_default().insert(linked.clone());
+            if let Some(directory) = hop.parent()
+                && let Err(error) = watches.watch_outside(directory)
+                && watched.is_ok()
+            {
+                watched = Err(error);
             }
         }
-        let Some(directory) = target.parent() else { return };
-        let Some(count) = self.directories.get_mut(directory) else { return };
-        *count -= 1;
-        if *count == 0 {
-            self.directories.remove(directory);
-            if let Err(error) = debouncer.unwatch(directory) {
-                tracing::debug!("unwatching {} failed: {error}", directory.display());
+        self.chains.insert(linked, chain);
+        watched
+    }
+
+    /// Forgets that `linked` leads through `chain`, and stops watching the directories on the way
+    /// that nothing else is watched for.
+    fn unlink(&mut self, watches: &mut Watches, linked: &(Area, Path), chain: &[PathBuf]) {
+        for hop in chain {
+            if let Some(linking) = self.linking.get_mut(hop) {
+                linking.remove(linked);
+                if linking.is_empty() {
+                    self.linking.remove(hop);
+                }
+            }
+            if let Some(directory) = hop.parent() {
+                watches.unwatch_outside(directory);
             }
         }
     }
 
     /// Forgets every symlink in `area`.
-    fn forget(&mut self, debouncer: &mut Debouncer<RecommendedWatcher, RemovalHook>, area: Area) {
-        let in_area: Vec<_> = self.targets.keys().filter(|(of, _)| *of == area).cloned().collect();
+    fn forget(&mut self, watches: &mut Watches, area: Area) {
+        let in_area: Vec<_> = self.chains.keys().filter(|(of, _)| *of == area).cloned().collect();
         for linked in in_area {
-            if let Some(target) = self.targets.remove(&linked) {
-                self.unlink(debouncer, &linked, &target);
+            if let Some(chain) = self.chains.remove(&linked) {
+                self.unlink(watches, &linked, &chain);
             }
         }
     }
 }
 
-/// The file `file` points to, if it is a symlink to something other than a directory, with the
-/// directories on the way as [`fs::canonicalize`] gives them. `None` if the directory it would be
-/// in doesn't exist.
-fn link_target(file: &FsPath) -> Option<PathBuf> {
+/// Where `file` leads, if it is a symlink to something other than a directory: each link after
+/// it, and the file at the end, with the directories on the way as [`fs::canonicalize`] gives
+/// them. It stops before a link or file whose directory doesn't exist.
+fn link_chain(file: &FsPath) -> Option<Vec<PathBuf>> {
     if !fs::symlink_metadata(file).ok()?.is_symlink()
         || fs::metadata(file).is_ok_and(|metadata| metadata.is_dir())
     {
         return None;
     }
-    let target = through_links(file.to_owned()).ok()?;
-    let directory = fs::canonicalize(target.parent()?).ok()?;
-    Some(directory.join(target.file_name()?))
+    let mut chain = Vec::new();
+    let mut at = file.to_owned();
+    // As many links as Linux follows before it gives up.
+    for _ in 0..40 {
+        if !fs::symlink_metadata(&at).is_ok_and(|metadata| metadata.is_symlink()) {
+            break;
+        }
+        let Ok(link) = fs::read_link(&at) else { break };
+        // A relative link is relative to the directory it is in.
+        let next = at.parent().map_or_else(|| link.clone(), |parent| parent.join(&link));
+        let (Some(directory), Some(name)) = (next.parent(), next.file_name()) else { break };
+        let Ok(directory) = fs::canonicalize(directory) else { break };
+        at = directory.join(name);
+        chain.push(at.clone());
+    }
+    (!chain.is_empty()).then_some(chain)
 }

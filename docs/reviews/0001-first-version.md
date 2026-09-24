@@ -1554,3 +1554,216 @@ Clippy is clean with default features, `--all-features`, `--no-default-features`
 sqlite only, each with `--all-targets` and without. So are rustfmt and rustdoc. `cargo test`
 passes with default features, `--no-default-features` and `--all-features`: 165 behaviour tests
 (45 without fs or sqlite).
+
+---
+
+## Ticket 11: Filesystem backend, watching
+
+Reviewed: `git diff 396d68e...b68d6de` (commit b68d6de). The Spec reviewer was also asked to check:
+- whether the relaxed two-Store tests are honest
+- whether any external edit can be lost, or reported twice or with the wrong Origin
+- the watcher holding the Commit lock, and when the feed ends
+- memory use and symlinks
+- the "never-read File" deviation
+
+The Spec reviewer tested with probes that race edits against Commits and flood the Area with Files.
+
+### Standards
+
+**(a) Documented-standard violations:** none hard.
+
+- **CONTEXT.md `_Avoid_` lists:** passes.
+  - "event" (avoided for Change) always means notify's filesystem events, never a Change.
+  - "watcher" (avoided for Change feed) is only the filesystem watcher, which is the spec's own term.
+  - "directory" means on-disk directories, never Prefixes.
+  - The rename to `Observed::Changes` (src/backend/mod.rs:126) uses the glossary term.
+- **Spec, Implementation Decisions:** passes.
+  - `FsWatcher` is `pub(crate)`, so there is no public Backend trait.
+  - `FailurePoint::WatchingFails` was added to the `#[non_exhaustive]` enum (src/backend/fs.rs:~252).
+  - All `tracing` calls are `debug!`.
+  - `supervise` is in the Store layer (src/store.rs:336), as the spec requires ("Running the task that records what a Backend observes…").
+- **Spec, Testing Decisions:** passes. Tests use the public API plus the failure-point exception. `fixture.on_disk(Area::Cache, "").is_dir()` (tests/behaviour/main.rs:586, 608) looks at the disk, but the Area directory is visible to users and main.rs:386 already did the same, so this isn't internal state.
+- **README:** Consistency and Limitations were updated together with the spec, as the spec's "keep them in sync" requires.
+
+**(b) Baseline smells (all judgement calls)**
+
+1. **Mysterious Name.** src/backend/fs/watch.rs:180 `pub(super) fn lock<T>(reported: &Mutex<T>)` is documented as "`reported`, locked", but it is generic. It also locks `Removals.paths` (226, 237, 255) and `Watched` (398). `mutex` or `lock_ignoring_poison` would fit.
+2. **Mysterious Name.** "roots" means two different things:
+   - `FsWatcher.roots: Vec<Arc<AreaRoot>>` (194)
+   - `Watched::roots() -> Vec<PathBuf>` (675), which returns canonicalised watch paths
+
+   Also, `WatchedArea.watched` inside `Watched` produces `watched.watched` (662, 668).
+3. **Mysterious Name.** `removal_settles` (watch.rs:334) is reused at 370 as the wait after a slow Commit, which has nothing to do with removals.
+4. **Duplicated Code.** `Watched::compare` (601–602, 616–620) and `Watched::list` (628–629, 640–646) both repeat two blocks:
+   - `let WatchedArea { root, reported, .. } = self.areas.get(area); let (root, reported) = (Arc::clone(root), Arc::clone(reported));`
+   - the loop `for path … { let file = root.file(path.as_str()); self.links.relink(&mut self.debouncer, &roots, area, path, &file) }`
+5. **Primitive Obsession.** `Reported.files: BTreeMap<String, Option<Revision>>` (99) and `Seen.names: BTreeSet<String>` (282) store Paths as `String`. The code keeps converting back and forth with `Path::stored(name.to_owned())` and `path.as_str().to_owned()` (128, 153, 163, 606, 633). This is partly justified, because `range_under` takes `&str`.
+6. **Data Clumps.** `debouncer`, and often `roots`, are passed into every `Links` method: `relink` (703), `unlink` (738) and `forget` (762).
+7. **Minor.** src/store.rs:371 wraps each item as `record_observed(&feed, area, vec![observed])` only to fit a `Vec` parameter shaped for SQLite. Calling `feed.record` / `feed.resync` directly, or changing the helper's signature, would avoid it.
+
+No Speculative Generality found. `supervise` is shared by SQLite and the filesystem, and the `in_step:` group in two_stores.rs reflects a real difference between the Backends.
+
+### Spec
+
+All tests pass. Probes were run in a scratch copy:
+- new directories written to immediately
+- editor-style saves (write a temporary file, then rename)
+- edits racing this Store's own Commit, both before and after it
+- the Area root removed and recreated
+- floods of 60,000 files
+
+Apart from the cases below, they produced no lost or misattributed Changes.
+
+**(a) Missing or partial**
+
+1. **A chain of links loses Changes silently.** The spec says "Symlinked Files are followed, and their targets are watched too" (spec:363), but only the final target's directory is watched (watch.rs:722-732, 775-783).
+   - Probe: `config/s.toml → dotfiles/current → app/s.toml`, then retarget `current` to `app2/s.toml`.
+   - A read shows the new contents, but no Change and no Resync arrives, and later edits to `app2/s.toml` produce nothing either.
+   - This is the dotfiles setup from story 65, and the implementer's own write test uses exactly this chain.
+   - The README's Limitations don't cover it.
+2. **After a Resync, a directory can stay unwatched.** Story 56: "a Resync for an Area when watching fails".
+   - After an inotify overflow, the Area is Resynced and listed again (watch.rs:505-507, 527-529). But notify doesn't add watches back after its queue overflows (inotify.rs:212), so a directory made while events were being lost is never watched, and later edits in it are lost silently.
+   - The same happens if `watch_again` fails (watch.rs:667-670): after one Resync the Area stays unwatched.
+   - Fix: on a rescan, unwatch the root and watch it again.
+3. **A write that changes nothing can still report a Change.** Story 54: "external events that did not change a File's contents to be dropped".
+   - This isn't met for Files not changed since `open`. The box is ticked, and the spec was amended (spec:373-377).
+   - The only fairly cheap way to avoid it is hashing every File at `open`. That's safe, since changes made before `open` returns needn't be reported, but it means reading the whole Cache. Hashing only Config would be a cheap middle ground.
+   - An acceptable, documented deviation, but the box should say "partly".
+
+**(b) Scope creep**
+
+None of substance.
+
+**(c) Implemented but looks wrong**
+
+4. **The relaxed tests are honest, with one inaccuracy.**
+   - `in_step:` really can't hold on the filesystem. Reading the marker Store's own feed first, the reviewer reproduced its local marker arriving before the other Store's last Commit.
+   - A split Commit never reproduced: `never_split` passed 25 runs out of 25 on the filesystem, including under load. It is a theoretical limitation, not one that has been shown.
+   - `.or(*said)` (two_stores.rs:268) only matters for the third feed in `BySecondStore`, which only SQLite runs, and SQLite always mentions the Path there. So it hides nothing, but its doc comment's claim about the filesystem is inaccurate.
+5. **Some docs still promise order and whole batches without the filesystem caveat.**
+   - `Store::commit` says "Commits reach the feed in the order they were applied" (store.rs:253).
+   - README:33 says "A commit's changes always arrive in the same batch", which the README's own later filesystem bullet contradicts.
+6. **Commits can be held up for seconds.** The watcher reads every name in a burst while holding the Commit turn (store.rs:367-372).
+   - With another program writing 40,000 Files, the slowest Commit took 4.6 s instead of about 5 ms.
+   - The wait is bounded, not starvation, because tokio's Mutex is fair. No deadlock was found: `wait_for_commits` runs without holding the turn.
+7. **Reaching the platform's watch limit makes `open` fail** (watch.rs:317, 490). Story 56 suggests a Resync instead. Minor.
+
+**Checked, no problems:**
+- **Lifetime:** the feed ends through `end()`, and the supervisor sends nothing when the Store stops the task.
+- **Memory:** holding an entry for every File is bounded and consistent with the spec.
+- **No duplicates:** Pending renames and this Store's own Commits produce no duplicate Changes.
+- **Directory symlinks:** the decision not to watch through them is documented.
+
+### Summary
+
+Standards: 0 hard violations and 7 smells, mostly names in watch.rs. Spec: 3 missing or partial items and 4 wrong or weak ones. The worst is that a chain of symlinks loses Changes silently (`config/s.toml → dotfiles/current → app/s.toml`, with `current` retargeted). That is the dotfiles case from story 65. Close behind: after an inotify overflow, a directory created during the overflow stays unwatched.
+
+
+
+### Resolution
+
+1. **Spec a1, a chain of links:** fixed. `Links` now keeps each symlinked File's whole chain:
+   every link after its own, and the file at the end, each with its directory canonicalised, as
+   event paths name them (`link_chain`). The directory of every hop outside the Areas is watched,
+   reference-counted. An event for any hop makes the linking Path a candidate, and the chain is
+   followed again after it is read. So retargeting `current` reads the new contents, gives a
+   Change, and moves the watch to `app2/`. New tests:
+   - `every_link_in_a_chain_of_symlinks_is_followed` is the probe's exact case. It edits through
+     the chain, retargets `current` with a rename, checks the Change and the read, edits the new
+     target (a Change) and then the old one (nothing). It fails when only the last hop is kept.
+   - `edits_to_a_symlinks_target_arrive_as_changes_for_the_linking_path` now also retargets a
+     single link the way `ln -sf` does, with a new link renamed over it: a Change, then edits to
+     the new target arrive and edits to the old one don't.
+
+   Directory links on the way to a linked File still aren't followed, and the README's
+   Limitations say so.
+2. **Spec a2, directories left unwatched:** fixed.
+   - Every Resync the watcher sends is now followed by watching the Area again from its root
+     (`Watches::watch_area`: unwatch, make the root, watch), then listing it. That covers an error,
+     lost events (overflow) and a root removed or renamed away. So a directory made while events
+     were lost is watched again.
+   - If watching fails, the Area is retried after a window, then twice as long each time, up to
+     30 s. The watcher's own timer wakes it (`next_burst` also waits for the first retry). The
+     Area gets another Resync once it is watched, since Changes to it were missed meanwhile.
+   - Tests:
+     - `FailurePoint::WatchingFails` now also loses the watches of the Areas its error names, as
+       a failing watcher can. `a_failure_to_watch_gives_a_resync` writes into a new directory
+       during the failure, then checks that edits there, and elsewhere, arrive after the Resync.
+       It fails without the rewatch.
+     - The new `FailurePoint::WatchingAnAreaFails { times }` drives
+       `an_area_that_cant_be_watched_is_tried_again_and_resynced_once_it_is`: every Area fails at
+       `open` and Config once more. The test expects Resyncs for Data and Cache, then Config
+       after the doubled wait, then edits arriving in each Area.
+   - Found on the way: the debouncer's own `unwatch` tells its file ID cache that the path was
+     removed. The removal hook then took the watcher's own unwatching for the root going away,
+     which gave a second Resync. `Watches::unwatch` now forgets that removal.
+3. **Spec a3, story 54 for Files unchanged since open:** partly met, as suggested. Listing Config
+   (at `open` and after a Resync) reads and hashes its Files, so rewriting one there with the
+   same contents, or setting only its mtime, gives nothing. The new first half of
+   `events_that_leave_a_files_contents_as_they_were_are_dropped` checks this, and fails without
+   the hashing. Data and Cache keep the documented deviation. The ticket's box now says "partly"
+   and why, and the README's Limitations and the spec are updated.
+4. **Spec c4, `.or(*said)`:** the fallback is removed, along with the sentence. Since the
+   filesystem stopped checking the third feed in the third-Store variant, every feed checked
+   makes its own Commits to `raced.txt` in each round, so it always says something. The test is
+   stricter again.
+5. **Spec c5, docs without the caveat:** fixed. `Store::commit` now says that this Store's
+   Commits reach the feed in the order they were applied, and that on SQLite other Stores' do
+   too, in order with them. On the filesystem, other Stores' Commits arrive once settled, so this
+   Store's next Commit can come first. The README's batch sentence now reads "if the store made
+   it, or on SQLite (on the filesystem, see below…)". `FeedItem`, `ChangeFeed::next` and
+   `open_fs` already had the caveat.
+6. **Spec c6, the Commit turn held across a burst:** fixed by reading without the turn.
+   - `FsWatcher::look` reads and hashes what the burst names, with no turn. That gives, per
+     Area, a `Looked`: each File as reads through tidings saw it, plus the names under which
+     every File was listed. Before it starts, `Reported::start_looking` makes each Commit's
+     `committed()` also note the Paths it changes.
+   - `store::watch_areas` then takes the turn for `FsWatcher::conclude`. This stops the noting,
+     reads again each noted Path that the look covered, compares with `Reported`, updates it, and
+     the Store records the result before letting go. Under the turn it reads only the Files the
+     Store's own Commits changed during the look.
+   - Why the guarantees hold: a Commit updates `Reported` while holding the turn, after its
+     changes are on disk.
+     - A Commit that updated `Reported` before the look began changed the disk before it too, so
+       the look saw its result.
+     - A Commit that updated `Reported` after the look began, including one being applied during
+       it (it finishes before `conclude` gets the turn), had its Paths noted, and they are read
+       again under the turn.
+     - So every Path is compared with a read made after the last own Commit to touch it. The
+       comparison is then as if the whole burst had been read under the turn, as before: no own
+       Change is reported again, and none is reported as external.
+     - External edits made after the look have events of their own.
+     - Files under a name that were reported already aren't read in the look, as before. If a
+       Commit removes or re-adds one meanwhile, it is noted and read again.
+   - Listings after a Resync go through the same two steps.
+   - Measured with the reviewer's shape of probe: 40,000 Files written directly, while this Store
+     commits every 5 ms.
+     - The slowest Commit took 4.6 s before, 156 ms after in a debug build, and 27 ms in a release
+       build (1.48 s before).
+     - Most of what is left in debug builds is recording the 40,000 Changes. Comparing
+       reported Paths as strings rather than through `Path::stored`, whose debug check validates
+       each, took it from 1.3 s to 156 ms.
+7. **Spec c7, the watch limit at `open`:** `open` now opens. An Area that can't be watched is
+   retried with backoff and gets a Resync once it is watched, as in item 2. `open` still fails if
+   no watcher can be made at all (no inotify instance), since then there is nothing to retry
+   with. This is documented in `open_fs`, the README's Consistency section and the spec.
+8. **Standards:** all done.
+   - `lock` is now `lock_ignoring_poison(mutex)`.
+   - The two "roots" are now `FsWatcher::area_roots` (the `AreaRoot`s, for waiting on Commits)
+     and `Watches::area_paths` (the canonicalised paths watched, `None` while an Area isn't).
+     `WatchedArea` no longer holds a path, so `watched.watched` is gone.
+   - The waits are now `until_removal_settles` and `until_renames_settle`.
+   - The destructuring and relink loops are shared: `Watched::relink(area, root, paths)` serves
+     both `look_at` and `list`, and each destructures `WatchedArea` once.
+   - The debouncer, the Area paths, the outside-directory counts and the retries are bundled
+     into `Watches`, and `Links` methods take `&mut Watches`.
+   - `record_observed` takes one `Observed`, and SQLite's two callers loop.
+   - String-typed Paths: `Seen.names` and `Looked` now hold `Path`s. `Reported.files` keeps
+     `String` keys, since the Files under a Prefix are a `range_under` range of them, and the
+     field's doc says so.
+
+Clippy (`--all-targets` and without) is clean with default features, `--all-features`,
+`--no-default-features`, `fs`, `sqlite` and `fs,testing`. So are rustfmt and the public rustdoc.
+`cargo test` passes with default features, `--no-default-features` and `--all-features`: 183
+behaviour tests. The watching and two-Store tests passed 20 runs out of 20 alone, and 10 out of
+10 with three copies of the filesystem suite running alongside.

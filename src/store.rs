@@ -135,7 +135,9 @@ impl Store {
     /// settled for the debounce window in `options`. Another Store's Commit usually arrives in one
     /// batch, but can be split while events keep coming, and it can arrive after this Store's own
     /// next Commit. If watching fails, or an Area's directory is removed (it is then made again),
-    /// the Area gets a Resync.
+    /// the Area gets a Resync. An Area that can't be watched, as once the platform's limit on
+    /// watches is reached, is tried again, waiting longer each time, and gets a Resync once it is
+    /// watched: the Store opens meanwhile.
     ///
     /// The filesystem has no Snapshots: see [`supports_snapshots`](Self::supports_snapshots).
     ///
@@ -250,7 +252,10 @@ impl Store {
     /// Every File written gets the Commit's timestamp as its last-modified time. A write that
     /// wouldn't change the File's contents is left out, so the File keeps its time and no Change
     /// is sent for it. The Changes arrive on the Change feed in the same batch, and a Commit
-    /// that changes nothing sends none. Commits reach the feed in the order they were applied.
+    /// that changes nothing sends none. This Store's Commits reach the feed in the order they were
+    /// applied. On SQLite, other Stores' Commits do too, in order with this Store's. On the
+    /// filesystem, they arrive once their events have settled, so this Store's own next Commit
+    /// can reach the feed first (see [`open_fs`](Self::open_fs)).
     /// On success, gives the timestamp and the new Revisions.
     ///
     /// Nothing is written if the Commit fails:
@@ -291,7 +296,9 @@ impl Store {
             let timestamp = Timestamp::now();
             let request = CommitRequest { timestamp, staged: staging.into_staged() };
             let outcome = inner.backend.commit(request).await?;
-            record_observed(&inner.feed, area, outcome.observed_before);
+            for observed in outcome.observed_before {
+                record_observed(&inner.feed, area, observed);
+            }
             inner.feed.record(area, outcome.changes, Origin::Local);
             if outcome.pending {
                 return Err(Error::Pending);
@@ -317,13 +324,11 @@ impl Store {
     }
 }
 
-/// Records on `feed` what the Backend observed in `area`, in order: each Commit in one batch.
-fn record_observed(feed: &FeedSender, area: Area, observed: Vec<Observed>) {
-    for observed in observed {
-        match observed {
-            Observed::Changes { origin, changes } => feed.record(area, changes, origin),
-            Observed::Missed => feed.resync(area),
-        }
+/// Records on `feed` what the Backend observed in `area`: Changes in one batch, or a Resync.
+fn record_observed(feed: &FeedSender, area: Area, observed: Observed) {
+    match observed {
+        Observed::Changes { origin, changes } => feed.record(area, changes, origin),
+        Observed::Missed => feed.resync(area),
     }
 }
 
@@ -361,14 +366,16 @@ fn supervise(
 /// until the Store is dropped and stops it, or watching stops. It holds only the Store's end of
 /// the Change feed and its turn with Commits, not the Store, so that the feed still ends.
 ///
-/// It looks at each burst of events in turn with Commits, so that each of the Store's own Commits
-/// is done and recorded, or not started: see the watcher's doc.
+/// It reads what each burst of events names without the turn, then takes the turn to compare it
+/// with what was reported, and record the difference, so that the Store's own Commits are neither
+/// held up for long nor reported again: see the watcher's doc.
 #[cfg(feature = "fs")]
 async fn watch_areas(mut watcher: FsWatcher, feed: FeedSender, commit_order: Arc<Mutex<()>>) {
     while let Some(burst) = watcher.next_burst().await {
+        let looks = watcher.look(burst).await;
         let _turn = commit_order.lock().await;
-        for (area, observed) in watcher.observe(burst).await {
-            record_observed(&feed, area, vec![observed]);
+        for (area, observed) in watcher.conclude(looks).await {
+            record_observed(&feed, area, observed);
         }
     }
 }
@@ -388,7 +395,9 @@ async fn follow_other_stores(poller: SqlitePoller, feed: FeedSender, commit_orde
             match poller.read(area).await {
                 Ok(observed) => {
                     failing.retain(|failed| *failed != area);
-                    record_observed(&feed, area, observed);
+                    for observed in observed {
+                        record_observed(&feed, area, observed);
+                    }
                 }
                 Err(error) => {
                     tracing::debug!("reading the change log of {area:?} failed: {error}");

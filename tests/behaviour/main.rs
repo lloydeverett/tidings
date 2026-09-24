@@ -269,6 +269,19 @@ mod fs {
     /// events that can't be writes: see the README's Limitations.
     #[tokio::test]
     async fn events_that_leave_a_files_contents_as_they_were_are_dropped() {
+        // Config's Files are read when the Store opens, so their Revisions are known: even a
+        // File there before gets none of these events.
+        let fixture = Fs::new();
+        fixture.write_directly(Area::Config, "settings.toml", "a = 1\n");
+        let Opened { store: _store, mut feed } = fixture.open().await;
+        let file = fixture.on_disk(Area::Config, "settings.toml");
+        std::fs::File::open(&file).unwrap().set_modified(SystemTime::UNIX_EPOCH).unwrap();
+        fixture.write_directly(Area::Config, "settings.toml", "a = 1\n");
+        assert_nothing_more(&mut feed).await;
+        fixture.write_directly(Area::Config, "settings.toml", "a = 2\n");
+        assert_eq!(changes(&next_batch(&mut feed).await), [("settings.toml", ChangeKind::Changed)]);
+
+        // In the other Areas, only once a File has changed.
         let fixture = Fs::new();
         fixture.write_directly(Area::Data, "before.txt", "there before");
         let Opened { store: _store, mut feed } = fixture.open().await;
@@ -560,10 +573,53 @@ mod fs {
         std::fs::write(elsewhere.join("theme.toml"), "light").unwrap();
         assert_eq!(changes(&next_batch(&mut feed).await), [("theme.toml", ChangeKind::Changed)]);
 
+        // Linked elsewhere, the way `ln -sf` does it: a new link renamed over the old one.
+        std::fs::write(elsewhere.join("other.toml"), "other").unwrap();
+        symlink(elsewhere.join("other.toml"), elsewhere.join("new link")).unwrap();
+        std::fs::rename(elsewhere.join("new link"), fixture.on_disk(Area::Config, "theme.toml"))
+            .unwrap();
+        assert_eq!(changes(&next_batch(&mut feed).await), [("theme.toml", ChangeKind::Changed)]);
+        std::fs::write(elsewhere.join("other.toml"), "other, edited").unwrap();
+        assert_eq!(changes(&next_batch(&mut feed).await), [("theme.toml", ChangeKind::Changed)]);
+        std::fs::write(elsewhere.join("theme.toml"), "no longer linked").unwrap();
+        assert_nothing_more(&mut feed).await;
+
         // Unlinked: the target's edits are nothing to the Area any more.
         std::fs::remove_file(fixture.on_disk(Area::Config, "theme.toml")).unwrap();
         assert_eq!(changes(&next_batch(&mut feed).await), [("theme.toml", ChangeKind::Removed)]);
         std::fs::write(elsewhere.join("theme.toml"), "blue").unwrap();
+        assert_nothing_more(&mut feed).await;
+    }
+
+    /// A dotfiles setup can link through several links: here to `current`, which points to the
+    /// file itself. Each link on the way is watched, so retargeting `current` is a Change, and
+    /// edits then go by where it points now.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn every_link_in_a_chain_of_symlinks_is_followed() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fs::new();
+        let dotfiles = fixture.root.path().join("dotfiles");
+        for version in ["app", "app2"] {
+            std::fs::create_dir_all(dotfiles.join(version)).unwrap();
+            std::fs::write(dotfiles.join(version).join("s.toml"), version).unwrap();
+        }
+        symlink("app/s.toml", dotfiles.join("current")).unwrap();
+        fixture.write_directly(Area::Config, "unrelated.toml", "");
+        symlink(dotfiles.join("current"), fixture.on_disk(Area::Config, "s.toml")).unwrap();
+        let Opened { store, mut feed } = fixture.open().await;
+
+        std::fs::write(dotfiles.join("app/s.toml"), "app, edited").unwrap();
+        assert_eq!(changes(&next_batch(&mut feed).await), [("s.toml", ChangeKind::Changed)]);
+
+        symlink("app2/s.toml", dotfiles.join("current.new")).unwrap();
+        std::fs::rename(dotfiles.join("current.new"), dotfiles.join("current")).unwrap();
+        assert_eq!(changes(&next_batch(&mut feed).await), [("s.toml", ChangeKind::Changed)]);
+        let file = store.read(Area::Config, "s.toml").await.unwrap().unwrap();
+        assert_eq!(file.contents(), "app2");
+        std::fs::write(dotfiles.join("app2/s.toml"), "app2, edited").unwrap();
+        assert_eq!(changes(&next_batch(&mut feed).await), [("s.toml", ChangeKind::Changed)]);
+        std::fs::write(dotfiles.join("app/s.toml"), "app, no longer linked").unwrap();
         assert_nothing_more(&mut feed).await;
     }
 
@@ -621,12 +677,46 @@ mod fs {
         let Opened { store: _store, mut feed } =
             fixture.open_with(|options| options.fail_at(FailurePoint::WatchingFails)).await;
 
-        fixture.write_directly(Area::Data, "missed.txt", "x");
+        // The watcher loses its watches of the Area, as it can when it fails, so the Area is
+        // watched again: directories made meanwhile too.
+        fixture.write_directly(Area::Data, "missed/a.txt", "x");
         assert_eq!(next_item(&mut feed).await, FeedItem::Resync(Area::Data));
         assert_nothing_more(&mut feed).await;
         fixture.write_directly(Area::Data, "seen.txt", "x");
         assert_eq!(changes(&next_batch(&mut feed).await), [("seen.txt", ChangeKind::Changed)]);
+        fixture.write_directly(Area::Data, "missed/a.txt", "y");
+        assert_eq!(changes(&next_batch(&mut feed).await), [("missed/a.txt", ChangeKind::Changed)]);
         assert_nothing_more(&mut feed).await;
+    }
+
+    /// An Area that can't be watched, as when the platform's limit on watches is reached, is
+    /// tried again, waiting longer each time. The Store opens meanwhile, and the Area gets a
+    /// Resync once it is watched, since Changes to it were missed until then.
+    #[tokio::test]
+    async fn an_area_that_cant_be_watched_is_tried_again_and_resynced_once_it_is() {
+        let fixture = Fs::new();
+        // Each Area fails when the Store opens, and Config once more after that.
+        let failing = FailurePoint::WatchingAnAreaFails { times: 4 };
+        let Opened { store: _store, mut feed } =
+            fixture.open_with(|options| options.fail_at(failing)).await;
+
+        let mut resynced = Vec::new();
+        for _ in 0..3 {
+            match next_item(&mut feed).await {
+                FeedItem::Resync(area) => resynced.push(area),
+                other => panic!("expected a Resync, got {other:?}"),
+            }
+        }
+        assert_eq!(resynced, [Area::Data, Area::Cache, Area::Config]);
+        assert_nothing_more(&mut feed).await;
+        for area in [Area::Config, Area::Data, Area::Cache] {
+            fixture.write_directly(area, "seen.txt", "x");
+            let batch = next_batch(&mut feed).await;
+            assert_eq!(
+                changes_in_full(&batch),
+                [(area, "seen.txt", ChangeKind::Changed, Origin::External)]
+            );
+        }
     }
 
     /// Something on disk that isn't a File can have the name of a File a Commit writes, or of a

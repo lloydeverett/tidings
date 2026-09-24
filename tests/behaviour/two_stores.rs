@@ -220,17 +220,14 @@ enum Marker {
 }
 
 /// In each round, tasks on two Stores race to write and delete one Path. However the Commits
-/// land, what each feed last said of the Path must be as the last of them left the File: changed
-/// if it is there, removed if it isn't. Once the round is over, `marked_by` commits a marker, which
-/// reaches each feed checked after every Commit of the round. A feed told of other Stores' Commits by
-/// watching may say nothing of the Path in a round that leaves it as it was, so what it said
-/// last may be from an earlier round.
+/// land, what each feed says of the Path must end as the last of them left the File: changed if
+/// it is there, removed if it isn't. Once the round is over, `marked_by` commits a marker, which
+/// reaches each feed checked after every Commit of the round.
 async fn race_then_mark(fixture: &impl Fixture, marked_by: Marker) {
     let Opened { store: first, feed: mut first_feed } = fixture.open().await;
     let Opened { store: second, feed: mut second_feed } = fixture.open().await;
     let Opened { store: third, feed: mut third_feed } = fixture.open().await;
     let marking = if marked_by == Marker::BySecondStore { &second } else { &third };
-    let mut said = [Some(ChangeKind::Removed); 3];
 
     for round in 0..150 {
         let tasks: Vec<_> = (0..4)
@@ -263,9 +260,9 @@ async fn race_then_mark(fixture: &impl Fixture, marked_by: Marker) {
         if marked_by == Marker::BySecondStore {
             feeds.push(&mut third_feed);
         }
-        for (feed, said) in feeds.into_iter().zip(&mut said) {
-            *said = kind_until(feed, "raced.txt", &marker).await.or(*said);
-            assert_eq!(*said, Some(expected), "round {round}");
+        for feed in feeds {
+            let said = kind_until(feed, "raced.txt", &marker).await;
+            assert_eq!(said, Some(expected), "round {round}");
         }
     }
 }
