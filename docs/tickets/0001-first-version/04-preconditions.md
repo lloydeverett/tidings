@@ -22,6 +22,9 @@ letter case are refused. Everything works on the memory Backend and is covered b
       Prefix differs.
 - [ ] A failed Precondition gives `Conflict { paths }` and nothing is written. For a Prefix, the
       paths are the ones added, removed or changed under it.
+- [ ] A rename (a delete and a write in one Commit) that hits a Conflict leaves both Paths as
+      they were. This is the "nothing" half of ticket 03's all-or-nothing rename, which couldn't
+      be tested until a Commit could fail.
 - [ ] A Staging with no Preconditions depends on nothing, and costs nothing extra.
 - [ ] A Commit that would create a Path differing only in letter case from an existing Path (or
       from another Path in the same Commit) is refused with `InvalidPath`.

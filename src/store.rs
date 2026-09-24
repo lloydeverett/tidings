@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use jiff::Timestamp;
 
-use crate::backend::{Backend, CommitRequest, memory::MemoryBackend};
+use crate::backend::{Backend, CommitRequest, RawChange, memory::MemoryBackend};
 use crate::change::{self, FeedSender};
 use crate::{
     Area, Change, ChangeFeed, Committed, File, IntoPath, IntoPrefix, Origin, Path, Result, Staging,
@@ -67,15 +67,14 @@ impl Store {
     pub async fn commit(&self, staging: Staging) -> Result<Committed> {
         let area = staging.area();
         let timestamp = Timestamp::now();
-        let (staged, prefix_deletes) = staging.into_parts();
-        let request = CommitRequest { area, timestamp, staged, prefix_deletes };
-        let applied = self.inner.backend.commit(request).await?;
-        let changes = applied
+        let request = CommitRequest { timestamp, staged: staging.into_staged() };
+        let outcome = self.inner.backend.commit(request).await?;
+        let changes = outcome
             .changes
             .into_iter()
-            .map(|(path, kind)| Change { area, path, kind, origin: Origin::Local })
+            .map(|RawChange { path, kind }| Change { area, path, kind, origin: Origin::Local })
             .collect();
         self.inner.feed.announce(changes);
-        Ok(Committed::new(timestamp, applied.revisions))
+        Ok(Committed::new(timestamp, outcome.revisions))
     }
 }

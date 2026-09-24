@@ -3,10 +3,8 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use jiff::Timestamp;
-
-use super::{Applied, CommitRequest};
-use crate::staging::Staged;
+use super::{CommitOutcome, CommitRequest, RawChange};
+use crate::staging::Action;
 use crate::{Area, ChangeKind, File, Path, Prefix, Revision, Stat};
 
 #[derive(Debug, Default)]
@@ -21,21 +19,20 @@ type Areas = [BTreeMap<Path, Stored>; 3];
 #[derive(Debug)]
 struct Stored {
     contents: String,
-    modified: Timestamp,
-    revision: Revision,
+    stat: Stat,
 }
 
 impl MemoryBackend {
     pub(crate) fn read(&self, area: Area, path: &Path) -> Option<File> {
         let areas = self.areas.lock().unwrap();
         let stored = areas[area as usize].get(path)?;
-        Some(File::new(path.clone(), stored.contents.clone(), stored.modified, stored.revision))
+        Some(File::new(path.clone(), stored.contents.clone(), stored.stat))
     }
 
     pub(crate) fn stat(&self, area: Area, path: &Path) -> Option<Stat> {
         let areas = self.areas.lock().unwrap();
         let stored = areas[area as usize].get(path)?;
-        Some(Stat::new(stored.modified, stored.revision))
+        Some(stored.stat)
     }
 
     pub(crate) fn list(&self, area: Area, prefix: &Prefix) -> Vec<Path> {
@@ -44,35 +41,32 @@ impl MemoryBackend {
     }
 
     /// Applies every write and delete at once, under the one lock.
-    pub(crate) fn commit(&self, request: CommitRequest) -> Applied {
-        let CommitRequest { area, timestamp, mut staged, prefix_deletes } = request;
+    pub(crate) fn commit(&self, request: CommitRequest) -> CommitOutcome {
+        let CommitRequest { timestamp, mut staged } = request;
         let mut areas = self.areas.lock().unwrap();
-        let files = &mut areas[area as usize];
-        for prefix in &prefix_deletes {
-            for path in files.keys().filter(|path| prefix.covers(path)) {
-                staged.entry(path.clone()).or_insert(Staged::Delete);
-            }
-        }
-        let mut applied = Applied::default();
-        for (path, staged) in staged {
-            match staged {
-                Staged::Write(contents) => {
+        let files = &mut areas[staged.area as usize];
+        staged.expand_prefix_deletes(files.keys());
+        let mut outcome = CommitOutcome::default();
+        for (path, action) in staged.actions {
+            match action {
+                Action::Write(contents) => {
                     let revision = Revision::of(&contents);
-                    applied.revisions.insert(path.clone(), revision);
+                    outcome.revisions.insert(path.clone(), revision);
                     // A write that changes nothing is left out: the File keeps its time.
-                    if files.get(&path).is_some_and(|stored| stored.revision == revision) {
+                    if files.get(&path).is_some_and(|stored| stored.stat.revision() == revision) {
                         continue;
                     }
-                    files.insert(path.clone(), Stored { contents, modified: timestamp, revision });
-                    applied.changes.push((path, ChangeKind::Changed));
+                    let stat = Stat::new(timestamp, revision);
+                    files.insert(path.clone(), Stored { contents, stat });
+                    outcome.changes.push(RawChange { path, kind: ChangeKind::Changed });
                 }
-                Staged::Delete => {
+                Action::Delete => {
                     if files.remove(&path).is_some() {
-                        applied.changes.push((path, ChangeKind::Removed));
+                        outcome.changes.push(RawChange { path, kind: ChangeKind::Removed });
                     }
                 }
             }
         }
-        applied
+        outcome
     }
 }

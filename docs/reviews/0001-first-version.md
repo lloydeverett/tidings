@@ -216,3 +216,119 @@ Not acted on, as triaged:
   (Standards b4).
 - **Spec (c5), no operation takes a Prefix yet:** tickets 03 and 04 own this, through
   `impl IntoPrefix`.
+
+---
+
+## Ticket 03: The full Staging, and reading
+
+Reviewed: `git diff 821421e...db1e63d` (commit db1e63d).
+
+### Standards
+
+#### Hard violations of documented standards
+
+None found. What was checked:
+- **Spec, Implementation Decisions:** Backends stay `pub(crate)` with no public trait, and there are no new error variants.
+- **Spec, Testing Decisions:** tests use only the public API and never inspect internal state.
+- **Spec, tracing and features:** no logging, so nothing above debug level, and no new features.
+- **README:** the Consistency section is updated for "a write that changes nothing is left out" and matches the behaviour.
+- **CONTEXT.md `_Avoid_` lists:** "key", "directory", "event", "version" and "transaction" are not used as names for domain concepts. `drafts/` appears only as test data, not as a name for Staging.
+
+#### Judgement calls (possible documented-standard or smell issues)
+
+1. **Uses a word from an `_Avoid_` list** (CONTEXT.md, Commit: "_Avoid_: save, flush, apply"). At `src/backend/mod.rs:33` there is `pub(crate) struct Applied`, and at `memory.rs:56` there is `let mut applied`. Both name the result of a Commit with the avoided word. This is soft, since CONTEXT's own definition uses "Applying" as a verb and the type is crate-private. `CommitOutcome` or `Done` would avoid the word.
+2. **Data Clumps.** `area`, `staged` and `prefix_deletes` travel together three times:
+   - in `Staging` (`staging.rs:11-17`)
+   - through `into_parts() -> (BTreeMap<Path, Staged>, BTreeSet<Prefix>)` (`staging.rs:73`)
+   - again in `CommitRequest` (`backend/mod.rs:21-29`)
+
+   Each copy has its own doc comment explaining the ordering. Ticket 04 adds `require` and `require_prefix`, which will widen the clump. Consider making `CommitRequest` hold the consumed `Staging` (or a shared staged-contents type) plus the `timestamp`.
+3. **Duplicated Code (incipient).** The "the later staged operation wins" rule is split in two places:
+   - `Staging::delete_prefix` removes earlier operations with `retain(|path, _| !prefix.covers(path))` (`staging.rs:67`).
+   - The memory Backend expands the Prefix delete with `staged.entry(path.clone()).or_insert(Staged::Delete)` (`memory.rs:51-54`).
+
+   The SQLite and filesystem Backends (tickets 07 and 09) will each have to copy the second half. Consider a single helper on `CommitRequest`, e.g. `expand_prefix_deletes(existing_paths)`, that every Backend calls under its lock.
+4. **Primitive Obsession (minor).** `Applied.changes: Vec<(Path, ChangeKind)>` (`backend/mod.rs:38`) is a bare tuple standing in for the Backend's "raw change". The spec's "What every Backend must provide" section gives a raw change a Revision too, and ticket 11 needs it. A small crate-private type now would save reshaping it later.
+5. **Duplicated Code (minor).** `Stat` (`file.rs:49-68`) repeats `File`'s `modified` and `revision` fields, their accessors and their doc comments (`file.rs:35-43`). `File` could hold a `Stat`, or build one, so the two can't drift apart.
+
+#### No issues
+
+- `Committed` (`src/committed.rs`), `Store::stat` and `Store::list` (`store.rs:46-58`), and `Prefix::covers` (`prefix.rs:31-35`) are well named and minimal.
+- Test names and helpers (`changes`, `list`, `assert_refused`, `tests/behaviour/suite.rs:470-500`) follow the glossary.
+- The 5 ms sleep at `suite.rs:254` is justified and acceptable.
+
+### Spec
+
+`cargo test` passes: 19 suite tests and 5 path tests. Every ticked box was checked against the code and tests, and all but one are genuinely met.
+
+**(a) Missing or partial**
+
+1. **The rename is only half tested, and the ticket was reworded to allow it.** Ticket: "Deleting a Path and writing another in the same Commit acts as a rename, and happens all-or-nothing." The implementer added to this criterion that "the 'nothing' half gets its test there" (in ticket 04). But ticket 04's checklist has no such item. Its closest line is "A failed Precondition gives `Conflict { paths }` and nothing is written", which doesn't mention renames. So the deferral is recorded nowhere that will make it happen.
+   - It is fair to say the case can't be tested today, because `src/backend/memory.rs:47-76` cannot fail.
+   - Fix: add a checkbox to `04-preconditions.md` saying that a rename which hits a Conflict changes nothing.
+
+**(b) Scope creep**
+
+None. `Prefix::covers` (`src/prefix.rs:31-35`), `Stat` and `Committed` are what the ticket's Notes and the spec ask for. The README change follows "Keep them in sync".
+
+**(c) Implemented but possibly wrong**
+
+None found. On the implementer's two recorded decisions:
+
+- **The order in which staged operations apply** (Notes: "the later of a write or delete to the same Path wins … `delete_prefix` drops anything staged under the Prefix before it"). The spec doesn't settle this, and the code does what the Notes say:
+  - `src/staging.rs:66-69`: `retain` drops everything already staged under the Prefix.
+  - `src/backend/memory.rs:51-54`: the Prefix delete is expanded under the lock with `or_insert`, so a write or delete staged after it wins. This fits "deletes of a Prefix, which are expanded when the Commit is made".
+  - It is tested in `a_prefix_delete_and_writes_under_it_apply_in_the_order_staged` in `tests/behaviour/suite.rs`.
+  - One risk for ticket 04: once writes and deletes carry Preconditions, a later `delete_prefix` will silently drop the Precondition of an earlier write under that Prefix. Ticket 04 should decide whether that is intended.
+- **Revisions for writes that were left out.** The spec says "the new Revision of each Path written", and US38 says "so that I can write them again safely without reading them first". The implementation (`memory.rs:59-64`) returns the Revision even for a left-out write. That Revision equals the stored one, so it serves US38 exactly. This is a sound reading, not a deviation, and `a_write_that_changes_nothing_is_left_out` asserts it.
+
+**Other boxes verified**
+
+- A missing File gives `Ok(None)` from both `read` and `stat`.
+- `stat` returns a `Stat` without contents (`src/file.rs:48-68`).
+- `list` returns an ordered `Vec<Path>`, and the empty Prefix lists the whole Area.
+- A delete of a Path that doesn't exist does nothing.
+- One timestamp per Commit, chosen in the Store layer (`src/store.rs:68`), as the spec requires.
+- A write identical to what's stored is left out, by comparing Revisions.
+- Deletes produce *removed* Changes, and a Commit's Changes arrive in one batch.
+- A Commit that changes nothing sends no batch (`announce` in `src/change.rs` returns early when there are no Changes). This is tested for an empty Commit, an unchanged write, and deletes of a missing Path and of an empty Prefix.
+- The invalid-Path test now covers `stat` and `delete` with every Path rule, and `list` and `delete_prefix` with every Prefix rule, as the Notes claim.
+
+### Summary
+
+Standards: 0 hard violations and 5 judgement calls. The most notable is a Data Clump: `area`, `staged` and `prefix_deletes` travel together through Staging, `into_parts` and CommitRequest, and ticket 04 will widen it. Spec: 1 partial item. The worst is that the "nothing" half of an all-or-nothing rename was deferred to ticket 04 without a checkbox there to make sure it gets done.
+
+
+### Resolution
+
+1. **Spec (a1), the "nothing" half of the rename had nowhere to go:** fixed. Ticket 04 has a new
+   unticked checkbox: "A rename (a delete and a write in one Commit) that hits a Conflict leaves
+   both Paths as they were". The rename criterion in ticket 03 now links to it.
+2. **Standards 1, `Applied` uses a word CONTEXT.md avoids:** fixed. The type is now
+   `CommitOutcome` and the binding is `outcome`.
+3. **Standards 2 and 3, the Data Clump and the rule split in two places:** fixed. The staged
+   contents have one crate-private home, `Staged` in `src/staging.rs`: the Area, the action for
+   each Path (`Action::Write` or `Action::Delete`) and the Prefix deletes.
+   - A `Staging` is a wrapper around a `Staged`.
+   - `CommitRequest` is now just the timestamp and the `Staged`. The tuple from `into_parts` is
+     gone.
+   - Ticket 04's `require` and `require_prefix` become fields of `Staged`, and nothing else has
+     to widen.
+   - Both halves of "a Path staged after the Prefix delete wins" now live in `staging.rs`.
+     `Staging::delete_prefix` drops anything staged under the Prefix before it.
+     `Staged::expand_prefix_deletes(existing_paths)` turns the Prefix deletes into deletes of
+     the existing Paths under them, keeping an action already staged for a Path. Every Backend
+     calls it under its lock with the Paths it has, and the memory Backend already does.
+4. **Standards 4, the `(Path, ChangeKind)` tuple:** fixed. `CommitOutcome::changes` is a
+   `Vec<RawChange>`, where `RawChange { path, kind }` is crate-private and lives in
+   `src/backend/mod.rs`. It has no Revision field, since nothing needs one before ticket 11.
+5. **Standards 5, `Stat` repeated `File`'s fields:** fixed. `File` holds a `Stat`, and its
+   public `modified()` and `revision()` read from it. The memory Backend stores each File as its
+   contents plus a `Stat`, so `stat` hands out the stored `Stat` directly.
+
+Not acted on here: the risk that a later `delete_prefix` silently drops the Precondition of an
+earlier write under that Prefix. The coordinator is passing it to ticket 04.
+
+The behaviour tests are unchanged. Clippy (all targets, with default features and with
+`--all-features`) is clean, and `cargo test` passes with default features, with
+`--no-default-features` and with `--all-features`.

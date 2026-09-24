@@ -24,7 +24,8 @@ shared suite.
 - [x] Deleting a Path and writing another in the same Commit acts as a rename, and happens
       all-or-nothing. The memory Backend applies a Commit under one lock, and the rename's two
       Changes arrive in one batch. A Commit can't fail after staging until ticket 04 adds
-      Conflicts, so the "nothing" half gets its test there.
+      Conflicts, so the "nothing" half gets its test there: see the rename checkbox in
+      [04](04-preconditions.md).
 - [x] Every File in a Commit gets the same last-modified time.
 - [x] A successful Commit returns its timestamp and the new Revision of each Path it wrote.
 - [x] A write whose contents are identical to what is stored is left out: the timestamp doesn't
@@ -38,8 +39,8 @@ shared suite.
   Path wins. `delete_prefix` follows the same rule: it drops anything staged under the Prefix
   before it, and a write or delete under the Prefix staged after it still happens. So staging
   `delete_prefix("drafts/")` and then `write("drafts/a.md", ..)` replaces the contents of
-  `drafts/`. The Backend expands the Prefix delete under its lock, into deletes of the Paths that
-  exist then and aren't staged individually.
+  `drafts/`. Every Backend expands the Prefix deletes under its lock by calling
+  `Staged::expand_prefix_deletes` with the Paths that exist then, so the rule lives in one place.
 - `Store::commit` returns `Committed`, with `timestamp()` and `revisions()`, a map from each Path
   written to its Revision. A write left out because it changed nothing is still in `revisions()`
   (its Revision is the stored one), so an app can write that File again safely without reading

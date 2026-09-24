@@ -8,18 +8,12 @@ use crate::{Path, Revision};
 pub struct File {
     path: Path,
     contents: String,
-    modified: Timestamp,
-    revision: Revision,
+    stat: Stat,
 }
 
 impl File {
-    pub(crate) fn new(
-        path: Path,
-        contents: String,
-        modified: Timestamp,
-        revision: Revision,
-    ) -> File {
-        File { path, contents, modified, revision }
+    pub(crate) fn new(path: Path, contents: String, stat: Stat) -> File {
+        File { path, contents, stat }
     }
 
     /// The File's Path within its Area.
@@ -34,12 +28,12 @@ impl File {
 
     /// When the File was last modified. Every File in a Commit gets the same time.
     pub fn modified(&self) -> Timestamp {
-        self.modified
+        self.stat.modified()
     }
 
     /// The Revision of the File as it was read.
     pub fn revision(&self) -> Revision {
-        self.revision
+        self.stat.revision()
     }
 }
 

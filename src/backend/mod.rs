@@ -3,7 +3,7 @@
 
 pub(crate) mod memory;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use jiff::Timestamp;
 
@@ -16,26 +16,30 @@ pub(crate) enum Backend {
     Memory(memory::MemoryBackend),
 }
 
-/// A Staging, with its Paths validated, ready for a Backend to apply.
+/// A Staging, with its Paths validated, ready for a Backend to commit.
 #[derive(Debug)]
 pub(crate) struct CommitRequest {
-    pub(crate) area: Area,
     /// The last-modified time every File written gets. The Store layer chooses it.
     pub(crate) timestamp: Timestamp,
-    /// What to do to each Path. It wins over `prefix_deletes`, because it was staged after them.
-    pub(crate) staged: BTreeMap<Path, Staged>,
-    /// Prefixes to delete everything under, expanded by the Backend when the Commit runs.
-    pub(crate) prefix_deletes: BTreeSet<Prefix>,
+    /// What to commit. The Backend expands its Prefix deletes under its lock.
+    pub(crate) staged: Staged,
 }
 
 /// What a Commit did.
 #[derive(Debug, Default)]
-pub(crate) struct Applied {
+pub(crate) struct CommitOutcome {
     /// The new Revision of each Path written, including writes left out because they would not
     /// have changed the contents.
     pub(crate) revisions: BTreeMap<Path, Revision>,
     /// Each Path the Commit changed or removed, in order.
-    pub(crate) changes: Vec<(Path, ChangeKind)>,
+    pub(crate) changes: Vec<RawChange>,
+}
+
+/// A change a Backend made or observed, before the Store layer tags it with its Area and Origin.
+#[derive(Debug)]
+pub(crate) struct RawChange {
+    pub(crate) path: Path,
+    pub(crate) kind: ChangeKind,
 }
 
 impl Backend {
@@ -60,7 +64,7 @@ impl Backend {
 
     /// Applies every write and delete in `request`, all-or-nothing, after expanding its Prefix
     /// deletes and leaving out writes that would not change the contents.
-    pub(crate) async fn commit(&self, request: CommitRequest) -> Result<Applied> {
+    pub(crate) async fn commit(&self, request: CommitRequest) -> Result<CommitOutcome> {
         match self {
             Backend::Memory(backend) => Ok(backend.commit(request)),
         }
