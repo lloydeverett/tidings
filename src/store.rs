@@ -1,6 +1,9 @@
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use jiff::Timestamp;
+use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 
 #[cfg(feature = "testing")]
@@ -33,10 +36,9 @@ pub struct Store {
 /// The Change feed ends when this is dropped, which is when the last Store handle goes. So a
 /// task that runs for as long as the Store is open (watching for changes, polling another
 /// process's Commits) must not hold an `Arc<Inner>`, or the feed would never end: it holds only
-/// what it needs, and `Inner` stops it when dropped. A task that finishes on its own, such as a
-/// Commit left to complete in the background, may hold one, which keeps the feed open until its
-/// Changes are recorded. Such a Commit must also carry its `commit_order` guard into the task (an
-/// owned guard, from an `Arc<Mutex<()>>`), or a later Commit could be recorded before it.
+/// what it needs, and `Inner` stops it when dropped. A task that finishes on its own may hold one,
+/// which keeps the feed open until it is done. A Commit the app stops waiting for continues in
+/// such a task, holding its `commit_order` guard, so that it finishes and records its Changes.
 #[derive(Debug)]
 struct Inner {
     backend: Backend,
@@ -44,7 +46,38 @@ struct Inner {
     /// Held from before a Commit is applied until its Changes are recorded, so that Commits reach
     /// the Change feed in the order they were applied. Otherwise two Commits to the same Path
     /// could be recorded the other way round, and the merged Change would have the wrong kind.
-    commit_order: Mutex<()>,
+    commit_order: Arc<Mutex<()>>,
+}
+
+/// A Commit that has started. It runs in place while the app waits for it. If the app stops
+/// waiting, by dropping it, the rest of the Commit is handed to a task on the runtime, which
+/// finishes it. Spawning a task only then keeps the Commits nobody cancels as cheap as before.
+struct Started {
+    /// The rest of the Commit, until it has finished.
+    commit: Option<Pin<Box<dyn Future<Output = Result<Committed>> + Send>>>,
+    runtime: Handle,
+}
+
+impl Future for Started {
+    type Output = Result<Committed>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let commit = self.commit.as_mut().expect("a Commit is not polled once it has finished");
+        let result = std::task::ready!(commit.as_mut().poll(cx));
+        self.commit = None;
+        Poll::Ready(result)
+    }
+}
+
+impl Drop for Started {
+    fn drop(&mut self) {
+        if let Some(commit) = self.commit.take() {
+            // Nobody waits for the result. The Commit records its Changes itself.
+            self.runtime.spawn(async move {
+                let _ = commit.await;
+            });
+        }
+    }
 }
 
 impl Drop for Inner {
@@ -78,7 +111,7 @@ impl Store {
 
     fn open(backend: Backend) -> (Store, ChangeFeed) {
         let (feed, change_feed) = change::feed();
-        let inner = Inner { backend, feed, commit_order: Mutex::new(()) };
+        let inner = Inner { backend, feed, commit_order: Arc::default() };
         (Store { inner: Arc::new(inner) }, change_feed)
     }
 
@@ -147,16 +180,34 @@ impl Store {
     /// - [`Error::InvalidPath`](crate::Error::InvalidPath) with
     ///   [`LetterCaseClash`](crate::InvalidPathReason::LetterCaseClash) if a write would create a
     ///   Path that differs only in letter case from another Path in the Area.
+    ///
+    /// A Commit can be cancelled, for example with a timeout, by dropping this future. If it is
+    /// dropped while the Commit waits for the Commits before it to finish, the Commit never
+    /// happens. Once the Commit has started, dropping this future hands the rest of it to a task
+    /// on the tokio runtime, which finishes it: its Changes arrive on the Change feed as usual.
+    ///
+    /// # Panics
+    ///
+    /// If it isn't called from within a tokio runtime.
     pub async fn commit(&self, staging: Staging) -> Result<Committed> {
-        let area = staging.area();
-        let _in_order = self.inner.commit_order.lock().await;
-        // Taken in turn too, so Commits read the clock in the order they are applied. The wall
-        // clock can step backwards, so their timestamps are in that order only while it doesn't.
-        let timestamp = Timestamp::now();
-        let request = CommitRequest { timestamp, staged: staging.into_staged() };
-        let outcome = self.inner.backend.commit(request).await?;
-        self.inner.feed.record(area, outcome.changes, Origin::Local);
-        Ok(Committed::new(timestamp, outcome.revisions))
+        let in_order = Arc::clone(&self.inner.commit_order).lock_owned().await;
+        // The Commit starts here. It holds its turn and the Store, so if this future is dropped
+        // from here on, the Commit still finishes in a task and its Changes are still recorded.
+        // Dropped before here, while waiting its turn, it never happens.
+        let inner = Arc::clone(&self.inner);
+        let commit = async move {
+            let _in_order = in_order;
+            let area = staging.area();
+            // Taken in turn too, so Commits read the clock in the order they are applied. The
+            // wall clock can step backwards, so their timestamps are in that order only while it
+            // doesn't.
+            let timestamp = Timestamp::now();
+            let request = CommitRequest { timestamp, staged: staging.into_staged() };
+            let outcome = inner.backend.commit(request).await?;
+            inner.feed.record(area, outcome.changes, Origin::Local);
+            Ok(Committed::new(timestamp, outcome.revisions))
+        };
+        Started { commit: Some(Box::pin(commit)), runtime: Handle::current() }.await
     }
 
     /// Records an external Change to `path` in `area` on the Change feed, as if another process

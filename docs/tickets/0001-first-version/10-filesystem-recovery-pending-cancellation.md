@@ -30,6 +30,10 @@ Named failure points in test builds make every one of these cases testable on Li
 - [ ] A rename that keeps failing after brief retries gives `Pending`. Until the renames are
       finished, reads of the affected Paths return the committed contents. The next Commit or
       `open` finishes the renames.
-- [ ] A Commit whose future is dropped once it has started runs to completion in the background.
-      Its Changes still arrive on the feed.
+- [ ] A filesystem Commit whose future is dropped once it has started runs to completion in the
+      background, and its Changes still arrive on the feed, tested with the pause point. The
+      mechanism is the Store layer's and already exists (ticket 07's review): a Commit dropped
+      once it has its turn is handed to a task that finishes it, and the shared suite's
+      `a_cancelled_commit_finishes_or_never_happens_and_is_reported_if_it_finishes` covers it on
+      every Backend. The pause point lets a test drop the future mid-journal for certain.
 - [ ] Journal recovery is logged through `tracing` at debug level.

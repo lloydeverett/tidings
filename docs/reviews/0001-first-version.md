@@ -770,3 +770,138 @@ Standards: 0 hard violations, 1 soft glossary point ("consistent read" in the RE
 Clippy (all targets, with default features, `--all-features` and `--no-default-features`) is
 clean. `cargo test` passes with each of them: 44 behaviour tests, 5 path tests and 3 Store-layer
 tests.
+
+---
+
+## Ticket 07: SQLite backend, storage
+
+Reviewed: `git diff dd23089...a5c740e` (commit a5c740e). This ticket's implementer was restarted twice after accidental interruptions and built on the partial files left behind. The Spec reviewer was also asked three questions: whether cancelling a Commit belongs to this ticket or ticket 10, whether the checks inside the write transaction are exact, and whether Snapshots are pinned.
+
+### Standards
+
+**Hard violations**
+
+- **src/backend/sqlite.rs:449-455 (a unit test edits the database directly).** This breaks docs/specs/0001-first-version.md:394-398: tests "never look at … tables or internal state", and the spec allows only two exceptions, both under `testing` (failure points and `inject_external_change`).
+  - *Justified:* yes. A stale fold only comes from a Unicode-data upgrade, which no public-API test can cause. The test also checks the result publicly (a Commit gets `LetterCaseClash`), and the ticket notes say it fails when the re-folding is removed.
+  - *Recorded:* only partly. It is noted in the test's doc comment (sqlite.rs:433) and in the ticket 07 Notes, but the spec still says "two exceptions". A one-line third exception under Testing Decisions would close the gap.
+  - *Alternative:* a `testing`-feature hook that overrides the stored `letter_case_fold_unicode_versions`, under the spec's own exception pattern, would test the same thing without touching tables.
+  - *Nit:* the test hard-codes `'fold_unicode_versions'` (sqlite.rs:453) instead of using `super::FOLD_UNICODE_VERSIONS`, so the two can drift apart silently.
+
+No other documented standard is breached:
+- Backends stay `pub(crate)`, with no public trait.
+- The single `#[non_exhaustive]` `Error` gains `Backend`, as the spec lists.
+- Feature gating matches the spec.
+- The behaviour suite's Fixture uses a temporary Root override for each test.
+- "transaction", "version" and "directory" are used only for SQLite transactions, schema and Unicode versions, and OS directories. None of them names a concept that CONTEXT.md's `_Avoid_` lists cover.
+- No `tracing` calls were added, so the debug-only rule is not engaged.
+
+**Baseline smells (judgement calls)**
+
+- **Duplicated Code:** the "`x/` up to `x0`" range trick appears four times: memory.rs:145, sqlite.rs:381, sqlite.rs:411 and the SQL at sqlite.rs:414. Each copy re-explains it in a comment. One helper, e.g. `Prefix::range()` or a `fold_range(fold)` in path.rs, would keep the rule in one place.
+- **Duplicated Code:** `SqliteBackend` and `SqliteSnapshot` each have `read`/`stat`/`list` plus their own `with_connection` (sqlite.rs:164 and 191). Minor, and partly forced by the Backend enum shape.
+- **Primitive Obsession:** `Option<Written>` means "a write, or `None` for a removal" (mod.rs:72, 135; sqlite.rs:315), and three doc comments have to explain the `None`. An enum such as `Planned::Write(Written) | Remove` would say it in the type.
+- **Mysterious Name:**
+  - `blocking()` (sqlite.rs:201) collides with the spec's `blocking` feature and `blocking::Store`. Something like `off_runtime` would avoid that.
+  - `Held` (memory.rs:31) and `Current` (sqlite.rs:343) don't say what they hold. `AreaInMemory` and `AreaInDatabase` are possible names.
+- **Mysterious Name / misused type:** `unexpected()` (sqlite.rs:272-273) wraps a non-SQLite failure in `rusqlite::Error::ToSqlConversionFailure`, which misdescribes it. It would be more honest for `open_database` to return `crate::Result` and use `Error::backend` directly.
+- **Data Clumps (mild):** `paths_named_like(name, fold)` (mod.rs:374) takes a `fold` that is always `letter_case_fold(name)`, so every caller has to keep the two consistent by hand.
+- **Not Speculative Generality:** the one-step `MIGRATIONS`, the `#[non_exhaustive] SqliteOptions` and `app.rs` are all needed by tickets 08 and 09.
+
+### Spec
+
+`cargo test` passes: 88 behaviour tests across memory and SQLite, plus `--no-default-features`.
+
+**(a) Missing or partial**
+
+1. **A cancelled SQLite Commit is applied but never reaches the feed.** This breaks two spec lines:
+   - ticket 05 (ticked): "Every Commit made after `open` returns produces a Change"
+   - ticket 07: "Everything the memory Backend does, the SQLite Backend does too."
+
+   A scratch probe confirmed it. `commit` was wrapped in a 50 µs timeout and run 300 times: all 300 Commits were applied, and none reached the feed.
+   - **Cause:** `src/store.rs:156-160` drops `_in_order` and never calls `record`, while `spawn_blocking` (`src/backend/sqlite.rs:150-163, 181-184`) runs on and commits.
+   - Story 39's "finish or not happen at all" still holds, because the SQLite transaction is atomic. Only the feed promise is broken.
+   - **Is ticket 10 the right owner? Only partly.**
+     - For: ticket 05's notes do hand the background-Commit mechanism to ticket 10, and its checklist item is worded for any Backend.
+     - Against: ticket 10's "What to build" is about the filesystem ("A filesystem Commit is all-or-nothing…"), and it is blocked by 09, so SQLite would ship breaking a ticked guarantee for two more tickets.
+     - The spec puts the fix in the Store layer ("Letting a cancelled Commit finish: once started, a Commit continues in a background task"), independent of the Backend. The fix is small: make `commit_order` an `Arc<Mutex<()>>` locked with `lock_owned`, and `tokio::spawn` a task that holds `Arc<Inner>` and the guard and records the Changes. `sqlite` already enables `tokio/rt`.
+   - **Recommendation:** close it now, with a shared-suite test (Testing Decisions lists "Cancelling a Commit"). Leave ticket 10 only the filesystem pause-point test. The README Status note (`README.md:7-11`) is honest, but it documents a workaround.
+
+**(b) Scope creep**
+
+- The memory fold index and the rewrites of `refuse_clashing_paths` and `expand_prefix_deletes` (`src/staging.rs:226-316`, `src/backend/memory.rs`) come from the ticket 05 review finding. The shared check needs them to run inside SQLite's transaction without scanning the whole Area, and the ticket's Notes cover them. Not a finding.
+
+**(c) Implemented but possibly wrong**
+
+- **Q2, are the checks exact? No problem found.** The spec says "The checks happen inside the write transaction, so they are exact."
+  - `sqlite.rs:152-160` opens the transaction with `TransactionBehavior::Immediate` (`BEGIN IMMEDIATE`). `plan` then reads everything it needs through `Current(&transaction)`: the Preconditions, Prefix Revisions from the stored Revisions, the no-op filter, and the clash lookup through `paths_named_like` (`sqlite.rs:414-426`). `apply` writes through the same transaction, and then it commits.
+  - The connection's mutex is held for the whole closure, and an `Err` from `plan` drops the transaction, which rolls it back. There is no window between the checks and the write.
+- **Q3, are Snapshots pinned? No problem found.** The spec says "A Snapshot is a read transaction on a separate connection."
+  - `sqlite.rs:131-145` runs `BEGIN` and then a read on a new read-only connection before `snapshot()` returns, which pins the view at the moment of the call.
+  - `SqliteSnapshot` holds only its `Arc<Mutex<Connection>>`, not `Inner`. The probe confirmed that the feed ended while a Snapshot was still held, and that the Snapshot kept returning the old contents after the Store was dropped. `a_snapshot_outlives_the_store_without_keeping_the_feed_open` (`tests/behaviour/suite.rs:1276`) covers this.
+
+The other checklist items were verified:
+- `etcetera` directories, with the Root override documented (`src/app.rs`)
+- `bundled`, WAL and `spawn_blocking`
+- folds redone when the recorded Unicode versions differ (`sqlite.rs:218-231`)
+- `supports_snapshots()` returns true
+- the `sqlite` feature gate (`Cargo.toml:15`)
+
+### Summary
+
+Standards: 1 hard violation, a justified but only partly recorded one: a unit test edits the database, against the spec's testing rule. There are also 6 judgement calls, the most notable being the Prefix-range trick copied four times. Spec: 1 missing item, and it is serious. A cancelled Commit is applied on SQLite but its Changes never reach the feed, which breaks ticket 05's ticked guarantee. The reviewer recommends fixing it in the Store layer now, not in ticket 10.
+
+
+
+### Resolution
+
+1. **Spec (a)1, a cancelled Commit never reached the feed:** fixed in the Store layer, for every
+   Backend.
+   - `commit_order` is now an `Arc<Mutex<()>>`. `Store::commit` waits for its turn with
+     `lock_owned`. From then on the Commit is an async block that owns the guard and an
+     `Arc<Inner>`, commits, and records its Changes.
+   - It runs inside a small `Started` future. While the app waits, `Started` polls it in place.
+     If `Started` is dropped before it finishes, it spawns the rest onto the runtime's `Handle`.
+     So a Commit dropped while waiting its turn never happens, and one dropped after it started
+     always finishes and is reported.
+   - The suggested shape spawned a task for every Commit. I tried it first, and it made ticket
+     05's probe on memory 14 times slower (0.26 s to 3.7 s in release). Spawning only for a
+     Commit that is actually dropped keeps the cost where it was.
+   - tokio's `rt` feature is now always on, including memory-only `--no-default-features`,
+     because `Handle` needs it on every Backend. Memory's Commit finishes in a single poll, so on
+     memory the task is never needed, but one code path is simpler.
+   - `commit` documents that a dropped Commit either never happens or finishes, and that it panics
+     outside a tokio runtime.
+   - The new suite test `a_cancelled_commit_finishes_or_never_happens_and_is_reported_if_it_finishes`
+     polls each of 100 Commits once and then drops it. It checks that the Changes reported are
+     exactly the Files written. On SQLite it failed before the fix, with Files written and nothing
+     reported. It fails again if `Started` drops the rest of the Commit instead of spawning it.
+   - The README Status workaround is gone. Consistency now says what cancelling does. Ticket 10's
+     checkbox asks only for the filesystem test with the pause point, and ticket 07's Notes record
+     the change.
+2. **Standards (hard), the unit test that edits the database:** kept, and recorded in the spec.
+   Its Testing Decisions now name it as a third, narrow exception. A `testing` hook that only
+   overrides the recorded versions couldn't show that the folds were really made again. That
+   would take a hook that corrupts folds, which is a stranger public surface than one internal
+   test. The test now uses `FOLD_UNICODE_VERSIONS`.
+3. **The "`x/` up to `x0`" range:** fixed. `path::range_under(name)` gives the range, with the
+   explanation in one place. Memory's fold lookup and SQLite's Prefix listing, fold lookup and
+   name exclusion all bind or use it. The SQL no longer builds the range with `|| '/'`.
+4. **`Option<Written>`:** fixed. It is now `Planned::Write { contents, stat } | Planned::Remove`,
+   and `Written` is gone.
+5. **Names:** fixed.
+   - `blocking()` is now `off_runtime()`.
+   - `Held` is now `AreaInMemory`, and `Current` is now `AreaInDatabase`.
+6. **`unexpected()`:** removed. `open_database` returns `crate::Result` and gives
+   `Error::backend(..)` for a journal mode that isn't WAL, or for a schema from a later version.
+   The pure-SQL part, `bring_up_to_date`, still returns `rusqlite::Result`.
+7. **`paths_named_like(name, fold)`:** left as it is. The caller already has the fold as the key
+   of its map of written names. Having the Backend fold again would double the folding.
+   A pairing type would mean cloning that key, and a doc comment already states the contract.
+8. **SQLite's duplicated read/stat/list:** fixed. An `AreaConnection` (a shared connection whose
+   calls run off the runtime) holds `read`, `stat`, `list` and `call`. Each Area's `Database` has
+   one, and `SqliteSnapshot` is now simply an `AreaConnection` in a read transaction. The
+   `JoinError` handling that `off_runtime` needs is one `error::joined` helper.
+
+Clippy (all targets, with default features, `--no-default-features` and `--all-features`) is
+clean. `cargo test` passes with each of them: 45 behaviour tests per Backend, 5 path tests,
+3 Store-layer tests, and the SQLite unit test where `sqlite` is on.

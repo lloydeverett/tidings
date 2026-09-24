@@ -12,23 +12,22 @@
 //! every Commit makes. Snapshots don't need it, so it isn't shared with them and is never copied.
 
 use std::collections::BTreeMap;
-use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 
-use super::{AreaState, CommitOutcome, CommitRequest, Written};
+use super::{AreaState, CommitOutcome, CommitRequest, Planned};
 use crate::area::PerArea;
-use crate::path::letter_case_fold;
+use crate::path::{letter_case_fold, range_under};
 use crate::staging::has_name;
 use crate::{Area, File, Path, Prefix, PrefixRevision, Result, Revision, Stat};
 
 #[derive(Debug, Default)]
 pub(crate) struct MemoryBackend {
-    areas: Mutex<PerArea<Held>>,
+    areas: Mutex<PerArea<AreaInMemory>>,
 }
 
 /// One Area as the Backend holds it.
 #[derive(Debug, Default)]
-struct Held {
+struct AreaInMemory {
     files: Arc<Files>,
     /// Each Path, by its [`letter_case_fold`]. No two Paths fold the same, since the check every
     /// Commit makes refuses that.
@@ -77,18 +76,18 @@ impl MemoryBackend {
     /// Works out what the Commit changes, then changes it, all under the one lock.
     pub(crate) fn commit(&self, request: CommitRequest) -> Result<CommitOutcome> {
         let mut areas = self.areas.lock().unwrap();
-        let held = areas.get_mut(request.staged.area);
-        let plan = request.plan(&*held)?;
-        let Held { files, folds } = held;
-        plan.apply(|path, written| {
-            match written {
-                Some(Written { contents, stat }) => {
+        let area = areas.get_mut(request.staged.area);
+        let plan = request.plan(&*area)?;
+        let AreaInMemory { files, folds } = area;
+        plan.apply(|path, planned| {
+            match planned {
+                Planned::Write { contents, stat } => {
                     let stored = Arc::new(Stored { contents, stat });
                     if Arc::make_mut(files).insert(path.clone(), stored).is_none() {
                         folds.insert(letter_case_fold(path.as_str()), path.clone());
                     }
                 }
-                None => {
+                Planned::Remove => {
                     Arc::make_mut(files).remove(path);
                     folds.remove(&letter_case_fold(path.as_str()));
                 }
@@ -125,7 +124,7 @@ fn list(files: &Files, prefix: &Prefix) -> Vec<Path> {
     files.keys().filter(|path| prefix.covers(path)).cloned().collect()
 }
 
-impl AreaState for Held {
+impl AreaState for AreaInMemory {
     fn revision(&self, path: &Path) -> Result<Option<Revision>> {
         Ok(self.files.get(path).map(|stored| stored.stat.revision()))
     }
@@ -140,10 +139,7 @@ impl AreaState for Held {
     }
 
     fn paths_named_like(&self, name: &str, fold: &str) -> Result<Vec<Path>> {
-        // Every fold that starts with `fold/` sorts from `fold/` up to `fold0`, since `0` comes
-        // right after `/`.
-        let under = (Bound::Included(format!("{fold}/")), Bound::Excluded(format!("{fold}0")));
-        let under = self.folds.range::<String, _>(under).map(|(_, path)| path);
+        let under = self.folds.range(range_under(fold)).map(|(_, path)| path);
         let folding = self.folds.get(fold).into_iter().chain(under);
         Ok(folding.filter(|path| !has_name(path, name)).cloned().collect())
     }

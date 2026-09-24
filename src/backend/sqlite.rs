@@ -17,10 +17,11 @@ use std::sync::{Arc, Mutex};
 use jiff::Timestamp;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
 
-use super::{AreaState, CommitOutcome, CommitRequest, Written};
+use super::{AreaState, CommitOutcome, CommitRequest, Planned};
 use crate::app::AppIdentity;
 use crate::area::PerArea;
-use crate::path::{letter_case_fold, letter_case_fold_unicode_versions};
+use crate::error::joined;
+use crate::path::{letter_case_fold, letter_case_fold_unicode_versions, range_under};
 use crate::{Area, Error, File, Path, Prefix, PrefixRevision, Result, Revision, Stat};
 
 /// How to open a Store on SQLite, with [`Store::open_sqlite`](crate::Store::open_sqlite).
@@ -69,34 +70,36 @@ const FOLD_UNICODE_VERSIONS: &str = "fold_unicode_versions";
 
 #[derive(Debug)]
 pub(crate) struct SqliteBackend {
-    areas: PerArea<Arc<Database>>,
+    areas: PerArea<Database>,
 }
 
 /// One Area's database, and the connection the Store reads and commits through.
 #[derive(Debug)]
 struct Database {
     path: PathBuf,
-    connection: Mutex<Connection>,
+    connection: AreaConnection,
 }
 
-/// A read transaction on a connection of its own. Dropping it closes the connection, which ends
-/// the transaction.
+/// A connection to one Area's database, for async code. Each call has the connection to itself,
+/// on one of tokio's blocking threads.
 #[derive(Debug)]
-pub(crate) struct SqliteSnapshot {
-    connection: Arc<Mutex<Connection>>,
-}
+pub(crate) struct AreaConnection(Arc<Mutex<Connection>>);
+
+/// A Snapshot is a connection of its own, in a read transaction. Dropping it closes the
+/// connection, which ends the transaction.
+pub(crate) type SqliteSnapshot = AreaConnection;
 
 impl SqliteBackend {
     /// Opens each Area's database, creating it and its directory if they don't exist.
     pub(crate) async fn open(app: &AppIdentity, options: SqliteOptions) -> Result<SqliteBackend> {
         let directories = app.area_directories(options.root_override.as_deref())?;
-        let areas = blocking(move || {
+        let areas = off_runtime(move || {
             PerArea::try_from_fn(|area| {
                 let directory = directories.get(area);
                 std::fs::create_dir_all(directory).map_err(Error::backend)?;
                 let path = directory.join(format!("{}.sqlite3", area.name()));
-                let connection = open_database(&path).map_err(Error::backend)?;
-                Ok(Arc::new(Database { path, connection: Mutex::new(connection) }))
+                let connection = AreaConnection::new(open_database(&path)?);
+                Ok(Database { path, connection })
             })
         })
         .await?;
@@ -104,33 +107,32 @@ impl SqliteBackend {
     }
 
     pub(crate) async fn read(&self, area: Area, path: &Path) -> Result<Option<File>> {
-        let path = path.clone();
-        self.with_connection(area, move |connection| read(connection, &path)).await
+        self.areas.get(area).connection.read(path).await
     }
 
     pub(crate) async fn stat(&self, area: Area, path: &Path) -> Result<Option<Stat>> {
-        let path = path.clone();
-        self.with_connection(area, move |connection| stat(connection, &path)).await
+        self.areas.get(area).connection.stat(path).await
     }
 
     pub(crate) async fn list(&self, area: Area, prefix: &Prefix) -> Result<Vec<Path>> {
-        let prefix = prefix.clone();
-        self.with_connection(area, move |connection| Current(connection).paths_under(&prefix)).await
+        self.areas.get(area).connection.list(prefix).await
     }
 
     pub(crate) async fn stat_prefix(&self, area: Area, prefix: &Prefix) -> Result<PrefixRevision> {
         let prefix = prefix.clone();
-        self.with_connection(area, move |connection| {
-            let files = Current(connection).revisions_under(&prefix)?;
-            Ok(PrefixRevision::of(area, prefix, files))
-        })
-        .await
+        let connection = &self.areas.get(area).connection;
+        connection
+            .call(move |connection| {
+                let files = AreaInDatabase(connection).revisions_under(&prefix)?;
+                Ok(PrefixRevision::of(area, prefix, files))
+            })
+            .await
     }
 
     /// Begins a read transaction on a new connection to the Area's database.
     pub(crate) async fn snapshot(&self, area: Area) -> Result<SqliteSnapshot> {
         let path = self.areas.get(area).path.clone();
-        blocking(move || {
+        off_runtime(move || {
             let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
             let connection = Connection::open_with_flags(&path, flags).map_err(Error::backend)?;
             // A plain `BEGIN` fixes what the transaction sees only at its first read, so this
@@ -139,116 +141,117 @@ impl SqliteBackend {
                 connection.query_row("SELECT EXISTS (SELECT 1 FROM files)", [], |_| Ok(()))
             });
             begin.map_err(Error::backend)?;
-            Ok(SqliteSnapshot { connection: Arc::new(Mutex::new(connection)) })
+            Ok(AreaConnection::new(connection))
         })
         .await
     }
 
     /// Works out what the Commit changes, then changes it, in one write transaction.
     pub(crate) async fn commit(&self, request: CommitRequest) -> Result<CommitOutcome> {
-        self.with_connection(request.staged.area, move |connection| {
-            let transaction = connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(Error::backend)?;
-            let plan = request.plan(&Current(&transaction))?;
-            let outcome = plan.apply(|path, written| {
-                apply(&transaction, path, written).map_err(Error::backend)
-            })?;
-            transaction.commit().map_err(Error::backend)?;
-            Ok(outcome)
-        })
-        .await
-    }
-
-    /// Runs `call` with the connection to `area`'s database, on a blocking thread.
-    async fn with_connection<T: Send + 'static>(
-        &self,
-        area: Area,
-        call: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
-    ) -> Result<T> {
-        let database = Arc::clone(self.areas.get(area));
-        blocking(move || call(&mut database.connection.lock().unwrap())).await
+        let connection = &self.areas.get(request.staged.area).connection;
+        connection
+            .call(move |connection| {
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(Error::backend)?;
+                let plan = request.plan(&AreaInDatabase(&transaction))?;
+                let outcome = plan.apply(|path, planned| {
+                    apply(&transaction, path, planned).map_err(Error::backend)
+                })?;
+                transaction.commit().map_err(Error::backend)?;
+                Ok(outcome)
+            })
+            .await
     }
 }
 
-impl SqliteSnapshot {
+impl AreaConnection {
+    fn new(connection: Connection) -> AreaConnection {
+        AreaConnection(Arc::new(Mutex::new(connection)))
+    }
+
     pub(crate) async fn read(&self, path: &Path) -> Result<Option<File>> {
         let path = path.clone();
-        self.with_connection(move |connection| read(connection, &path)).await
+        self.call(move |connection| read(connection, &path)).await
     }
 
     pub(crate) async fn stat(&self, path: &Path) -> Result<Option<Stat>> {
         let path = path.clone();
-        self.with_connection(move |connection| stat(connection, &path)).await
+        self.call(move |connection| stat(connection, &path)).await
     }
 
     pub(crate) async fn list(&self, prefix: &Prefix) -> Result<Vec<Path>> {
         let prefix = prefix.clone();
-        self.with_connection(move |connection| Current(connection).paths_under(&prefix)).await
+        self.call(move |connection| AreaInDatabase(connection).paths_under(&prefix)).await
     }
 
-    /// Runs `call` with the Snapshot's connection, on a blocking thread.
-    async fn with_connection<T: Send + 'static>(
+    /// Runs `call` with the connection, on a blocking thread.
+    async fn call<T: Send + 'static>(
         &self,
-        call: impl FnOnce(&Connection) -> Result<T> + Send + 'static,
+        call: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        let connection = Arc::clone(&self.connection);
-        blocking(move || call(&connection.lock().unwrap())).await
+        let connection = Arc::clone(&self.0);
+        off_runtime(move || call(&mut connection.lock().unwrap())).await
     }
 }
 
 /// Runs `call` on one of tokio's blocking threads, so that it doesn't hold up the async runtime.
-async fn blocking<T: Send + 'static>(
+async fn off_runtime<T: Send + 'static>(
     call: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    match tokio::task::spawn_blocking(call).await {
-        Ok(result) => result,
-        Err(error) => match error.try_into_panic() {
-            Ok(panic) => std::panic::resume_unwind(panic),
-            // The runtime is shutting down.
-            Err(error) => Err(Error::backend(error)),
-        },
-    }
+    joined(tokio::task::spawn_blocking(call).await)
 }
 
 /// Opens the database at `path`, creating it if it doesn't exist, in WAL mode, with its schema
 /// brought up to date. If the folds in it were made with other Unicode data than
 /// [`letter_case_fold`] uses now, it makes them again.
-fn open_database(path: &std::path::Path) -> rusqlite::Result<Connection> {
-    let mut connection = Connection::open(path)?;
-    let mode: String = connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+fn open_database(path: &std::path::Path) -> Result<Connection> {
+    let mut connection = Connection::open(path).map_err(Error::backend)?;
+    let mode: String = connection
+        .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+        .map_err(Error::backend)?;
     if !mode.eq_ignore_ascii_case("wal") {
-        return Err(unexpected(format!("SQLite would not use WAL mode, only {mode:?}")));
+        return Err(Error::backend(format!("SQLite would not use WAL mode, only {mode:?}")));
     }
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let version: u32 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    let version = version as usize;
-    if version > MIGRATIONS.len() {
-        return Err(unexpected(format!(
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(Error::backend)?;
+    let version: u32 = transaction
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(Error::backend)?;
+    if version as usize > MIGRATIONS.len() {
+        return Err(Error::backend(format!(
             "the database's schema is version {version}, from a later version of tidings",
         )));
     }
+    bring_up_to_date(&transaction, version as usize).map_err(Error::backend)?;
+    transaction.commit().map_err(Error::backend)?;
+    Ok(connection)
+}
+
+/// Brings a database with the schema `version` up to date, and makes its folds again if they were
+/// made with other Unicode data.
+fn bring_up_to_date(connection: &Connection, version: usize) -> rusqlite::Result<()> {
     for migration in &MIGRATIONS[version..] {
-        transaction.execute_batch(migration)?;
+        connection.execute_batch(migration)?;
     }
-    transaction.pragma_update(None, "user_version", MIGRATIONS.len() as u32)?;
+    connection.pragma_update(None, "user_version", MIGRATIONS.len() as u32)?;
 
     let versions = letter_case_fold_unicode_versions();
-    let stored: Option<String> = transaction
+    let stored: Option<String> = connection
         .query_row("SELECT value FROM meta WHERE name = ?1", [FOLD_UNICODE_VERSIONS], |row| {
             row.get(0)
         })
         .optional()?;
     if stored.as_ref() != Some(&versions) {
-        fold_again(&transaction)?;
-        transaction.execute(
+        fold_again(connection)?;
+        connection.execute(
             "INSERT INTO meta (name, value) VALUES (?1, ?2)
              ON CONFLICT (name) DO UPDATE SET value = excluded.value",
             params![FOLD_UNICODE_VERSIONS, versions],
         )?;
     }
-    transaction.commit()?;
-    Ok(connection)
+    Ok(())
 }
 
 /// Makes the fold of every Path again, after the Unicode data behind it changed. If two Paths now
@@ -266,11 +269,6 @@ fn fold_again(connection: &Connection) -> rusqlite::Result<()> {
         }
     }
     Ok(())
-}
-
-/// An error for something wrong that SQLite itself didn't report.
-fn unexpected(message: String) -> rusqlite::Error {
-    rusqlite::Error::ToSqlConversionFailure(message.into())
 }
 
 fn read(connection: &Connection, path: &Path) -> Result<Option<File>> {
@@ -311,9 +309,9 @@ fn stat_at(row: &Row, first: usize) -> rusqlite::Result<Stat> {
     Ok(Stat::new(modified, Revision::from_bytes(row.get(first + 2)?)))
 }
 
-/// Writes `written` to `path`, or removes the File there if it is `None`.
-fn apply(connection: &Connection, path: &Path, written: Option<Written>) -> rusqlite::Result<()> {
-    let Some(Written { contents, stat }) = written else {
+/// Does what is `planned` to the File at `path`.
+fn apply(connection: &Connection, path: &Path, planned: Planned) -> rusqlite::Result<()> {
+    let Planned::Write { contents, stat } = planned else {
         let mut delete = connection.prepare_cached("DELETE FROM files WHERE path = ?1")?;
         delete.execute([path.as_str()])?;
         return Ok(());
@@ -340,9 +338,9 @@ fn apply(connection: &Connection, path: &Path, written: Option<Written>) -> rusq
 }
 
 /// An Area's database as a connection sees it, inside a transaction or not.
-struct Current<'a>(&'a Connection);
+struct AreaInDatabase<'a>(&'a Connection);
 
-impl Current<'_> {
+impl AreaInDatabase<'_> {
     /// Gives what `each` makes of every row of `sql`, which takes the parameters `params`.
     fn rows<T>(
         &self,
@@ -370,22 +368,20 @@ impl Current<'_> {
         columns: &str,
         each: impl FnMut(&Row) -> rusqlite::Result<T>,
     ) -> Result<Vec<T>> {
-        // Every Path under `themes/` sorts from `themes/` up to `themes0`, since `0` comes right
-        // after `/`. SQLite compares text as bytes, which for UTF-8 is the order of Paths.
         match prefix.as_str().strip_suffix('/') {
             None => self.rows(&format!("SELECT {columns} FROM files ORDER BY path"), [], each),
-            Some(without_slash) => self.rows(
-                &format!(
+            Some(without_slash) => {
+                let under = range_under(without_slash);
+                let sql = format!(
                     "SELECT {columns} FROM files WHERE path >= ?1 AND path < ?2 ORDER BY path"
-                ),
-                [prefix.as_str(), &format!("{without_slash}0")],
-                each,
-            ),
+                );
+                self.rows(&sql, [&under.start, &under.end], each)
+            }
         }
     }
 }
 
-impl AreaState for Current<'_> {
+impl AreaState for AreaInDatabase<'_> {
     fn revision(&self, path: &Path) -> Result<Option<Revision>> {
         let mut statement = self
             .0
@@ -406,14 +402,18 @@ impl AreaState for Current<'_> {
     }
 
     fn paths_named_like(&self, name: &str, fold: &str) -> Result<Vec<Path>> {
-        // The Paths with the name `name` are `name` itself, or, for a Prefix, those from `name`
-        // up to `name` with a `0` in place of its `/`. For a File, that range is empty.
-        let end = name.strip_suffix('/').map_or(name.to_owned(), |name| format!("{name}0"));
+        let folds_under = range_under(fold);
+        // The Paths with the name `name`: `name` itself, and the Paths under it if it is a
+        // Prefix. For a File's name, the range is empty.
+        let under_name = match name.strip_suffix('/') {
+            Some(without_slash) => range_under(without_slash),
+            None => name.to_owned()..name.to_owned(),
+        };
         self.rows(
             "SELECT path FROM files
-             WHERE (fold = ?1 OR (fold >= ?1 || '/' AND fold < ?1 || '0'))
-             AND NOT (path = ?2 OR (path >= ?2 AND path < ?3))",
-            [fold, name, &end],
+             WHERE (fold = ?1 OR (fold >= ?2 AND fold < ?3))
+             AND NOT (path = ?4 OR (path >= ?5 AND path < ?6))",
+            [fold, &folds_under.start, &folds_under.end, name, &under_name.start, &under_name.end],
             |row| Ok(Path::stored(row.get(0)?)),
         )
     }
@@ -423,6 +423,7 @@ impl AreaState for Current<'_> {
 mod tests {
     use rusqlite::Connection;
 
+    use super::FOLD_UNICODE_VERSIONS;
     use crate::{AppIdentity, Area, Error, InvalidPathReason, SqliteOptions, Staging, Store};
 
     /// New Unicode data can change how Paths fold, which leaves the folds made with the old data
@@ -431,7 +432,7 @@ mod tests {
     /// makes the folds again, so the letter-case check still refuses a clash with a stored Path.
     ///
     /// This is the one test that touches a database directly, because the public API can't
-    /// make a fold stale.
+    /// make a fold stale. The spec's Testing Decisions allow it as their third exception.
     #[tokio::test]
     async fn opening_folds_again_what_was_folded_with_other_unicode_data() {
         let root = tempfile::tempdir().unwrap();
@@ -447,12 +448,9 @@ mod tests {
         drop(store);
 
         let database = Connection::open(root.path().join("config/config.sqlite3")).unwrap();
-        database
-            .execute_batch(
-                "UPDATE files SET fold = 'stale';
-                 UPDATE meta SET value = 'other' WHERE name = 'fold_unicode_versions';",
-            )
-            .unwrap();
+        database.execute("UPDATE files SET fold = 'stale'", []).unwrap();
+        let versions = "UPDATE meta SET value = 'other' WHERE name = ?1";
+        database.execute(versions, [FOLD_UNICODE_VERSIONS]).unwrap();
         drop(database);
 
         let (store, _feed) = open().await;

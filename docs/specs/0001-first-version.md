@@ -395,7 +395,9 @@ otherwise.
   observe: what a read returns, what a Commit does, what arrives on the Change feed. It never
   looks at journal files, tables or internal state. There are two exceptions, both only with the
   `testing` feature: starting a failure point, and injecting an external Change into the Store
-  layer (see "memory" below).
+  layer (see "memory" below). A third is narrower still: one unit test inside the SQLite Backend
+  makes the stored letter-case folds stale, as new Unicode data would, and then checks through
+  the public API that opening the Store folds them again. No public API can make a fold stale.
 - **Main seam: the public Store API, run on every Backend.** One behaviour suite, written once, is
   instantiated for the filesystem, SQLite and memory Backends and for the blocking Store. This is
   the same approach as OpenDAL's behaviour tests, which run one suite against every service.

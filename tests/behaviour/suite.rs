@@ -1,6 +1,8 @@
 //! The tests themselves. Each is an `async fn` taking the Backend's [`Fixture`], and is listed in
 //! [`behaviour_suite!`] so that every Backend runs it.
 
+use std::collections::BTreeSet;
+use std::task::Poll;
 use std::time::Duration;
 
 use jiff::Timestamp;
@@ -65,6 +67,7 @@ macro_rules! behaviour_suite {
             a_commit_made_before_the_feed_is_first_read_is_reported,
             a_commits_changes_are_never_split_across_batches,
             concurrent_commits_reach_the_feed_in_the_order_they_were_made,
+            a_cancelled_commit_finishes_or_never_happens_and_is_reported_if_it_finishes,
             a_snapshot_reads_the_area_as_it_was_when_taken,
             reads_through_a_snapshot_never_mix_commits,
             holding_a_snapshot_does_not_hold_up_commits,
@@ -1137,6 +1140,43 @@ pub async fn concurrent_commits_reach_the_feed_in_the_order_they_were_made(fixtu
         assert_eq!(changes(&batch), [("raced.txt", expected)], "in round {round}");
     }
     assert_nothing_more(&mut feed).await;
+}
+
+pub async fn a_cancelled_commit_finishes_or_never_happens_and_is_reported_if_it_finishes(
+    fixture: &impl Fixture,
+) {
+    let Opened { store, mut feed } = fixture.open().await;
+
+    // Each Commit's future is polled once, then dropped. A Commit that has started by then
+    // finishes anyway, so its File is written and its Change still arrives. One still waiting
+    // for the Commits before it never happens. Where a Backend's Commit finishes in one poll, as
+    // memory's does, none is left unfinished, and this only checks that each is reported.
+    for i in 0..100 {
+        let mut staging = Staging::new(Area::Data);
+        staging.write(format!("cancelled/{i}.txt"), "x").unwrap();
+        let mut commit = std::pin::pin!(store.commit(staging));
+        let polled = std::future::poll_fn(|cx| Poll::Ready(commit.as_mut().poll(cx))).await;
+        if let Poll::Ready(result) = polled {
+            result.unwrap();
+        }
+    }
+    // Commits are applied in turn, so once this one returns, every one that started has
+    // finished.
+    let mut staging = Staging::new(Area::Data);
+    staging.write("last.txt", "x").unwrap();
+    store.commit(staging).await.unwrap();
+
+    let mut reported = BTreeSet::new();
+    while !reported.contains("last.txt") {
+        for change in next_batch(&mut feed).await {
+            assert_eq!(change.kind, ChangeKind::Changed);
+            reported.insert(change.path.as_str().to_owned());
+        }
+    }
+    assert_nothing_more(&mut feed).await;
+    reported.remove("last.txt");
+    let written: BTreeSet<_> = list(&store, Area::Data, "cancelled/").await.into_iter().collect();
+    assert_eq!(reported, written, "every Commit that happened, and only those, is reported");
 }
 
 pub async fn a_snapshot_reads_the_area_as_it_was_when_taken(fixture: &impl Fixture) {

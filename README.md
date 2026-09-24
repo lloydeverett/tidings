@@ -6,15 +6,16 @@ change feed.
 
 Status: early. Stores in memory and on SQLite exist so far: reading, stat and listing, commits of
 writes and deletes with preconditions, checked paths, the change feed, and snapshots. Still to
-come: the filesystem backend, resyncs, the blocking API, seeing another process's commits to the
-same SQLite databases, and commits that finish after being cancelled. Until then, on SQLite, a
-commit whose future is dropped once it has started can be applied without being reported on the
-change feed. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
+come: the filesystem backend, resyncs, the blocking API, and seeing another process's commits to
+the same SQLite databases. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
 
 ## Consistency
 
 - A commit is all-or-nothing, and only happens when you call `commit`. A staging you drop is
   discarded.
+- A commit you cancel, by dropping its future (with a timeout, say), either never happens, if it
+  was still waiting for earlier commits, or finishes in the background and is reported on the
+  change feed as usual. `commit` must be called from within a tokio runtime.
 - Every file a commit writes gets the same last-modified time. A write that wouldn't change a
   file's contents is left out: the file keeps its time, and no change is reported.
 - Reads are one file at a time. Reading several files can mix states from different commits.

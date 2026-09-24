@@ -1,4 +1,5 @@
 use std::fmt;
+use std::ops::Range;
 
 use caseless::Caseless;
 use relative_path::{Component, RelativePath};
@@ -124,6 +125,14 @@ fn is_reserved(name: &str) -> bool {
 /// is `I` in upper case, but doesn't fold to `i`. Folding the upper case catches both.
 pub(crate) fn letter_case_fold(name: &str) -> String {
     name.to_uppercase().chars().nfd().default_case_fold().nfd().collect()
+}
+
+/// Every string that starts with `name` and a `/`, as a range: from `name/` up to `name0`, since
+/// `0` comes right after `/`. Strings compare as bytes, in Rust as in SQLite, which for UTF-8 is
+/// the order of characters. So the Paths under the Prefix `name/` are the Paths in this range, and
+/// the Paths under a Prefix that folds to `name` are those whose fold is in it.
+pub(crate) fn range_under(name: &str) -> Range<String> {
+    format!("{name}/")..format!("{name}0")
 }
 
 /// The versions of the Unicode data [`letter_case_fold`] follows: the standard library's for upper

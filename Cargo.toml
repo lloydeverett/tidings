@@ -12,7 +12,7 @@ default = ["fs", "sqlite"]
 # The filesystem Backend.
 fs = []
 # The SQLite Backend.
-sqlite = ["dep:etcetera", "dep:rusqlite", "tokio/rt"]
+sqlite = ["dep:etcetera", "dep:rusqlite"]
 # `blocking::Store`, for synchronous code.
 blocking = []
 # Failure points and helpers for tidings' own tests.
@@ -26,7 +26,7 @@ relative-path = "2.0.1"
 rusqlite = { version = "0.40.2", features = ["bundled"], optional = true }
 sanitize-filename = "0.6.0"
 thiserror = "2.0.21"
-tokio = { version = "1.53.1", features = ["sync"] }
+tokio = { version = "1.53.1", features = ["rt", "sync"] }
 unicode-normalization = "0.1.25"
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 

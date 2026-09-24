@@ -72,17 +72,19 @@ does, the SQLite Backend does too, and the whole shared suite passes on it, incl
   them allowed, but no Commit can add a name that clashes with either. The unit test
   `opening_folds_again_what_was_folded_with_other_unicode_data` in src/backend/sqlite.rs is the one
   test that edits a database directly: it makes every fold stale and changes the recorded versions,
-  since the public API can't. It fails if opening doesn't fold again.
+  since the public API can't. It fails if opening doesn't fold again. After the review, the spec's
+  Testing Decisions name it as a third, narrow exception to "public API only".
 - **Schema.** `files (path TEXT PRIMARY KEY, fold, contents, modified_second, modified_nanosecond,
   revision BLOB)` with an index on `(fold, path)`, and `meta (name, value)`. An ordinary rowid
   table, since contents can be large. Migrations are a list of steps, applied by `PRAGMA
   user_version`; ticket 08 adds its change log as a new step at the end. A database from a later
   schema version is refused with `Backend`. `synchronous` is SQLite's default (`FULL`), so a Commit
   that returned survives a power cut, as the filesystem journal's does.
-- **Connections.** Each Area has one connection for the Store's reads and Commits, behind a mutex,
-  used on tokio's blocking threads through `spawn_blocking` (the `sqlite` feature turns on tokio's
-  `rt`). A Commit is a `BEGIN IMMEDIATE` transaction, so its checks and writes happen under SQLite's
-  write lock, which also keeps out other processes (ticket 08).
+- **Connections.** Each Area has one connection for the Store's reads and Commits, behind a mutex in
+  an `AreaConnection`, used on tokio's blocking threads through `spawn_blocking`. A Snapshot is an
+  `AreaConnection` of its own, so both read through the same code. A Commit is a `BEGIN IMMEDIATE`
+  transaction, so its checks and writes happen under SQLite's write lock, which also keeps out other
+  processes (ticket 08).
 - **Snapshots.** A Snapshot opens a read-only connection, begins a transaction and reads at once (a
   plain `BEGIN` is deferred). With the read removed,
   `a_snapshot_reads_the_area_as_it_was_when_taken` fails on SQLite. It holds only its connection,
@@ -95,9 +97,23 @@ does, the SQLite Backend does too, and the whole shared suite passes on it, incl
   also checks that the `open_sqlite` future is `Send`. Breaking the fold lookup's SQL fails
   `a_path_differing_only_in_letter_case_is_refused` and `a_file_cannot_be_under_another_file` on
   SQLite, and doing the same to memory's fails them on memory.
-- **For ticket 10: cancelling a SQLite Commit.** A SQLite Commit runs on a blocking thread, so if
-  its future is dropped once that has started, the Commit still happens but the Store layer never
-  records its Changes. Memory couldn't be cancelled mid-Commit, so this is new. Ticket 10's "a
-  Commit whose future is dropped once it has started runs to completion in the background. Its
-  Changes still arrive on the feed" fixes it in the Store layer for every Backend. Until then the
-  README's Status says so.
+- **Cancelled Commits (after the review).** A SQLite Commit runs on a blocking thread, so dropping
+  its future once that had started left the Commit applied but its Changes never recorded, breaking
+  ticket 05's "every Commit made after `open` returns produces a Change". The review asked for the
+  fix here, in the Store layer, rather than in ticket 10. `commit_order` is now an `Arc<Mutex<()>>`.
+  `Store::commit` waits for its turn with `lock_owned`; from then on the Commit is an async block
+  that owns the guard and an `Arc<Inner>`, and commits and records its Changes. It is wrapped in
+  `Started`, which polls it in place while the app waits and, if dropped unfinished, spawns the rest
+  onto the runtime's `Handle`. A Commit dropped while waiting its turn never happens; one dropped
+  after it started always finishes and is reported. A first version spawned a task for every Commit,
+  which made the ticket 05 probe on memory 14 times slower (0.26 s to 3.7 s in release), so a task
+  is spawned only for a Commit that is actually dropped. tokio's `rt` feature is now always on, not
+  only with `sqlite`, since `Handle` needs it on every Backend; memory's Commit finishes in one
+  poll, so there it never needs the task, but one path is simpler. `commit` panics outside a tokio
+  runtime, documented under `# Panics`. The new suite test
+  `a_cancelled_commit_finishes_or_never_happens_and_is_reported_if_it_finishes` polls each of 100
+  Commits once and drops it, then checks that the Changes reported are exactly the Files written. On
+  SQLite it failed before the fix (Files written, nothing reported), and fails again if `Started`
+  drops the rest instead of spawning it. On memory it only checks the reporting, since nothing is
+  left unfinished. Ticket 10's cancellation checkbox now asks only for the filesystem test with its
+  pause point.

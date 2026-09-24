@@ -67,19 +67,20 @@ pub(crate) struct CommitRequest {
 /// What a Commit changes, worked out by [`CommitRequest::plan`].
 #[derive(Debug)]
 pub(crate) struct Plan {
-    /// What to do to each Path the Commit changes, in order of Path: write it, or remove it
-    /// (`None`).
-    changes: Vec<(Path, Option<Written>)>,
+    /// What to do to each Path the Commit changes, in order of Path.
+    changes: Vec<(Path, Planned)>,
     /// The new Revision of each Path written, including writes left out because they would not
     /// have changed the contents.
     revisions: BTreeMap<Path, Revision>,
 }
 
-/// A File a Commit writes.
+/// What a Commit does to one Path.
 #[derive(Debug)]
-pub(crate) struct Written {
-    pub(crate) contents: String,
-    pub(crate) stat: Stat,
+pub(crate) enum Planned {
+    /// Writes the File with these contents and this Stat.
+    Write { contents: String, stat: Stat },
+    /// Removes the File.
+    Remove,
 }
 
 /// What a Commit did.
@@ -114,30 +115,32 @@ impl CommitRequest {
         let revisions = staged.leave_out_what_changes_nothing(current)?;
         staged.refuse_clashing_paths(current)?;
         let changes = staged.actions.into_iter().map(|(path, action)| {
-            let written = match action {
+            let planned = match action {
                 Action::Write(contents) => {
-                    let stat = Stat::new(timestamp, revisions[&path]);
-                    Some(Written { contents, stat })
+                    Planned::Write { contents, stat: Stat::new(timestamp, revisions[&path]) }
                 }
-                Action::Delete => None,
+                Action::Delete => Planned::Remove,
             };
-            (path, written)
+            (path, planned)
         });
         Ok(Plan { changes: changes.collect(), revisions })
     }
 }
 
 impl Plan {
-    /// Makes each change with `change`, which writes the File or removes it (`None`), in order of
-    /// Path. The Backend makes them all under its lock, all-or-nothing.
+    /// Makes each change with `change`, in order of Path. The Backend makes them all under its
+    /// lock, all-or-nothing.
     pub(crate) fn apply(
         self,
-        mut change: impl FnMut(&Path, Option<Written>) -> Result<()>,
+        mut change: impl FnMut(&Path, Planned) -> Result<()>,
     ) -> Result<CommitOutcome> {
         let mut changes = Vec::with_capacity(self.changes.len());
-        for (path, written) in self.changes {
-            let kind = if written.is_some() { ChangeKind::Changed } else { ChangeKind::Removed };
-            change(&path, written)?;
+        for (path, planned) in self.changes {
+            let kind = match planned {
+                Planned::Write { .. } => ChangeKind::Changed,
+                Planned::Remove => ChangeKind::Removed,
+            };
+            change(&path, planned)?;
             changes.push(RawChange { path, kind });
         }
         Ok(CommitOutcome { revisions: self.revisions, changes })
