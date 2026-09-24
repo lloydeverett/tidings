@@ -1,10 +1,7 @@
 //! Tests for Backends where a second Store can be opened on the same storage, standing in for
-//! another process: SQLite and the filesystem. Each test calls its Fixture's `open` twice, and
-//! both Stores share the Fixture's Root override. Each is listed in [`two_stores_suite!`].
-#![cfg_attr(
-    not(feature = "sqlite"),
-    expect(dead_code, reason = "so far, only SQLite tells a Store about another Store's Commits")
-)]
+//! another process: SQLite and the filesystem. Each test calls its Fixture's `open` more than
+//! once, and the Stores share the Fixture's Root override. Each is listed in
+//! [`two_stores_suite!`].
 
 use std::collections::BTreeMap;
 
@@ -14,8 +11,10 @@ use crate::common::{assert_nothing_more, changes_in_full, next_batch, next_item}
 use crate::suite::{Fixture, Opened};
 
 /// Instantiates every test here for one Backend's [`Fixture`]. `committing:` instantiates only
-/// the tests of Commits from both Stores, and `seeing_each_other:` only those of each Store
-/// telling its Change feed about the other's Commits, for a Backend that can't do that yet.
+/// the tests of Commits from both Stores, `seeing_each_other:` only those of each Store telling
+/// its Change feed about the other's Commits, and `in_step:` only those of a Store that reads
+/// other Stores' Commits from a log, each Commit's whole, and before its own next Commit. The
+/// filesystem, which sees them by watching, once their events have settled, runs the first two.
 macro_rules! two_stores_suite {
     (committing: $fixture:expr) => {
         two_stores_suite!(@tests $fixture;
@@ -26,13 +25,20 @@ macro_rules! two_stores_suite {
         two_stores_suite!(@tests $fixture;
             another_stores_commit_arrives_as_one_batch_of_external_changes,
             commits_made_before_a_store_is_opened_are_not_reported_to_it,
-            another_stores_commits_are_never_split_across_batches,
+            another_stores_commits_made_apart_each_arrive_in_one_batch,
             commits_from_both_stores_reach_each_feed_in_the_order_they_were_applied,
+        );
+    };
+    (in_step: $fixture:expr) => {
+        two_stores_suite!(@tests $fixture;
+            another_stores_commits_are_never_split_across_batches,
+            a_stores_commit_reaches_its_feed_after_the_other_stores_commits_before_it,
         );
     };
     ($fixture:expr) => {
         two_stores_suite!(committing: $fixture);
         two_stores_suite!(seeing_each_other: $fixture);
+        two_stores_suite!(in_step: $fixture);
     };
     (@tests $fixture:expr; $($test:ident),* $(,)?) => {
         $(
@@ -112,6 +118,31 @@ pub async fn commits_made_before_a_store_is_opened_are_not_reported_to_it(fixtur
     assert!(second.read(Area::Data, "before.txt").await.unwrap().is_some());
 }
 
+pub async fn another_stores_commits_made_apart_each_arrive_in_one_batch(fixture: &impl Fixture) {
+    let Opened { store: first, feed: _first_feed } = fixture.open().await;
+    let Opened { store: _second, feed: mut second_feed } = fixture.open().await;
+    // Many Files per Commit, in a directory of their own, so that a Commit's Changes that were
+    // gathered in parts would likely be read in parts.
+    const FILES: usize = 20;
+
+    for commit in 0..10 {
+        let mut staging = Staging::new(Area::Data);
+        for file in 0..FILES {
+            staging.write(format!("{commit}/{file}"), "x").unwrap();
+        }
+        first.commit(staging).await.unwrap();
+
+        let batch = next_batch(&mut second_feed).await;
+        assert_eq!(batch.len(), FILES, "Commit {commit} was split across batches");
+        for change in batch {
+            assert!(change.path.as_str().starts_with(&format!("{commit}/")), "{change:?}");
+            assert_eq!(change.origin, Origin::External);
+        }
+    }
+    assert_nothing_more(&mut second_feed).await;
+}
+
+#[cfg_attr(not(feature = "sqlite"), expect(dead_code, reason = "only SQLite runs `in_step:`"))]
 pub async fn another_stores_commits_are_never_split_across_batches(fixture: &impl Fixture) {
     let Opened { store: first, feed: _first_feed } = fixture.open().await;
     let Opened { store: _second, feed: mut second_feed } = fixture.open().await;
@@ -167,13 +198,40 @@ pub async fn another_stores_commits_are_never_split_across_batches(fixture: &imp
 pub async fn commits_from_both_stores_reach_each_feed_in_the_order_they_were_applied(
     fixture: &impl Fixture,
 ) {
+    race_then_mark(fixture, Marker::ByAThirdStore).await;
+}
+
+#[cfg_attr(not(feature = "sqlite"), expect(dead_code, reason = "only SQLite runs `in_step:`"))]
+pub async fn a_stores_commit_reaches_its_feed_after_the_other_stores_commits_before_it(
+    fixture: &impl Fixture,
+) {
+    race_then_mark(fixture, Marker::BySecondStore).await;
+}
+
+/// Which Store commits the marker in [`race_then_mark`].
+#[derive(PartialEq)]
+enum Marker {
+    /// The second of the racing Stores, so that it reaches the second's feed as a local Change
+    /// as soon as it is made, and must come after the first's Commits before it. A third Store's
+    /// feed is checked too.
+    BySecondStore,
+    /// A third, so that it reaches both racing Stores' feeds as an external Change.
+    ByAThirdStore,
+}
+
+/// In each round, tasks on two Stores race to write and delete one Path. However the Commits
+/// land, what each feed last said of the Path must be as the last of them left the File: changed
+/// if it is there, removed if it isn't. Once the round is over, `marked_by` commits a marker, which
+/// reaches each feed checked after every Commit of the round. A feed told of other Stores' Commits by
+/// watching may say nothing of the Path in a round that leaves it as it was, so what it said
+/// last may be from an earlier round.
+async fn race_then_mark(fixture: &impl Fixture, marked_by: Marker) {
     let Opened { store: first, feed: mut first_feed } = fixture.open().await;
     let Opened { store: second, feed: mut second_feed } = fixture.open().await;
+    let Opened { store: third, feed: mut third_feed } = fixture.open().await;
+    let marking = if marked_by == Marker::BySecondStore { &second } else { &third };
+    let mut said = [Some(ChangeKind::Removed); 3];
 
-    // In each round, tasks on both Stores race to write and delete one Path. However the Commits
-    // land, what each feed says of the Path must end as the last of them left the File: changed
-    // if it is there, removed if it isn't. Once the round is over, the second Store commits a
-    // marker, which reaches each feed after every Commit of the round.
     for round in 0..150 {
         let tasks: Vec<_> = (0..4)
             .map(|task| {
@@ -197,16 +255,17 @@ pub async fn commits_from_both_stores_reach_each_feed_in_the_order_they_were_app
         let marker = format!("round-{round}.txt");
         let mut staging = Staging::new(Area::Data);
         staging.write(marker.as_str(), "x").unwrap();
-        second.commit(staging).await.unwrap();
+        marking.commit(staging).await.unwrap();
 
         let there = first.read(Area::Data, "raced.txt").await.unwrap().is_some();
         let expected = if there { ChangeKind::Changed } else { ChangeKind::Removed };
-        for feed in [&mut first_feed, &mut second_feed] {
-            assert_eq!(
-                kind_until(feed, "raced.txt", &marker).await,
-                Some(expected),
-                "round {round}"
-            );
+        let mut feeds = vec![&mut first_feed, &mut second_feed];
+        if marked_by == Marker::BySecondStore {
+            feeds.push(&mut third_feed);
+        }
+        for (feed, said) in feeds.into_iter().zip(&mut said) {
+            *said = kind_until(feed, "raced.txt", &marker).await.or(*said);
+            assert_eq!(*said, Some(expected), "round {round}");
         }
     }
 }

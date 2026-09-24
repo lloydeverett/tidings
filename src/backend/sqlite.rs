@@ -533,10 +533,10 @@ fn read_log(
         let kind = if removed { ChangeKind::Removed } else { ChangeKind::Changed };
         let change = RawChange { path: Path::stored(path), kind };
         match observed.last_mut() {
-            Some(Observed::Commit { changes, .. }) if id == *seen => changes.push(change),
+            Some(Observed::Changes { changes, .. }) if id == *seen => changes.push(change),
             _ => {
                 let origin = if by == store { Origin::Local } else { Origin::External };
-                observed.push(Observed::Commit { origin, changes: vec![change] });
+                observed.push(Observed::Changes { origin, changes: vec![change] });
                 *seen = id;
             }
         }

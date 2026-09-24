@@ -46,8 +46,9 @@ pub enum Origin {
 /// One item on the Change feed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedItem {
-    /// Every Change recorded since the last item, merged per Area and Path. A Commit's Changes
-    /// always arrive in the same batch, and a batch may hold several Commits' Changes.
+    /// Every Change recorded since the last item, merged per Area and Path. The Changes of a
+    /// Commit through this Store always arrive in the same batch, and so do another Store's on
+    /// SQLite, and usually on the filesystem. A batch may hold several Commits' Changes.
     Changes(Vec<Change>),
     /// Changes to this Area may have been missed: read everything you rely on in it again.
     Resync(Area),
@@ -68,8 +69,9 @@ pub struct ChangeFeed {
 
 impl ChangeFeed {
     /// Waits for the next item: every Change recorded since the last one, merged per Area and
-    /// Path, in one batch. A Commit's Changes are never split across batches, but a batch may
-    /// hold several Commits' Changes.
+    /// Path, in one batch. The Changes of a Commit through this Store are never split across
+    /// batches, and neither are another Store's on SQLite (on the filesystem, see
+    /// [`Store::open_fs`](crate::Store::open_fs)). A batch may hold several Commits' Changes.
     ///
     /// Gives `None` once every handle to the Store has been dropped and everything recorded
     /// before has been read.
@@ -178,7 +180,7 @@ impl Unread {
         *self.areas.get_mut(area) = UnreadInArea::Resync;
     }
 
-    #[cfg(feature = "sqlite")]
+    #[cfg(any(feature = "fs", feature = "sqlite"))]
     fn resync_every_area(&mut self) {
         if self.store_dropped || self.feed_dropped {
             return;
@@ -250,7 +252,7 @@ impl FeedSender {
     }
 
     /// Records a Resync for every Area, as [`resync`](Self::resync) does for one.
-    #[cfg(feature = "sqlite")]
+    #[cfg(any(feature = "fs", feature = "sqlite"))]
     pub(crate) fn resync_every_area(&self) {
         self.shared.unread.lock().unwrap().resync_every_area();
         self.shared.recorded.notify_one();

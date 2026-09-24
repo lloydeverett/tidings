@@ -19,7 +19,7 @@ use crate::SqliteOptions;
 #[cfg(feature = "testing")]
 use crate::backend::RawChange;
 #[cfg(feature = "fs")]
-use crate::backend::fs::FsBackend;
+use crate::backend::fs::{FsBackend, FsWatcher};
 #[cfg(feature = "sqlite")]
 use crate::backend::sqlite::{SqliteBackend, SqlitePoller};
 use crate::backend::{Backend, CommitRequest, Observed, memory::MemoryBackend};
@@ -130,8 +130,12 @@ impl Store {
     /// together with its one Change feed.
     ///
     /// Other processes can open the same directories, and commit to them safely: Commits are
-    /// applied one at a time. Their Commits, and edits made to the Files by other programs, don't
-    /// arrive on the Change feed yet.
+    /// applied one at a time. The directories are watched, and their Commits, and what other
+    /// programs change there, arrive on the Change feed as external Changes once their events have
+    /// settled for the debounce window in `options`. Another Store's Commit usually arrives in one
+    /// batch, but can be split while events keep coming, and it can arrive after this Store's own
+    /// next Commit. If watching fails, or an Area's directory is removed (it is then made again),
+    /// the Area gets a Resync.
     ///
     /// The filesystem has no Snapshots: see [`supports_snapshots`](Self::supports_snapshots).
     ///
@@ -143,8 +147,11 @@ impl Store {
     /// If it isn't called from within a tokio runtime.
     #[cfg(feature = "fs")]
     pub async fn open_fs(app: &AppIdentity, options: FsOptions) -> Result<(Store, ChangeFeed)> {
-        let backend = FsBackend::open(app, options).await?;
-        Ok(Store::open(Backend::Fs(backend), |_, _| None))
+        let (backend, watcher) = FsBackend::open(app, options).await?;
+        Ok(Store::open(Backend::Fs(backend), |feed, commit_order| {
+            let watching = watch_areas(watcher, feed.clone(), Arc::clone(commit_order));
+            Some(supervise("watching the Areas' directories", watching, feed))
+        }))
     }
 
     /// Opens a Store that keeps each Area in a SQLite database of its own, in the Area's standard
@@ -168,7 +175,8 @@ impl Store {
     ) -> Result<(Store, ChangeFeed)> {
         let (backend, poller) = SqliteBackend::open(app, options).await?;
         Ok(Store::open(Backend::Sqlite(backend), |feed, commit_order| {
-            Some(start_following_other_stores(poller, feed, commit_order))
+            let following = follow_other_stores(poller, feed.clone(), Arc::clone(commit_order));
+            Some(supervise("following other Stores' Commits", following, feed))
         }))
     }
 
@@ -313,36 +321,56 @@ impl Store {
 fn record_observed(feed: &FeedSender, area: Area, observed: Vec<Observed>) {
     for observed in observed {
         match observed {
-            Observed::Commit { origin, changes } => feed.record(area, changes, origin),
+            Observed::Changes { origin, changes } => feed.record(area, changes, origin),
             Observed::Missed => feed.resync(area),
         }
     }
 }
 
-/// Starts the task that follows other Stores' Commits to the SQLite databases, and gives the handle
-/// that stops it.
+/// Starts `task`, which runs for as long as the Store is open, `doing` what it says, and gives the
+/// handle that stops it.
 ///
-/// If the task panics, their Changes stop arriving, so a second task, which waits for it, sends a
-/// Resync for every Area. When the Store stops the task, it sends nothing.
-#[cfg(feature = "sqlite")]
-fn start_following_other_stores(
-    poller: SqlitePoller,
+/// If the task panics or ends, the Changes it records stop arriving, so a second task, which waits
+/// for it, sends a Resync for every Area. When the Store stops the task, it sends nothing.
+#[cfg(any(feature = "fs", feature = "sqlite"))]
+fn supervise(
+    doing: &'static str,
+    task: impl Future<Output = ()> + Send + 'static,
     feed: &FeedSender,
-    commit_order: &Arc<Mutex<()>>,
 ) -> AbortHandle {
-    let following =
-        tokio::spawn(follow_other_stores(poller, feed.clone(), Arc::clone(commit_order)));
-    let stopping = following.abort_handle();
+    let running = tokio::spawn(task);
+    let stopping = running.abort_handle();
     let feed = feed.clone();
     tokio::spawn(async move {
-        if let Err(ended) = following.await
-            && ended.is_panic()
-        {
-            tracing::debug!("following other Stores' Commits panicked: {ended}");
-            feed.resync_every_area();
+        match running.await {
+            Err(ended) if ended.is_cancelled() => {}
+            Err(ended) => {
+                tracing::debug!("{doing} panicked: {ended}");
+                feed.resync_every_area();
+            }
+            Ok(()) => {
+                tracing::debug!("{doing} stopped");
+                feed.resync_every_area();
+            }
         }
     });
     stopping
+}
+
+/// Records what changed in the Areas' directories outside this Store as the watcher sees it,
+/// until the Store is dropped and stops it, or watching stops. It holds only the Store's end of
+/// the Change feed and its turn with Commits, not the Store, so that the feed still ends.
+///
+/// It looks at each burst of events in turn with Commits, so that each of the Store's own Commits
+/// is done and recorded, or not started: see the watcher's doc.
+#[cfg(feature = "fs")]
+async fn watch_areas(mut watcher: FsWatcher, feed: FeedSender, commit_order: Arc<Mutex<()>>) {
+    while let Some(burst) = watcher.next_burst().await {
+        let _turn = commit_order.lock().await;
+        for (area, observed) in watcher.observe(burst).await {
+            record_observed(&feed, area, vec![observed]);
+        }
+    }
 }
 
 /// Records other Stores' Commits to the SQLite databases as the poller notices them, until the

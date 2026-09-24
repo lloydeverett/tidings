@@ -137,15 +137,15 @@ mod sqlite {
 #[cfg(feature = "fs")]
 mod fs {
     use std::path::{Path as FsPath, PathBuf};
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
 
     use tempfile::TempDir;
     use tidings::{
-        AppIdentity, Area, ChangeKind, Error, FailurePoint, FsOptions, InvalidPathReason, Pause,
-        PrefixRevision, Revision, Staging, Store,
+        AppIdentity, Area, ChangeKind, Error, FailurePoint, FeedItem, FsOptions, InvalidPathReason,
+        Origin, Pause, PrefixRevision, Revision, Staging, Store,
     };
 
-    use crate::common::{assert_nothing_more, changes, next_batch};
+    use crate::common::{assert_nothing_more, changes, changes_in_full, next_batch, next_item};
     use crate::suite::{Fixture, Opened};
 
     /// Opens each test's Store under a temporary Root override of its own, removed when the test
@@ -163,7 +163,9 @@ mod fs {
         /// ones.
         async fn open_with(&self, options: impl FnOnce(FsOptions) -> FsOptions) -> Opened {
             let app = AppIdentity::new("tidings tests", "tidings", "org");
-            let usual = FsOptions::default().root_override(self.root.path());
+            let usual = FsOptions::default()
+                .root_override(self.root.path())
+                .debounce_window(Duration::from_millis(20));
             let (store, feed) = Store::open_fs(&app, options(usual)).await.unwrap();
             Opened { store, feed }
         }
@@ -193,7 +195,9 @@ mod fs {
     }
 
     behaviour_suite!(Fs::new());
+    // Not `in_step:`: see the README's Consistency section.
     two_stores_suite!(committing: Fs::new());
+    two_stores_suite!(seeing_each_other: Fs::new());
 
     /// The suite's Snapshot tests are skipped where Snapshots aren't supported, so this makes sure
     /// the filesystem is one of those, and that the suite's refusal test runs there.
@@ -201,6 +205,177 @@ mod fs {
     async fn fs_does_not_support_snapshots() {
         let Opened { store, feed: _feed } = Fs::new().open().await;
         assert!(!store.supports_snapshots());
+    }
+
+    /// A person editing, making or deleting a File in an Area's directory, while the app runs,
+    /// is reported as an external Change once the events have settled.
+    #[tokio::test]
+    async fn edits_made_directly_in_an_area_arrive_as_external_changes() {
+        let fixture = Fs::new();
+        let Opened { store: _store, mut feed } = fixture.open().await;
+
+        fixture.write_directly(Area::Config, "settings.toml", "a = 1\n");
+        assert_eq!(
+            changes_in_full(&next_batch(&mut feed).await),
+            [(Area::Config, "settings.toml", ChangeKind::Changed, Origin::External)],
+        );
+        fixture.write_directly(Area::Config, "settings.toml", "a = 2\n");
+        assert_eq!(
+            changes_in_full(&next_batch(&mut feed).await),
+            [(Area::Config, "settings.toml", ChangeKind::Changed, Origin::External)],
+        );
+        std::fs::remove_file(fixture.on_disk(Area::Config, "settings.toml")).unwrap();
+        assert_eq!(
+            changes_in_full(&next_batch(&mut feed).await),
+            [(Area::Config, "settings.toml", ChangeKind::Removed, Origin::External)],
+        );
+        assert_nothing_more(&mut feed).await;
+    }
+
+    /// An editor saves a File with a burst of events, and the File can be half written in
+    /// between. The burst is held back until it settles, and gives one Change, after which the
+    /// File reads whole.
+    #[tokio::test]
+    async fn an_editors_burst_of_events_gives_one_change_once_it_settles() {
+        let fixture = Fs::new();
+        let window = Duration::from_millis(300);
+        let Opened { store, mut feed } =
+            fixture.open_with(|options| options.debounce_window(window)).await;
+        fixture.write_directly(Area::Config, "settings.toml", "a = 1\n");
+        assert_eq!(changes(&next_batch(&mut feed).await), [("settings.toml", ChangeKind::Changed)]);
+
+        // As vim does by default: move the File to a backup, write it again in two goes, remove
+        // the backup.
+        let file = fixture.on_disk(Area::Config, "settings.toml");
+        let backup = fixture.on_disk(Area::Config, "settings.toml~");
+        std::fs::rename(&file, &backup).unwrap();
+        let mut writing = std::fs::File::create(&file).unwrap();
+        std::io::Write::write_all(&mut writing, b"a = ").unwrap();
+        std::io::Write::flush(&mut writing).unwrap();
+        std::io::Write::write_all(&mut writing, b"2\n").unwrap();
+        drop(writing);
+        std::fs::remove_file(&backup).unwrap();
+
+        assert_eq!(changes(&next_batch(&mut feed).await), [("settings.toml", ChangeKind::Changed)]);
+        let read = store.read(Area::Config, "settings.toml").await.unwrap().unwrap();
+        assert_eq!(read.contents(), "a = 2\n");
+        assert_nothing_more(&mut feed).await;
+    }
+
+    /// An event that leaves a File's contents as they were is no Change: a File read, its times
+    /// or permissions changed, or its contents written again as they were. Some of those events
+    /// look like writes, so they are told apart by comparing Revisions. Only a File that has
+    /// changed since the Store opened has a known Revision, so a File there before gets only the
+    /// events that can't be writes: see the README's Limitations.
+    #[tokio::test]
+    async fn events_that_leave_a_files_contents_as_they_were_are_dropped() {
+        let fixture = Fs::new();
+        fixture.write_directly(Area::Data, "before.txt", "there before");
+        let Opened { store: _store, mut feed } = fixture.open().await;
+        fixture.write_directly(Area::Data, "during.txt", "a");
+        assert_eq!(changes(&next_batch(&mut feed).await), [("during.txt", ChangeKind::Changed)]);
+
+        let set_readonly = |path: &str, readonly: bool| {
+            let file = fixture.on_disk(Area::Data, path);
+            let mut permissions = std::fs::metadata(&file).unwrap().permissions();
+            permissions.set_readonly(readonly);
+            std::fs::set_permissions(file, permissions).unwrap();
+        };
+        // As `touch` does, both times at once, which is no write.
+        let both = std::fs::FileTimes::new()
+            .set_accessed(SystemTime::UNIX_EPOCH)
+            .set_modified(SystemTime::UNIX_EPOCH);
+        for path in ["before.txt", "during.txt"] {
+            std::fs::read(fixture.on_disk(Area::Data, path)).unwrap();
+            let file = std::fs::File::open(fixture.on_disk(Area::Data, path)).unwrap();
+            file.set_times(both).unwrap();
+            set_readonly(path, true);
+            set_readonly(path, false);
+        }
+        // The modification time alone, which is also how a write shows, and the contents as
+        // they were.
+        let file = std::fs::File::open(fixture.on_disk(Area::Data, "during.txt")).unwrap();
+        file.set_modified(SystemTime::UNIX_EPOCH).unwrap();
+        fixture.write_directly(Area::Data, "during.txt", "a");
+        assert_nothing_more(&mut feed).await;
+    }
+
+    /// Names on disk that no Path has give no Change: tidings' own `.tidings/`, names like its
+    /// temporary files', and names another program made that aren't Paths.
+    #[tokio::test]
+    async fn events_for_names_that_are_not_paths_are_ignored() {
+        let fixture = Fs::new();
+        let Opened { store: _store, mut feed } = fixture.open().await;
+        fixture.write_directly(Area::Data, ".tidings/other.txt", "x");
+        fixture.write_directly(
+            Area::Data,
+            ".kept.txt.tidings-0123456789abcdef0123456789abcdef-0",
+            "x",
+        );
+        fixture.write_directly(Area::Data, "cafe\u{301}.txt", "x");
+        fixture.write_directly(Area::Data, "re\u{301}sume\u{301}/cv.txt", "x");
+        fixture.write_directly(Area::Data, "kept.txt", "x");
+
+        assert_eq!(changes(&next_batch(&mut feed).await), [("kept.txt", ChangeKind::Changed)]);
+        assert_nothing_more(&mut feed).await;
+    }
+
+    /// A directory moved into an Area with Files in it gives a Change for each of them, even
+    /// though they got there before the directory was watched. One removed gives a Change for
+    /// each File that was in it.
+    #[tokio::test]
+    async fn a_directory_moved_in_or_removed_gives_a_change_for_each_file_in_it() {
+        let fixture = Fs::new();
+        let Opened { store: _store, mut feed } = fixture.open().await;
+        let outside = fixture.root.path().join("outside");
+        std::fs::create_dir_all(outside.join("deeper")).unwrap();
+        std::fs::write(outside.join("a.toml"), "a").unwrap();
+        std::fs::write(outside.join("deeper/b.toml"), "b").unwrap();
+
+        std::fs::rename(&outside, fixture.on_disk(Area::Config, "themes")).unwrap();
+        let expected =
+            [("themes/a.toml", ChangeKind::Changed), ("themes/deeper/b.toml", ChangeKind::Changed)];
+        assert_eq!(changes(&next_batch(&mut feed).await), expected);
+
+        std::fs::remove_dir_all(fixture.on_disk(Area::Config, "themes")).unwrap();
+        let expected =
+            [("themes/a.toml", ChangeKind::Removed), ("themes/deeper/b.toml", ChangeKind::Removed)];
+        assert_eq!(changes(&next_batch(&mut feed).await), expected);
+        assert_nothing_more(&mut feed).await;
+    }
+
+    /// A File replaced by renaming another over it looks newly made to the watcher. Removed or
+    /// renamed away straight after, before its events have settled, it is still reported
+    /// removed.
+    #[tokio::test]
+    async fn a_file_replaced_then_removed_straight_away_is_reported_removed() {
+        let fixture = Fs::new();
+        let Opened { store: _store, mut feed } = fixture.open().await;
+        fixture.write_directly(Area::Data, "removed.txt", "old");
+        fixture.write_directly(Area::Data, "moved.txt", "old");
+        assert_eq!(
+            changes(&next_batch(&mut feed).await),
+            [("moved.txt", ChangeKind::Changed), ("removed.txt", ChangeKind::Changed)],
+        );
+        // Quiet for a while, as the Files usually are when someone replaces them.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        for path in ["removed.txt", "moved.txt"] {
+            let replacement = fixture.on_disk(Area::Data, "replacement~");
+            std::fs::write(&replacement, "new").unwrap();
+            std::fs::rename(&replacement, fixture.on_disk(Area::Data, path)).unwrap();
+        }
+        std::fs::remove_file(fixture.on_disk(Area::Data, "removed.txt")).unwrap();
+        std::fs::rename(
+            fixture.on_disk(Area::Data, "moved.txt"),
+            fixture.root.path().join("moved away.txt"),
+        )
+        .unwrap();
+        assert_eq!(
+            changes(&next_batch(&mut feed).await),
+            [("moved.txt", ChangeKind::Removed), ("removed.txt", ChangeKind::Removed)],
+        );
+        assert_nothing_more(&mut feed).await;
     }
 
     #[tokio::test]
@@ -339,6 +514,119 @@ mod fs {
         let file = store.read(Area::Config, "settings.toml").await.unwrap().unwrap();
         assert_eq!(file.contents(), "a = 2\n");
         assert_eq!(temporary_files(fixture.root.path()), Vec::<PathBuf>::new());
+    }
+
+    /// A symlinked File is watched through its link: an edit to the file it points to, outside
+    /// the Area or in it, arrives as a Change for the linking Path. Links made, changed and
+    /// removed while the Store runs are followed too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edits_to_a_symlinks_target_arrive_as_changes_for_the_linking_path() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fs::new();
+        let dotfiles = fixture.root.path().join("dotfiles");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        std::fs::write(dotfiles.join("settings.toml"), "a = 1\n").unwrap();
+        fixture.write_directly(Area::Config, "real.toml", "real");
+        symlink(dotfiles.join("settings.toml"), fixture.on_disk(Area::Config, "settings.toml"))
+            .unwrap();
+        symlink("real.toml", fixture.on_disk(Area::Config, "alias.toml")).unwrap();
+        let Opened { store: _store, mut feed } = fixture.open().await;
+
+        // Linked when the Store opened.
+        std::fs::write(dotfiles.join("settings.toml"), "a = 2\n").unwrap();
+        assert_eq!(
+            changes_in_full(&next_batch(&mut feed).await),
+            [(Area::Config, "settings.toml", ChangeKind::Changed, Origin::External)],
+        );
+        fixture.write_directly(Area::Config, "real.toml", "real, edited");
+        assert_eq!(
+            changes(&next_batch(&mut feed).await),
+            [("alias.toml", ChangeKind::Changed), ("real.toml", ChangeKind::Changed)],
+        );
+
+        // Replaced the way editors save, by renaming a new file over it.
+        std::fs::write(dotfiles.join("settings.toml.new"), "a = 3\n").unwrap();
+        std::fs::rename(dotfiles.join("settings.toml.new"), dotfiles.join("settings.toml"))
+            .unwrap();
+        assert_eq!(changes(&next_batch(&mut feed).await), [("settings.toml", ChangeKind::Changed)]);
+
+        // Linked while the Store runs, to a file in another directory outside the Area.
+        let elsewhere = fixture.root.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("theme.toml"), "dark").unwrap();
+        symlink(elsewhere.join("theme.toml"), fixture.on_disk(Area::Config, "theme.toml")).unwrap();
+        assert_eq!(changes(&next_batch(&mut feed).await), [("theme.toml", ChangeKind::Changed)]);
+        std::fs::write(elsewhere.join("theme.toml"), "light").unwrap();
+        assert_eq!(changes(&next_batch(&mut feed).await), [("theme.toml", ChangeKind::Changed)]);
+
+        // Unlinked: the target's edits are nothing to the Area any more.
+        std::fs::remove_file(fixture.on_disk(Area::Config, "theme.toml")).unwrap();
+        assert_eq!(changes(&next_batch(&mut feed).await), [("theme.toml", ChangeKind::Removed)]);
+        std::fs::write(elsewhere.join("theme.toml"), "blue").unwrap();
+        assert_nothing_more(&mut feed).await;
+    }
+
+    /// Clearing the Cache by removing its directory, while the app runs, is safe: the directory
+    /// is made again and watched again, and the Area gets a Resync, since its Files are gone.
+    #[tokio::test]
+    async fn an_area_directory_removed_while_running_is_made_again_with_a_resync() {
+        let fixture = Fs::new();
+        let Opened { store, mut feed } = fixture.open().await;
+        let mut staging = Staging::new(Area::Cache);
+        staging.write("thumbnails/a.png", "a").unwrap();
+        store.commit(staging).await.unwrap();
+        assert_eq!(
+            changes(&next_batch(&mut feed).await),
+            [("thumbnails/a.png", ChangeKind::Changed)]
+        );
+
+        std::fs::remove_dir_all(fixture.on_disk(Area::Cache, "")).unwrap();
+        assert_eq!(next_item(&mut feed).await, FeedItem::Resync(Area::Cache));
+        assert!(fixture.on_disk(Area::Cache, "").is_dir());
+        assert_nothing_more(&mut feed).await;
+
+        // Watched again.
+        fixture.write_directly(Area::Cache, "new.txt", "x");
+        assert_eq!(
+            changes_in_full(&next_batch(&mut feed).await),
+            [(Area::Cache, "new.txt", ChangeKind::Changed, Origin::External)],
+        );
+        let mut staging = Staging::new(Area::Cache);
+        staging.write("thumbnails/a.png", "a").unwrap();
+        store.commit(staging).await.unwrap();
+        assert_eq!(
+            changes_in_full(&next_batch(&mut feed).await),
+            [(Area::Cache, "thumbnails/a.png", ChangeKind::Changed, Origin::Local)],
+        );
+        assert_nothing_more(&mut feed).await;
+
+        // Renamed away, the same, and what happens to it where it went is no Change.
+        let moved = fixture.root.path().join("old cache");
+        std::fs::rename(fixture.on_disk(Area::Cache, ""), &moved).unwrap();
+        assert_eq!(next_item(&mut feed).await, FeedItem::Resync(Area::Cache));
+        assert!(fixture.on_disk(Area::Cache, "").is_dir());
+        std::fs::write(moved.join("new.txt"), "y").unwrap();
+        assert_nothing_more(&mut feed).await;
+        fixture.write_directly(Area::Cache, "new.txt", "z");
+        assert_eq!(changes(&next_batch(&mut feed).await), [("new.txt", ChangeKind::Changed)]);
+        assert_nothing_more(&mut feed).await;
+    }
+
+    /// If watching fails, the Areas it concerns get a Resync, since Changes to them may have been
+    /// missed, and watching goes on.
+    #[tokio::test]
+    async fn a_failure_to_watch_gives_a_resync() {
+        let fixture = Fs::new();
+        let Opened { store: _store, mut feed } =
+            fixture.open_with(|options| options.fail_at(FailurePoint::WatchingFails)).await;
+
+        fixture.write_directly(Area::Data, "missed.txt", "x");
+        assert_eq!(next_item(&mut feed).await, FeedItem::Resync(Area::Data));
+        assert_nothing_more(&mut feed).await;
+        fixture.write_directly(Area::Data, "seen.txt", "x");
+        assert_eq!(changes(&next_batch(&mut feed).await), [("seen.txt", ChangeKind::Changed)]);
+        assert_nothing_more(&mut feed).await;
     }
 
     /// Something on disk that isn't a File can have the name of a File a Commit writes, or of a
@@ -678,6 +966,46 @@ mod fs {
             assert_eq!(kept.contents(), "newer");
         }
         assert_eq!(temporary_files(fixture.root.path()), Vec::<PathBuf>::new());
+    }
+
+    /// A Commit that gave `Pending` is reported when it is made, as reads show it then, even
+    /// where none of its Files has changed on disk yet: here its first rename fails, so none is
+    /// renamed. When it is finished later, by another Store's Commit here, its Files land, and
+    /// nobody is told of them again: not the Store that made it, not a Store that was open
+    /// already and was told of it as external, and not one opened while it was still pending.
+    #[tokio::test]
+    async fn a_pending_commit_is_reported_once_and_not_again_when_it_is_finished() {
+        let fixture = Fs::new();
+        let Opened { store: other, feed: mut other_feed } = fixture.open().await;
+        let failing = FailurePoint::RenameFails { n: 0, times: usize::MAX };
+        let Opened { store, mut feed } =
+            fixture.open_with(|options| options.fail_at(failing)).await;
+        let pending = store.commit(staged(&[("a.txt", "a"), ("b.txt", "b")], &[])).await;
+        assert!(matches!(pending, Err(Error::Pending)), "{pending:?}");
+
+        let written = [("a.txt", ChangeKind::Changed), ("b.txt", ChangeKind::Changed)];
+        let batch = next_batch(&mut feed).await;
+        assert!(batch.iter().all(|change| change.origin == Origin::Local));
+        assert_eq!(changes(&batch), written);
+        let batch = next_batch(&mut other_feed).await;
+        assert!(batch.iter().all(|change| change.origin == Origin::External));
+        assert_eq!(changes(&batch), written);
+        // Its rename fails here too, so it stays pending.
+        let Opened { store: _later, feed: mut later_feed } =
+            fixture.open_with(|options| options.fail_at(failing)).await;
+
+        let mut staging = Staging::new(Area::Data);
+        staging.write("later.txt", "later").unwrap();
+        other.commit(staging).await.unwrap();
+        let later = [("later.txt", ChangeKind::Changed)];
+        assert_eq!(changes(&next_batch(&mut other_feed).await), later);
+        assert_eq!(changes(&next_batch(&mut feed).await), later);
+        assert_eq!(changes(&next_batch(&mut later_feed).await), later);
+        for feed in [&mut feed, &mut other_feed, &mut later_feed] {
+            assert_nothing_more(feed).await;
+        }
+        let written = [("a.txt", "a"), ("b.txt", "b"), ("later.txt", "later")];
+        assert_eq!(contents(&other).await, written.map(|(p, c)| (p.to_owned(), c.to_owned())));
     }
 
     /// A Commit whose future is dropped once it has started still finishes, in the background,

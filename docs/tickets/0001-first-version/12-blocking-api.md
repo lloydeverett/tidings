@@ -25,3 +25,11 @@ can wait for the Change feed on a plain thread.
       future is dropped once it has started finishes in a task on the runtime (ticket 07's
       review). If the runtime is gone by then, the Commit can be applied without its Changes
       being reported.
+
+**Notes from ticket 11:**
+
+- The filesystem watcher, like SQLite's poller, is a task on the Store's runtime that needs tokio's
+  timers and blocking threads, and runs between calls into the Store. So the internal runtime must
+  keep running while no blocking call is in progress: a multi-threaded runtime, or one driven by a
+  thread of its own, not a current-thread runtime driven only inside `block_on`. Otherwise edits
+  and other processes' Commits would reach the Change feed only while the app is inside a call.

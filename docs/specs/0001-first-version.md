@@ -244,10 +244,11 @@ SQLite database per Area, or in memory.
   - The Store layer handles everything that is the same for all Backends:
     - Validating Paths.
     - Choosing each Commit's timestamp (one `jiff::Timestamp` for the whole Commit).
-    - Holding back external events for the debounce window and merging them.
     - Merging Changes that haven't been read yet.
-    - Tagging each Change with its Origin, except where a Backend's change log already says it
-      (see below).
+    - Tagging the Changes of its own Commits with their Origin (see below).
+    - Running the task that records what a Backend observes of other Stores and programs (the
+      SQLite poller, the filesystem watcher), in turn with its own Commits, and sending a Resync
+      for every Area if that task panics or stops.
     - Letting a cancelled Commit finish: once started, a Commit continues in a background task.
 - **Staging**: an owned value for one Area, built independently of the Store. It holds:
   - writes: a Path, the new contents, and a Precondition that defaults to *any*;
@@ -290,7 +291,8 @@ SQLite database per Area, or in memory.
   - A Change is an Area, a Path, a kind (*changed* or *removed*) and an Origin.
   - Changes that haven't been read are merged per (Area, Path): the latest kind wins, and the
     Origin is external if any merged Change was external.
-  - A Commit's Changes are never split across batches.
+  - A Commit's Changes are never split across batches. (On the filesystem, another Store's
+    Commit sometimes can be: see Watching, below.)
   - If the feed is dropped, the Store stops recording Changes.
 - **Errors**: one `#[non_exhaustive]` error type with `InvalidPath`, `NotText { path }`,
   `Conflict { paths }`, `Pending`, `Unsupported` and `Backend` (wrapping the underlying error). A
@@ -317,14 +319,17 @@ Backends are private to the crate (not a public trait). Each Backend provides:
     Backend and runs under its lock;
   - applies the rest;
   - returns the Revisions;
-- a stream of the raw changes it observes, each with its Revision (or *removed*), plus signals that
-  watching failed or an Area root vanished.
+- what it observes of other Stores and programs: Changes, each group with its Origin, or that
+  Changes to an Area were missed (watching failed, an Area root vanished, or the change log was
+  pruned past the Store).
 
 A Change's Origin is decided where the knowledge is. The Store layer tags the Changes of its own
 Commits *local*. A Backend that reads other Stores' Commits from a change log (SQLite) knows which
-Store instance wrote each one, and gives its Origin with it. For raw changes a Backend observes
-without knowing who made them (the filesystem's watcher), the Store tags one *local* when it
-matches a Commit this Store made, and *external* otherwise.
+Store instance wrote each one, and gives its Origin with it. The filesystem's watcher can't tell
+who made what it sees, so it matches it against what the Change feed was last told of each File,
+which the Store's own Commits update as they are reported (decided in ticket 11): an event that
+finds a File as reported, as the events of the Store's own Commits do, gives nothing, and every
+other difference is *external*.
 
 ### Filesystem Backend
 
@@ -359,6 +364,27 @@ matches a Commit this Store made, and *external* otherwise.
   - `.tidings/` and temporary-file names are ignored.
   - If an Area root disappears, the root is recreated, watched again, and a Resync is sent.
   - If watching fails, a Resync is sent.
+
+  Settled while building it (ticket 11; the watcher's module doc has the detail):
+  - For each name that events settled for, the watcher reads the File as reads through tidings
+    see it, and compares it with what the Change feed was last told of it. So edits that don't
+    change the contents, and the Store's own Commits, give nothing. It looks at the names in turn
+    with the Store's Commits, so each Commit is recorded before its events are looked at.
+  - What was reported is kept for every File in each Area, listed when the Store opens without
+    reading the Files: memory in proportion to the number of Files. A File's Revision is known
+    once it changes, so rewriting a File that hasn't changed since the Store opened with the same
+    contents reports a Change. Events that can't be writes (a File read, touched, or its
+    permissions changed) are dropped before that.
+  - A Commit left `Pending` is reported once, by the Store that made it, and by other Stores once
+    its journal has settled, since reads show it finished. Its renames landing later give
+    nothing.
+  - Another Store's Commit is usually one batch, and one slower than the window is waited for and
+    kept whole, but one can be split when events keep coming for longer than four windows. And
+    the Store's own next Commit can reach its feed before another Store's Commits made just
+    before it. So on the filesystem, "a Commit's Changes are never split across batches" holds
+    for the Store's own Commits, as ADR 0003 says. SQLite, which reads other Stores' Commits from
+    its log, keeps both promises for them too.
+  - Directories are watched under their own names only, not through symlinks to directories.
 
 ### SQLite Backend
 

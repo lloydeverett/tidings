@@ -50,7 +50,7 @@ impl<T> PerArea<T> {
     }
 
     /// Each Area with its `T`, in order of Area.
-    #[cfg(feature = "sqlite")]
+    #[cfg(any(feature = "fs", feature = "sqlite"))]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (Area, &T)> {
         Self::AREAS.into_iter().zip(&self.0)
     }

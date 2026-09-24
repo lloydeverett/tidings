@@ -34,9 +34,9 @@ impl Path {
         &self.0
     }
 
-    /// A Path read back from where a Backend stored it, which was validated before it was
-    /// stored, so it isn't validated again.
-    #[cfg(feature = "sqlite")]
+    /// A Path read back from where a Backend stored or kept it, which was validated before, so it
+    /// isn't validated again.
+    #[cfg(any(feature = "fs", feature = "sqlite"))]
     pub(crate) fn stored(path: String) -> Path {
         debug_assert_eq!(refusal(&path), None, "{path:?} was stored, so it should be valid");
         Path(path)
@@ -135,7 +135,7 @@ pub(crate) fn temporary_file_name(name: &str, commit_id: u128, n: usize) -> Stri
 
 /// Whether `name` is the name of a temporary file, as [`temporary_file_name`] makes them. No
 /// Path has such a name, so that a File is never taken for a temporary file.
-fn is_temporary_file_name(name: &str) -> bool {
+pub(crate) fn is_temporary_file_name(name: &str) -> bool {
     let Some((before, id)) = name.rsplit_once(".tidings-") else { return false };
     let Some((commit_id, n)) = id.split_once('-') else { return false };
     before.len() > 1

@@ -73,26 +73,32 @@
 //! step 6. And one that writes a File after step 2 and before step 6 has its edit overwritten if
 //! the Commit writes that File: the filesystem can't replace a File only if it is unchanged.
 //!
+//! **Watching.** Each Area's directory is watched, so that what other programs and other Stores
+//! change there reaches the Change feed: see [`watch`].
+//!
 //! Every call to the filesystem blocks, so each runs on tokio's blocking threads.
 
 mod journal;
+mod watch;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "testing")]
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::sync::{Arc, Mutex};
 #[cfg(feature = "testing")]
-use std::sync::{Condvar, Mutex, PoisonError};
+use std::sync::{Condvar, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use jiff::Timestamp;
 use xxhash_rust::xxh3::xxh3_128;
 
 use self::journal::{AsFinished, Journal, Recovery, Remove, Replace, Target};
+pub(crate) use self::watch::FsWatcher;
+use self::watch::Reported;
 use super::{AreaState, CommitOutcome, CommitRequest, Planned, off_runtime};
 use crate::app::AppIdentity;
 use crate::area::PerArea;
@@ -109,6 +115,7 @@ use crate::{
 #[non_exhaustive]
 pub struct FsOptions {
     root_override: Option<PathBuf>,
+    debounce_window: Option<Duration>,
     #[cfg(feature = "testing")]
     fail_at: Option<FailurePoint>,
     #[cfg(feature = "testing")]
@@ -124,13 +131,23 @@ impl FsOptions {
         self
     }
 
+    /// How long the events of an edit made outside this Store are held back, once the last of
+    /// them, before the edit is reported. Editors save a File with a burst of events, so that a
+    /// File can be half written in between: the burst has to settle first. 150 ms by default. A
+    /// longer window reports edits later, and a shorter one risks reporting a File half saved.
+    pub fn debounce_window(mut self, window: Duration) -> FsOptions {
+        self.debounce_window = Some(window);
+        self
+    }
+
     /// Makes every Commit through the Store stop at `point`, as if the process had died there: the
     /// Commit gives [`Error::Backend`], and leaves everything on disk as it is. Finishing a Commit
     /// left behind, when a Store opens or commits, never stops. For tidings' own tests of how an
     /// interrupted Commit is recovered.
     ///
     /// [`FailurePoint::RenameFails`] and [`FailurePoint::CommittedJournalFails`] are different:
-    /// each makes a step fail, as described there.
+    /// each makes a step fail, as described there. [`FailurePoint::WatchingFails`] makes watching
+    /// fail.
     #[cfg(feature = "testing")]
     pub fn fail_at(mut self, point: FailurePoint) -> FsOptions {
         self.fail_at = Some(point);
@@ -199,8 +216,8 @@ impl Pause {
 
 /// A named point in a filesystem Commit, where [`FsOptions::fail_at`] stops it and
 /// [`FsOptions::pause_at`] holds it, or with [`RenameFails`](Self::RenameFails) and
-/// [`CommittedJournalFails`](Self::CommittedJournalFails), a step that fails. For tidings' own
-/// tests.
+/// [`CommittedJournalFails`](Self::CommittedJournalFails), a step that fails, or with
+/// [`WatchingFails`](Self::WatchingFails), watching. For tidings' own tests.
 #[cfg(feature = "testing")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -229,6 +246,10 @@ pub enum FailurePoint {
     /// Writing the journal as `committed` gives an error once the journal is written, as it would
     /// if forcing its directory to disk failed.
     CommittedJournalFails,
+    /// Watching the Areas' directories fails: the first events that could change a File are
+    /// replaced by an error naming them, as the platform's watcher gives when it fails. Not a
+    /// point in a Commit.
+    WatchingFails,
 }
 
 /// What [`FsOptions::fail_at`] and [`FsOptions::pause_at`] set up, for each Area of a Store.
@@ -272,13 +293,23 @@ const RETRY_DELAYS: [Duration; 3] =
 #[derive(Debug)]
 pub(crate) struct FsBackend {
     areas: PerArea<Arc<AreaRoot>>,
+    /// What the Change feed has been told of each Area's Files, which the watcher compares events
+    /// with, and each Commit updates.
+    reported: PerArea<Arc<Mutex<Reported>>>,
 }
 
 impl FsBackend {
-    /// Makes each Area's root and its `.tidings/` directory if they don't exist, and finishes or
-    /// discards any Commit a crash left in its journal.
-    pub(crate) async fn open(app: &AppIdentity, options: FsOptions) -> Result<FsBackend> {
+    /// Makes each Area's root and its `.tidings/` directory if they don't exist, finishes or
+    /// discards any Commit a crash left in its journal, and starts watching the Areas, giving the
+    /// watcher for the Store to run.
+    pub(crate) async fn open(
+        app: &AppIdentity,
+        options: FsOptions,
+    ) -> Result<(FsBackend, FsWatcher)> {
         let roots = app.area_directories(options.root_override.as_deref())?;
+        let window = options.debounce_window.unwrap_or(watch::DEFAULT_WINDOW);
+        #[cfg(feature = "testing")]
+        let watching_fails = options.fail_at == Some(FailurePoint::WatchingFails);
         #[cfg(feature = "testing")]
         let failures = FailureSetup {
             fail_at: options.fail_at,
@@ -308,7 +339,20 @@ impl FsBackend {
             })
         })
         .await?;
-        Ok(FsBackend { areas })
+        let reported = PerArea::try_from_fn(|_| Ok(Arc::default()))?;
+        let watching = PerArea::try_from_fn(|area| {
+            Ok((Arc::clone(areas.get(area)), Arc::clone(reported.get(area))))
+        })?;
+        let watcher = off_runtime(move || {
+            FsWatcher::start(
+                watching,
+                window,
+                #[cfg(feature = "testing")]
+                watching_fails,
+            )
+        })
+        .await?;
+        Ok((FsBackend { areas, reported }, watcher))
     }
 
     pub(crate) async fn read(&self, area: Area, path: &Path) -> Result<Option<File>> {
@@ -348,9 +392,13 @@ impl FsBackend {
         .await
     }
 
-    /// Commits `request` to its Area's directory, as the module's doc describes.
+    /// Commits `request` to its Area's directory, as the module's doc describes, and takes what
+    /// it changed as reported, since the Store reports it.
     pub(crate) async fn commit(&self, request: CommitRequest) -> Result<CommitOutcome> {
-        self.off_runtime(request.staged.area, move |root| root.commit(request)).await
+        let area = request.staged.area;
+        let outcome = self.off_runtime(area, move |root| root.commit(request)).await?;
+        watch::lock(self.reported.get(area)).committed(&outcome);
+        Ok(outcome)
     }
 
     /// Runs `call` with `area`'s root, on a blocking thread.

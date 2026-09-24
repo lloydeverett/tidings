@@ -6,11 +6,11 @@ change feed.
 
 Status: early. Stores in memory, on SQLite and on the filesystem exist so far: reading, stat and
 listing, commits of writes and deletes with preconditions, checked paths, the change feed,
-snapshots (not on the filesystem), and on SQLite, seeing other processes' commits to the same
-databases. On the filesystem, commits are journaled, recovery is tested at every step, and a
-commit whose rename keeps failing gives `Pending`. Still to come on the filesystem: watching, so
-that other processes' commits and people's edits reach the change feed, with the resyncs that
-come with it. Then the blocking API. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
+snapshots (not on the filesystem), and seeing other processes' commits to the same store. On the
+filesystem, commits are journaled, recovery is tested at every step, a commit whose rename keeps
+failing gives `Pending`, and the area directories are watched, so that people's edits and other
+processes' commits reach the change feed. Still to come: the blocking API. See
+[CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
 
 ## Consistency
 
@@ -41,6 +41,20 @@ come with it. Then the blocking API. See [CONTEXT.md](CONTEXT.md) and [docs/adr]
   they were applied. They are kept for 10 minutes for stores that haven't seen them yet: a store
   that falls further behind than that, because its process was stopped, say, gets a resync
   instead.
+- On the filesystem, the area directories are watched. A file another program changes, makes or
+  deletes there, and another process's commit, is reported as an external change once its burst
+  of events has settled: none for the debounce window (150 ms by default, set in `FsOptions`),
+  so that a file an editor is saving isn't reported half written. That is usually within twice
+  the window, and later if the events keep coming or a commit takes longer. An event that leaves
+  a file's contents as they were (it was read, touched or had its permissions changed, or was
+  written again the same) reports nothing, and neither do the events of the store's own commits,
+  which it reports itself, as local, when it makes them. Another process's commit is usually
+  reported in one batch, and whole if it took longer than the window, but can be split if files
+  keep changing for longer than four windows. Unlike on SQLite, a store's own commit can reach
+  its feed before another process's commits made just before it, which arrive once they settle.
+  If watching fails or loses track of events, or an area's directory is removed or renamed away
+  (the cache cleared, say), that area gets a resync, and a removed directory is made again, and
+  watched again.
 - The store can be cloned and shared between tasks. The change feed ends once every clone has
   been dropped, even if a snapshot is still held. Dropping the change feed leaves the store
   working.
@@ -102,8 +116,18 @@ come with it. Then the blocking API. See [CONTEXT.md](CONTEXT.md) and [docs/adr]
   directory there costs in proportion to N, and reading them all to N².
 - On the filesystem, stat reads the whole file, to hash it, and a prefix revision reads every file
   under the prefix.
-- On the filesystem, the change feed doesn't report other processes' commits, or edits made by
-  other programs, yet.
+- On the filesystem, watching remembers every file in each area, to tell what an event changed:
+  memory in proportion to the number of files. It learns a file's contents only when it changes,
+  so until then, writing a file that was there when the store opened again with the same
+  contents, or setting only its modification time, reports a change.
+- On the filesystem, an edit to the file a symlinked file points to is reported for the link,
+  wherever that file is, and links made, changed or removed while the store runs are followed.
+  If that file is outside the areas and its directory is removed or replaced, edits there are no
+  longer seen until the link changes or a store opens again. Symlinks to directories aren't watched through: edits
+  under a link to a directory elsewhere in the area are reported under that directory's own
+  prefix only, and edits under a link to a directory outside the areas aren't reported. Where a
+  commit writes a file through a symlink, another path that is the same file gets an external
+  change.
 - On SQLite, each area is a database (`config.sqlite3`, `data.sqlite3` or `cache.sqlite3`) in the
   area's directory, written only by tidings. Other programs writing to it directly aren't
   supported.

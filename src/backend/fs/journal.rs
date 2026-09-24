@@ -129,6 +129,11 @@ impl AsFinished<'_> {
         Ok(finished)
     }
 
+    /// Each Path the Commit in the journal writes or deletes, if one is left there committed.
+    pub(super) fn paths(&self) -> impl Iterator<Item = &Path> {
+        self.written.keys().chain(self.removed.keys())
+    }
+
     /// What [`AreaRoot::read`] gives for `path`, once the Commit is finished.
     pub(super) fn read(&self, path: &Path) -> Result<Option<(Vec<u8>, Timestamp)>> {
         // A temporary file that is gone was renamed over the File already.

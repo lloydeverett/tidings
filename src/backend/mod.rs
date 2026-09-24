@@ -113,20 +113,27 @@ pub(crate) struct CommitOutcome {
     pub(crate) pending: bool,
 }
 
-/// Something a Backend observed in an Area's change log, which Commits by every Store on the same
-/// storage go into.
+/// Something a Backend observed in an Area, other than this Store's Commits as it makes them: in
+/// SQLite's change log, which Commits by every Store on the same storage go into, or with the
+/// filesystem's watcher.
 #[derive(Debug)]
-#[cfg_attr(not(feature = "sqlite"), expect(dead_code, reason = "only SQLite has a change log"))]
+#[cfg_attr(
+    not(any(feature = "fs", feature = "sqlite")),
+    expect(dead_code, reason = "only SQLite and the filesystem observe other Stores")
+)]
 pub(crate) enum Observed {
-    /// A Commit, and each Path it changed or removed. Its Origin is local if this Store made it.
-    Commit { origin: Origin, changes: Vec<RawChange> },
-    /// Commits were pruned from the log before this Store read them, so their Changes are missed.
+    /// Changes to the Area, all with the same Origin, to go in the same batch: a Commit's, read
+    /// from the change log, whose Origin is local if this Store made it, or all the watcher saw in
+    /// one burst of events, which are external.
+    Changes { origin: Origin, changes: Vec<RawChange> },
+    /// Changes may have been missed: Commits were pruned from the log before this Store read
+    /// them, or watching failed, or the Area's directory was removed.
     Missed,
 }
 
 /// A change a Backend made or observed, without its Area and Origin. The Store layer adds the Area,
-/// and the Origin: local for its own Commits, and for Commits read from a change log, the Origin
-/// the Backend gives with them ([`Observed::Commit`]).
+/// and the Origin: local for its own Commits, and for what a Backend observed, the Origin it gives
+/// with them ([`Observed::Changes`]).
 #[derive(Debug)]
 pub(crate) struct RawChange {
     pub(crate) path: Path,
