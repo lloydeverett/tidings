@@ -229,8 +229,9 @@ SQLite database per Area, or in memory.
   - Anything under the reserved `.tidings` Prefix is refused.
   - A Prefix is checked the same way.
   - Refusing Paths that differ only in letter case needs the Area's contents, so it happens at
-    Commit time (see Backend). Case folding uses an established Unicode case-folding crate, chosen
-    during implementation.
+    Commit time (see Backend). The same goes for the Prefixes they are under, and for a Path that
+    is also a Prefix of another Path (`a` beside `a/b`). Case folding uses an established Unicode
+    case-folding crate: `caseless`, chosen during implementation (ticket 04).
 - **Area**: a closed enum of Config, Data and Cache.
 - **Store (async)**: the public entry point. It is a cheap, cloneable handle to shared state.
   - Constructors, one per Backend: `open_fs(app, FsOptions)`, `open_sqlite(app, SqliteOptions)`
@@ -305,7 +306,9 @@ Backends are private to the crate (not a public trait). Each Backend provides:
   - checks every Precondition: those on writes and deletes, those on Files it doesn't write, and
     those on Prefixes;
   - drops writes that would not change the contents;
-  - refuses Paths that differ only in letter case from an existing Path;
+  - refuses Paths that differ only in letter case from an existing Path, or are under a Prefix
+    that does, and Paths that are also a Prefix of another Path. The check is shared by every
+    Backend and runs under its lock;
   - applies the rest;
   - returns the Revisions;
 - a stream of the raw changes it observes, each with its Revision (or *removed*), plus signals that
@@ -352,8 +355,10 @@ otherwise.
 - **Databases.** One database per Area, in that Area's standard directory (or under the Root
   override). It uses `rusqlite` with SQLite built in (the `bundled` feature), called through
   `spawn_blocking`, in WAL mode.
-- **Tables.** The Files table holds the Path, the case-folded Path (unique, which enforces the
-  letter-case rule), the contents, the last-modified time and the Revision.
+- **Tables.** The Files table holds the Path, the case-folded Path, the contents, the
+  last-modified time and the Revision. A unique case-folded Path column alone doesn't enforce the
+  letter-case rule, which also covers the Prefixes a Path is under and a Path that is a Prefix of
+  another, so the shared check runs inside the write transaction too.
 - **Detecting other processes' Commits.** Each Commit also appends to a change log table, in the
   same transaction, recording the Paths, the kind and which Store instance wrote it. Commits by
   other processes are noticed by polling SQLite's `data_version` or watching the database files

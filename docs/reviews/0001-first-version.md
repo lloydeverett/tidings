@@ -332,3 +332,125 @@ earlier write under that Prefix. The coordinator is passing it to ticket 04.
 The behaviour tests are unchanged. Clippy (all targets, with default features and with
 `--all-features`) is clean, and `cargo test` passes with default features, with
 `--no-default-features` and with `--all-features`.
+
+---
+
+## Ticket 04: Preconditions
+
+Reviewed: `git diff 90f7ae7...edca4b7` (commit edca4b7). The Spec reviewer was also asked to judge four decisions from the implementer's Notes.
+
+### Standards
+
+**Hard violations of documented standards: none found.**
+- **Spec, Testing Decisions** ("tests use only the public API; no internal state"): met. Every new test in tests/behaviour/suite.rs uses only `Store`, `Staging`, `Precondition`, `Committed` and `Error`.
+- **Spec, Implementation Decisions:** met on every point checked:
+  - `Error` stays `#[non_exhaustive]` and gains `Conflict { paths }`.
+  - `AreaState` is `pub(crate)` (src/backend/mod.rs:21), so Backends stay private with no public trait.
+  - The memory Backend commits in the order check → expand → letter case → apply, matching the spec's Backend list.
+  - No logging was added, so the `tracing` rule is untouched.
+  - `caseless` fits the spec's "case-folding crate chosen during implementation".
+- **CONTEXT.md `_Avoid_` lists:** no avoided word is used for a glossary concept. `digest128`, `Entry` and `next_batch` are names from std, xxhash or existing helpers.
+- **ADR 0004:** the letter-case rule is enforced on memory as required. One doc-drift note, not a violation: the ADR's list of "established crates" doesn't mention `caseless`.
+- **README:** the new Consistency and Limitations lines match the behaviour and the tests.
+
+**Baseline smells (all judgement calls):**
+
+1. **Possible Mysterious Name**, src/staging.rs:271 `fn names_in(path: &Path)`. It returns the Prefixes plus the Path itself (`a/`, `a/b/`, `a/b/c.txt`). In CONTEXT.md a Path *is* a name, so "names in a path" reads oddly. Something like `prefixes_and_path` would say what it returns.
+2. **Borderline glossary friction**, src/path.rs:117 `letter_case_key`. CONTEXT.md lists "key" as an Avoid word for Path. Here it names a comparison form, not a Path, so it isn't a breach, but `letter_case_fold` or `letter_case_form` would avoid the word.
+3. **Possible naming drift from the glossary**, src/staging.rs:38–40, 185. `requirements`, `prefix_requirements` and `add_requirement` hold what the glossary calls Preconditions, while the check is `check_preconditions` (:195), so two words now name one concept. `preconditions` and `prefix_preconditions` would match. The public `require` is named in the spec and is fine.
+   - Related: src/precondition.rs:3 says "Something a Commit requires of a File". The glossary says a *Staging* requires it, and a Precondition can also be on a Prefix. Minor wording mismatch.
+4. **Possible Data Clump:** `(Path, Revision)` pairs travel together in four places. It's weak because the tuple is small and local, so a type is only worth it if the ticket 07/09 Backends add more uses.
+   - `AreaState::revisions_under` (src/backend/mod.rs:25)
+   - `PrefixRevision::of` (src/revision.rs:47)
+   - `files: Arc<[(Path, Revision)]>` (src/revision.rs:42)
+   - src/backend/memory.rs:91
+5. **Minor Duplicated Code**, src/backend/memory.rs:43 vs :91. `list` and `revisions_under` both walk the Area with `prefix.covers(path)`. It's a one-line shape, so low priority.
+
+No Speculative Generality found. `AreaState` returning `Result`, and the `Arc`'d file list inside `PrefixRevision`, are justified by tickets 07/09 and by the requirement that a Conflict name the Paths that differ.
+
+### Spec
+
+All 10 checkboxes hold up against the code and the suite, and `cargo test` passes: 30 behaviour tests and 5 path tests.
+
+**(a) Missing or partial:** none.
+
+**(b) Scope creep:** none of substance.
+
+**(c) Implemented, but wrong or behind the docs**
+
+1. The wider letter-case rule was not recorded in the glossary or the spec. The code also refuses clashes between Prefixes (src/staging.rs:232–275). The docs still say "No two Paths in an Area may differ only by letter case" (CONTEXT.md:45) and "the case-folded Path (unique, which enforces the letter-case rule)" (spec:355, ticket 07:18). Only README.md was updated. CONTEXT.md, ADR 0004 and ticket 07's text should be updated now, not just the Notes.
+2. `PrefixRevision` doesn't record which Area or Prefix it was taken for. Two misuses were probed:
+   - `require_prefix("u/", <rev of "t/">)` gives `Conflict ["t/1","u/1"]`.
+   - A revision taken in another Area gives a Conflict naming Paths that don't exist in this one.
+
+   Both fail safe, with a misleading message. Minor.
+
+**Points the orchestrator asked about**
+
+1. **A Precondition is never dropped: agree.** The spec says Preconditions "stop the application from overwriting changes it hasn't seen" (Solution), and user stories 27 and 29 say the same. Letting a later `write` or `delete_prefix` silently drop one would break that. The costs are safe and documented: a Staging can never take back a Precondition, and `Absent` plus `UnchangedSince` on one Path always conflicts. The glossary still says a write "carries one", so it needs a sentence.
+2. **`PrefixRevision` holding the list: agree.** It's the only way to meet "the paths are the ones under the Prefix that were added, removed or changed". It stays opaque, because `Eq`, `Hash` and `Debug` use only the hash (src/revision.rs:42, 59). The `stat_prefix` rustdoc (src/store.rs:67) should mention the memory cost, which grows with the number of Files under the Prefix. A large Cache is where it would hurt.
+3. **`caseless` with uppercase then folding: agree.** It fits "established Unicode case-folding crate", and refusing more is within the spirit of ADR 0004. An exhaustive check over single code points found that whenever two fold the same, their keys match (0 violations). Covering directory-like Prefixes follows from the ADR's reason ("could not be moved to the filesystem Backend"); point (c)1 is the paperwork. For ticket 07: the key depends on the Unicode tables in the toolchain and in `caseless` (Unicode 16). A key stored in SQLite can go stale after an upgrade, so recompute it on open, or at least document that it can change.
+4. **File `a` alongside File `a/b`: refuse it on every Backend.** A probe showed the memory Backend accepts `a` then `a/b`, `a/b` then `a`, both in one Commit, and `A` beside `a/b`. The last is also a case-insensitive clash, which the current check misses because it compares `a` with `a/`. Under ADR 0004 and "same guarantees on every Backend" this is the same kind of rule. Without it, a filesystem Commit fails with `Backend` partway through its journal, where memory and SQLite succeed.
+   - **Error:** `InvalidPath { path, reason: <new reason, e.g. FileUnderFile> }`. The reason list is `#[non_exhaustive]`, and the spec groups Commit refusals of this kind under `InvalidPath`. It should not be `Conflict`, which is for Preconditions only.
+   - **How:** extend `refuse_letter_case_clashes` to compare each File's key with the Prefix keys minus their trailing `/`. As now, a Path deleted in the same Commit doesn't count.
+   - **Which ticket:** a small follow-up to 04, done now, because it's the same shared function and 07 inherits it. At the latest before 07. Also add a line to ADR 0004 and the glossary ("a Path can't also be a Prefix of another Path").
+
+### Summary
+
+Standards: 0 hard violations and 5 judgement calls. The most notable is naming drift: `requirements` in the code, where the glossary says Preconditions. Spec: 0 missing, plus 2 wrong-or-behind-the-docs items and 1 new rule recommended. The worst is that a File `a` and a File `a/b` can both exist on memory (and SQLite), which the filesystem cannot hold. That breaks ADR 0004's portability guarantee.
+
+
+
+### Resolution
+
+1. **Spec point 4, a File under a File:** fixed on every Backend through the shared check, now
+   called `Staged::refuse_clashing_paths`. It folds each name, with a Prefix's trailing `/`
+   removed, so the File `a` and the Prefix `a/` meet. The same name gives the new
+   `InvalidPathReason::FileUnderFile`. Names that also differ in letter case (`A` beside `a/b`)
+   give `LetterCaseClash`, which the old check missed. Paths deleted in the same Commit still
+   don't count. The new test `a_file_cannot_be_under_another_file` covers:
+   - `a/b` and `a/b/c` under an existing `a`;
+   - `d` over an existing `d/e`;
+   - `n` and `n/m` in one Commit;
+   - `D`, `A/b`, and `N` with `n/m`, which clash by letter case;
+   - moving `a` to `a/b`, and `d/e` to `d`, in one Commit, both of which succeed.
+
+   I checked that the test fails if the fold keeps the trailing `/`.
+2. **Spec (c)1, docs behind the rule:** fixed.
+   - CONTEXT.md: the Path entry covers the Prefixes a Path is under, and says a Path can't also
+     be a Prefix of another Path. The Precondition entry says Preconditions accumulate.
+   - ADR 0004 has a line for each rule checked at Commit time, and names `caseless`.
+   - The spec's Path module, its Backend list and its SQLite Tables line now say that a unique
+     case-folded column alone doesn't enforce the rule, so the shared check runs in the write
+     transaction.
+   - Ticket 07's checkbox says the same. A new unticked checkbox there says the stored fold can go
+     stale after a Unicode upgrade, and asks for it to be recomputed or documented.
+   - README Limitations mentions the File-under-File rule.
+3. **Spec (c)2, a Prefix Revision for another Area or Prefix:** fixed. A `PrefixRevision` now
+   records its Area and Prefix. `require_prefix` panics if they don't match the Staging's Area
+   and the given Prefix, documented under `# Panics`. Such a Precondition could never hold, so a
+   Conflict would mislead the app, and an app that retries after a Conflict could loop forever.
+   The spec's error list has no variant for it, and the mistake is always in the app's code.
+   Equality, `Hash` and `Debug` include the Area and Prefix. The new test
+   `a_prefix_revision_is_only_for_its_own_area_and_prefix` checks the panic for another Prefix,
+   the empty Prefix and another Area, and that the right one is accepted. The reasoning is in the
+   ticket Notes.
+4. **Spec point 2, memory cost:** the `stat_prefix` and `PrefixRevision` rustdoc now say that a
+   Prefix Revision keeps each Path and Revision, so it costs memory in proportion to the number
+   of Files under the Prefix, which can be large for a Cache.
+5. **Standards 1 and 3, naming:** fixed.
+   - `names_in` is now `prefixes_and_path`.
+   - `requirements`, `prefix_requirements` and `add_requirement` are now `preconditions`,
+     `prefix_preconditions` and `add_precondition`.
+   - `check_preconditions` takes `current` rather than `area`, since `Staged` has an `area` of
+     its own.
+   - precondition.rs now says a *Staging* requires a Precondition, and that a Staging can also
+     require a Prefix.
+6. **Standards 2, `letter_case_key`:** renamed to `letter_case_fold`.
+7. **Standards 4 and 5:** left as they are. The `(Path, Revision)` pair is small and local, and a
+   type is worth it only if tickets 07 and 09 add more uses. The walk that `list` and
+   `revisions_under` share is one line.
+
+Clippy (all targets, with default features and with `--all-features`) is clean. `cargo test`
+passes with default features, `--no-default-features` and `--all-features`: 32 behaviour tests
+and 5 path tests.

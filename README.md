@@ -39,7 +39,8 @@ still to come. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
   control characters, a trailing dot or space, `.` and `..`, and paths not in Unicode NFC form are
   refused, as is anything under `.tidings/`. A commit can't create a path that differs only in
   letter case from another in the same area (`Themes/a.toml` against `themes/b.toml` counts too),
-  because some platforms treat them as the same name.
+  because some platforms treat them as the same name. Nor can it put a file under another file:
+  `a` and `a/b` can't both exist, as on a filesystem.
 - No moving a store's data from one backend to another.
 - No size limit or eviction for the cache area.
 - Backends are defined in this crate. You cannot plug in your own.

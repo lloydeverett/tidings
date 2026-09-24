@@ -55,6 +55,8 @@ macro_rules! behaviour_suite {
             a_precondition_stays_when_something_staged_later_replaces_it,
             a_staging_without_preconditions_depends_on_nothing,
             a_path_differing_only_in_letter_case_is_refused,
+            a_file_cannot_be_under_another_file,
+            a_prefix_revision_is_only_for_its_own_area_and_prefix,
         );
     };
     (@tests $fixture:expr; $($test:ident),* $(,)?) => {
@@ -823,6 +825,76 @@ pub async fn a_path_differing_only_in_letter_case_is_refused(fixture: &impl Fixt
     rename.write("Themes/dark.toml", "dark").unwrap();
     store.commit(rename).await.unwrap();
     assert_eq!(list(&store, Area::Config, "").await, ["Themes/dark.toml", "settings.toml"]);
+}
+
+pub async fn a_file_cannot_be_under_another_file(fixture: &impl Fixture) {
+    let Opened { store, mut feed } = fixture.open().await;
+    let mut staging = Staging::new(Area::Data);
+    staging.write("a", "a").unwrap();
+    staging.write("d/e", "e").unwrap();
+    store.commit(staging).await.unwrap();
+    next_batch(&mut feed).await;
+
+    // A filesystem can't hold a File named like the directory other Files are in. Each Commit
+    // also writes a File that would be fine alone, which must not be written either. Where two
+    // Paths in the Commit clash, either may be the one refused.
+    use InvalidPathReason::{FileUnderFile, LetterCaseClash};
+    let clashes: [(&[&str], InvalidPathReason); 7] = [
+        // Under an existing File.
+        (&["a/b"], FileUnderFile),
+        (&["a/b/c"], FileUnderFile),
+        // Where existing Files are under it.
+        (&["d"], FileUnderFile),
+        // Both in the same Commit.
+        (&["n", "n/m"], FileUnderFile),
+        // Where it would be one of those, but for letter case.
+        (&["D"], LetterCaseClash),
+        (&["A/b"], LetterCaseClash),
+        (&["N", "n/m"], LetterCaseClash),
+    ];
+    for (paths, expected) in clashes {
+        let mut staging = Staging::new(Area::Data);
+        for path in paths {
+            staging.write(*path, "clash").unwrap();
+        }
+        staging.write("fine.txt", "fine").unwrap();
+        match store.commit(staging).await {
+            Err(Error::InvalidPath { path, reason }) if reason == expected => {
+                assert!(paths.contains(&path.as_str()), "{paths:?} refused for {path:?}");
+            }
+            other => panic!("{paths:?} should be refused for {expected:?}, got {other:?}"),
+        }
+    }
+    assert_eq!(list(&store, Area::Data, "").await, ["a", "d/e"]);
+    assert_nothing_more(&mut feed).await;
+
+    // A Path deleted in the same Commit doesn't count, so a File can be moved under its own name,
+    // or to where the Files under it were.
+    let mut rename = Staging::new(Area::Data);
+    rename.delete("a").unwrap();
+    rename.write("a/b", "a").unwrap();
+    rename.delete_prefix("d/").unwrap();
+    rename.write("d", "e").unwrap();
+    store.commit(rename).await.unwrap();
+    assert_eq!(list(&store, Area::Data, "").await, ["a/b", "d"]);
+}
+
+pub async fn a_prefix_revision_is_only_for_its_own_area_and_prefix(fixture: &impl Fixture) {
+    let Opened { store, feed: _feed } = fixture.open().await;
+    let themes = store.stat_prefix(Area::Config, "themes/").await.unwrap();
+
+    // Requiring it for anything else is a mistake in the app, not a Conflict, so it panics.
+    for (area, prefix) in [(Area::Config, "fonts/"), (Area::Config, ""), (Area::Data, "themes/")] {
+        let requiring = std::panic::catch_unwind(|| {
+            let mut staging = Staging::new(area);
+            let _ = staging.require_prefix(prefix, themes.clone());
+        });
+        assert!(requiring.is_err(), "requiring it for {area:?} {prefix:?} should panic");
+    }
+
+    let mut staging = Staging::new(Area::Config);
+    staging.require_prefix("themes/", themes).unwrap();
+    store.commit(staging).await.unwrap();
 }
 
 // Helpers shared by the tests above.

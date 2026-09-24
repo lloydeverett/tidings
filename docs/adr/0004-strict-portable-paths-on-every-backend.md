@@ -6,9 +6,14 @@ status: accepted
 
 A Path is relative and separated by `/`. It may not contain empty segments, `.` or `..`, and each
 segment must be a name every platform accepts, so names Windows reserves such as `CON` are
-refused. It must be in Unicode NFC form. A Commit may not create a Path that differs only in letter
-case from a Path already in the Area. These rules apply on SQLite and in memory too, even though
-those Backends could store any string.
+refused. It must be in Unicode NFC form. These rules apply on SQLite and in memory too, even though
+those Backends could store any string. Two more need the Area's contents, so they are checked when
+a Commit is made:
+
+- A Commit may not create a Path that differs only in letter case from another Path in the Area,
+  or put it under a Prefix that does (`Themes/a` beside `themes/b`).
+- A Commit may not create a Path that is also a Prefix of another Path (`a` beside `a/b`), because
+  a filesystem can't have a file and a directory with the same name.
 
 The reason is that a Store should behave the same whichever Backend it uses and whichever platform
 it runs on. macOS and Windows filesystems treat `Config.toml` and `config.toml` as the same file,
@@ -17,5 +22,5 @@ rules, data that works on SQLite, or on Linux, could not be moved to the filesys
 those platforms.
 
 We check Paths with established crates instead of writing the rules ourselves: `relative-path` for
-the structure, `sanitize-filename` (with its Windows rules) for each segment, and
-`unicode-normalization` for NFC.
+the structure, `sanitize-filename` (with its Windows rules) for each segment,
+`unicode-normalization` for NFC, and `caseless` for comparing letter case.

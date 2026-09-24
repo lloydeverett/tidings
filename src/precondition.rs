@@ -1,7 +1,11 @@
 use crate::Revision;
 
-/// Something a Commit requires of a File when it runs. If it doesn't hold, the Commit writes
-/// nothing and fails with [`Error::Conflict`](crate::Error::Conflict).
+/// Something a Staging requires of a File when it is committed. If it doesn't hold, the Commit
+/// writes nothing and fails with [`Error::Conflict`](crate::Error::Conflict).
+///
+/// A Staging can also require everything under a Prefix to be unchanged, with a
+/// [`PrefixRevision`](crate::PrefixRevision) and
+/// [`Staging::require_prefix`](crate::Staging::require_prefix).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Precondition {
     /// Whatever is there. Requires nothing, so it never fails.

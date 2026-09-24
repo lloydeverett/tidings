@@ -63,7 +63,9 @@ impl Store {
     /// them was added, removed or changed since. The empty Prefix covers the whole Area.
     ///
     /// Unlike [`list`](Self::list), it needs the Revision of every File under `prefix`. On the
-    /// filesystem that means reading them all.
+    /// filesystem that means reading them all. The Prefix Revision keeps each Path and its
+    /// Revision, so that a Conflict can name the Files that changed: holding one costs memory in
+    /// proportion to the number of Files under `prefix`, which can be large for a Cache.
     pub async fn stat_prefix(&self, area: Area, prefix: impl IntoPrefix) -> Result<PrefixRevision> {
         let prefix = prefix.into_prefix()?;
         self.inner.backend.stat_prefix(area, &prefix).await

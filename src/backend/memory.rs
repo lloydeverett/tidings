@@ -45,7 +45,8 @@ impl MemoryBackend {
 
     pub(crate) fn stat_prefix(&self, area: Area, prefix: &Prefix) -> Result<PrefixRevision> {
         let areas = self.areas.lock().unwrap();
-        Ok(PrefixRevision::of(areas[area as usize].revisions_under(prefix)?))
+        let files = areas[area as usize].revisions_under(prefix)?;
+        Ok(PrefixRevision::of(area, prefix.clone(), files))
     }
 
     /// Checks every Precondition, then applies every write and delete at once, under the one
@@ -56,7 +57,7 @@ impl MemoryBackend {
         let files = &mut areas[staged.area as usize];
         staged.check_preconditions(files)?;
         staged.expand_prefix_deletes(files.keys());
-        staged.refuse_letter_case_clashes(files.keys())?;
+        staged.refuse_clashing_paths(files.keys())?;
         let mut outcome = CommitOutcome::default();
         for (path, action) in staged.actions {
             match action {

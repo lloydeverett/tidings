@@ -68,17 +68,29 @@ letter case are refused. Everything works on the memory Backend and is covered b
   caseless matching (NFD, full case folding, NFD). Folding is what macOS does; Windows compares in
   upper case, and the dotless `ı` matches `I` only that way. I checked every code point: equal
   under folding alone implies equal under this key, so it is the stricter of the two.
-  `path::letter_case_key` is the one definition. The `.tidings` check now uses it too, which
+  `path::letter_case_fold` is the one definition. The `.tidings` check now uses it too, which
   refuses everything the uppercase comparison did.
 - The clash check covers Prefixes as well as Paths: `Themes/light.toml` clashes with an existing
   `themes/dark.toml`, because on a case-insensitive filesystem they share a directory. A Path
   deleted in the same Commit doesn't count, so renaming `Settings.toml` to `settings.toml` in one
-  Commit works. `Staged::refuse_letter_case_clashes(existing_paths)` is shared too, called after
+  Commit works. `Staged::refuse_clashing_paths(existing_paths)` is shared too, called after
   `expand_prefix_deletes`. Preconditions are checked first, so a Commit that breaks both gives
   `Conflict`. The refused Path is in `InvalidPath { path, reason: LetterCaseClash }`.
+- **A File under a File** (added after the review). The same check refuses a Path that is also a
+  Prefix of another Path (`a` beside `a/b`, in either order or in one Commit) with
+  `InvalidPath { reason: FileUnderFile }`, because a filesystem can't hold both. It folds each
+  Prefix without its trailing `/`, so a Prefix and a File with the same name meet. If they differ
+  in letter case too (`A` beside `a/b`) the reason is `LetterCaseClash`. A Path deleted in the
+  same Commit doesn't count, so moving `a` to `a/b` in one Commit works.
+- **A Prefix Revision is for one Area and Prefix** (added after the review). It records both, and
+  `require_prefix` panics if they don't match the Staging's Area and the Prefix given. Such a
+  Precondition could never hold, so a Conflict would be misleading, and an app that retries
+  after a Conflict by taking a new Prefix Revision for the same wrong Prefix would retry forever.
+  The spec's error list has no variant for it, and the mistake is always in the app's code, so a
+  panic at the call, documented under `# Panics`, is the clearest. Equality and `Debug` now
+  include the Area and Prefix.
 - For later tickets:
   - Ticket 07: a unique case-folded Path column catches clashes between whole Paths, but not
-    between Prefixes (`Themes/a` against `themes/b`). Use `letter_case_key` for the column and
-    still call `refuse_letter_case_clashes`, or also store the folded Prefixes.
-  - Ticket 09: a File and a Prefix with the same name (`a` and `a/b`) can both exist on memory,
-    but not on a filesystem. That isn't a letter-case rule, so this ticket doesn't refuse it.
+    between Prefixes (`Themes/a` against `themes/b`) or a File under a File. Call
+    `refuse_clashing_paths` in the write transaction. Ticket 07's checkboxes now say so, and
+    that a stored fold can go stale after a Unicode upgrade.

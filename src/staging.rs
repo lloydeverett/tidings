@@ -2,7 +2,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::backend::AreaState;
-use crate::path::letter_case_key;
+use crate::path::letter_case_fold;
 use crate::{
     Area, Error, File, IntoPath, IntoPrefix, InvalidPathReason, Path, Precondition, Prefix,
     PrefixRevision, Result,
@@ -35,9 +35,9 @@ pub(crate) struct Staged {
     /// Every Precondition staged other than *any*, on a Path written, deleted or only required.
     /// None is ever dropped: a later write or delete replaces the action for a Path, but not what
     /// the Staging required of it.
-    requirements: Vec<(Path, Precondition)>,
+    preconditions: Vec<(Path, Precondition)>,
     /// Each Prefix that must be unchanged since a Prefix Revision.
-    prefix_requirements: Vec<(Prefix, PrefixRevision)>,
+    prefix_preconditions: Vec<(Prefix, PrefixRevision)>,
 }
 
 /// What a Staging does to one Path.
@@ -55,8 +55,8 @@ impl Staging {
                 area,
                 actions: BTreeMap::new(),
                 prefix_deletes: BTreeSet::new(),
-                requirements: Vec::new(),
-                prefix_requirements: Vec::new(),
+                preconditions: Vec::new(),
+                prefix_preconditions: Vec::new(),
             },
         }
     }
@@ -150,7 +150,7 @@ impl Staging {
         path: impl IntoPath,
         precondition: Precondition,
     ) -> Result<&mut Self> {
-        self.staged.add_requirement(path.into_path()?, precondition);
+        self.staged.add_precondition(path.into_path()?, precondition);
         Ok(self)
     }
 
@@ -161,17 +161,29 @@ impl Staging {
     /// those Files.
     ///
     /// Gives [`Error::InvalidPath`](crate::Error::InvalidPath) if `prefix` is not allowed.
+    ///
+    /// # Panics
+    ///
+    /// If `prefix_revision` was taken for another Area or Prefix. It could never hold, so this is
+    /// a mistake in the app rather than a Conflict.
     pub fn require_prefix(
         &mut self,
         prefix: impl IntoPrefix,
         prefix_revision: PrefixRevision,
     ) -> Result<&mut Self> {
-        self.staged.prefix_requirements.push((prefix.into_prefix()?, prefix_revision));
+        let prefix = prefix.into_prefix()?;
+        let area = self.staged.area;
+        assert!(
+            prefix_revision.is_for(area, &prefix),
+            "{prefix_revision:?} can't be required for {area:?} {prefix:?}: it was taken for another \
+             Area or Prefix",
+        );
+        self.staged.prefix_preconditions.push((prefix, prefix_revision));
         Ok(self)
     }
 
     fn stage(&mut self, path: Path, action: Action, precondition: Precondition) -> &mut Self {
-        self.staged.add_requirement(path.clone(), precondition);
+        self.staged.add_precondition(path.clone(), precondition);
         self.staged.actions.insert(path, action);
         self
     }
@@ -182,25 +194,26 @@ impl Staging {
 }
 
 impl Staged {
-    fn add_requirement(&mut self, path: Path, precondition: Precondition) {
+    fn add_precondition(&mut self, path: Path, precondition: Precondition) {
         // *Any* requires nothing, so a Staging without Preconditions has nothing to check.
         if precondition != Precondition::Any {
-            self.requirements.push((path, precondition));
+            self.preconditions.push((path, precondition));
         }
     }
 
-    /// Checks every Precondition against `area`, as it is when the Commit runs. A Backend calls
+    /// Checks every Precondition against `current`, the Area as it is when the Commit runs. A Backend calls
     /// this under its lock, before it writes anything. Gives [`Error::Conflict`] with every Path
     /// where a Precondition fails. A Staging with no Preconditions reads nothing.
-    pub(crate) fn check_preconditions(&self, area: &impl AreaState) -> Result<()> {
+    pub(crate) fn check_preconditions(&self, current: &impl AreaState) -> Result<()> {
         let mut conflicts = BTreeSet::new();
-        for (path, precondition) in &self.requirements {
-            if !precondition.holds(area.revision(path)?) {
+        for (path, precondition) in &self.preconditions {
+            if !precondition.holds(current.revision(path)?) {
                 conflicts.insert(path.clone());
             }
         }
-        for (prefix, prefix_revision) in &self.prefix_requirements {
-            let now = PrefixRevision::of(area.revisions_under(prefix)?);
+        for (prefix, prefix_revision) in &self.prefix_preconditions {
+            let files = current.revisions_under(prefix)?;
+            let now = PrefixRevision::of(self.area, prefix.clone(), files);
             conflicts.extend(prefix_revision.differences(&now));
         }
         if conflicts.is_empty() {
@@ -225,11 +238,17 @@ impl Staged {
         }
     }
 
-    /// Refuses a write that would create a Path differing only in letter case from another Path
-    /// in the Area after the Commit, or put it under a Prefix that does. `existing` is every Path
-    /// in the Area. A Backend calls this under its lock, after expanding the Prefix deletes, so
-    /// that a Path deleted in the same Commit doesn't count.
-    pub(crate) fn refuse_letter_case_clashes<'a>(
+    /// Refuses a write that would leave two names in the Area after the Commit that some platform
+    /// can't hold together. A name is a Path, or a Prefix it is under. `existing` is every Path in
+    /// the Area. A Backend calls this under its lock, after expanding the Prefix deletes, so that
+    /// a Path deleted in the same Commit doesn't count. It refuses:
+    /// - names that differ only in letter case, such as `a.txt` and `A.txt`, or `a/` in `a/b` and
+    ///   `A/` in `A/c` ([`InvalidPathReason::LetterCaseClash`]);
+    /// - a Path that is also a Prefix of another Path, such as `a` and `a/b`
+    ///   ([`InvalidPathReason::FileUnderFile`]).
+    ///
+    /// Both are found by folding each name, without the `/` that ends a Prefix.
+    pub(crate) fn refuse_clashing_paths<'a>(
         &'a self,
         existing: impl IntoIterator<Item = &'a Path>,
     ) -> Result<()> {
@@ -238,37 +257,39 @@ impl Staged {
         if written.peek().is_none() {
             return Ok(());
         }
+        let fold = |name: &str| letter_case_fold(name.strip_suffix('/').unwrap_or(name));
         let deleted = |path: &Path| matches!(self.actions.get(path), Some(Action::Delete));
         let mut names = HashMap::new();
         for path in existing.into_iter().filter(|path| !deleted(path)) {
-            for name in names_in(path) {
-                names.insert(letter_case_key(name), name);
+            for name in prefixes_and_path(path) {
+                names.insert(fold(name), name);
             }
         }
         for path in written {
-            for name in names_in(path) {
-                match names.entry(letter_case_key(name)) {
+            for name in prefixes_and_path(path) {
+                let other = match names.entry(fold(name)) {
                     Entry::Vacant(entry) => {
                         entry.insert(name);
+                        continue;
                     }
-                    Entry::Occupied(other) if *other.get() != name => {
-                        let path = path.as_str().to_owned();
-                        return Err(Error::InvalidPath {
-                            path,
-                            reason: InvalidPathReason::LetterCaseClash,
-                        });
-                    }
-                    Entry::Occupied(_) => {}
-                }
+                    Entry::Occupied(other) if *other.get() == name => continue,
+                    Entry::Occupied(other) => *other.get(),
+                };
+                let reason = if other.trim_end_matches('/') == name.trim_end_matches('/') {
+                    InvalidPathReason::FileUnderFile
+                } else {
+                    InvalidPathReason::LetterCaseClash
+                };
+                return Err(Error::InvalidPath { path: path.as_str().to_owned(), reason });
             }
         }
         Ok(())
     }
 }
 
-/// Every name `path` puts in the Area: each Prefix it is under, other than the empty one, and the
-/// Path itself. For `a/b/c.txt`, that is `a/`, `a/b/` and `a/b/c.txt`.
-fn names_in(path: &Path) -> impl Iterator<Item = &str> {
+/// Each Prefix `path` is under, other than the empty one, then `path` itself. For `a/b/c.txt`,
+/// that is `a/`, `a/b/` and `a/b/c.txt`.
+fn prefixes_and_path(path: &Path) -> impl Iterator<Item = &str> {
     let path = path.as_str();
     let prefixes = path.match_indices('/').map(|(slash, _)| &path[..=slash]);
     prefixes.chain(std::iter::once(path))

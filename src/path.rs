@@ -35,7 +35,7 @@ impl Path {
 }
 
 /// The top-level name tidings keeps its own bookkeeping under. It is its own
-/// [`letter_case_key`].
+/// [`letter_case_fold`].
 const RESERVED: &str = ".tidings";
 
 /// Why `path` is refused, if it is.
@@ -104,7 +104,7 @@ fn is_device_name_sanitize_filename_misses(name: &str) -> bool {
 /// case-insensitive filesystem `.Tidings` is the same directory, and so are `.tidingſ` and
 /// `.tıdings` on some.
 fn is_reserved(name: &str) -> bool {
-    letter_case_key(name) == RESERVED
+    letter_case_fold(name) == RESERVED
 }
 
 /// A form of `name` that is the same for two names some platform treats as the same apart from
@@ -114,7 +114,7 @@ fn is_reserved(name: &str) -> bool {
 /// `caseless` crate), applied to the name in upper case. Case folding is what macOS does. Windows
 /// compares names in upper case instead, and some letters match only that way: the dotless `ı`
 /// is `I` in upper case, but doesn't fold to `i`. Folding the upper case catches both.
-pub(crate) fn letter_case_key(name: &str) -> String {
+pub(crate) fn letter_case_fold(name: &str) -> String {
     name.to_uppercase().chars().nfd().default_case_fold().nfd().collect()
 }
 
@@ -142,9 +142,14 @@ pub enum InvalidPathReason {
     /// A Prefix other than the empty one doesn't end with `/`.
     NoTrailingSlash,
     /// A Commit would create a Path that differs only in letter case from another Path in the
-    /// Area, or from another Path in the same Commit, or would put it under a Prefix that does.
-    /// Some platforms treat them as the same name, so only one is allowed.
+    /// Area, or from another Path in the same Commit, or would put it under a Prefix that does,
+    /// as with `Themes/a` beside `themes/b`. Some platforms treat them as the same name, so only
+    /// one is allowed.
     LetterCaseClash,
+    /// A Commit would leave a File under another File, as with `a` and `a/b`: a Path can't also
+    /// be a Prefix of another Path. A filesystem can't hold both, since `a` would have to be a
+    /// file and a directory at once.
+    FileUnderFile,
 }
 
 impl fmt::Display for InvalidPathReason {
@@ -162,6 +167,9 @@ impl fmt::Display for InvalidPathReason {
             InvalidPathReason::NoTrailingSlash => "it is a Prefix that doesn't end with `/`",
             InvalidPathReason::LetterCaseClash => {
                 "it differs only in letter case from another Path in the Area"
+            }
+            InvalidPathReason::FileUnderFile => {
+                "it would be under another File, or have other Files under it"
             }
         })
     }

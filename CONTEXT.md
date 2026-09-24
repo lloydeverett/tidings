@@ -42,7 +42,9 @@ _Avoid_: entry, blob, object, document
 
 **Path**:
 A File's name within its Area: relative, `/`-separated, UTF-8 in NFC form, made only of names that
-are safe on every platform. No two Paths in an Area may differ only by letter case.
+are safe on every platform. No two Paths in an Area may differ only by letter case, and neither
+may the Prefixes they are under (`Themes/a` and `themes/b` clash). A Path can't also be a Prefix of
+another Path: `a` and `a/b` can't both be Files.
 _Avoid_: key, filename
 
 **Prefix**:
@@ -76,6 +78,8 @@ _Avoid_: transaction, changeset, batch, draft
 Something a Staging requires to hold when it is committed. A staged write or delete carries one:
 *any*, *absent*, or *unchanged since* a given Revision. A Staging can also carry Preconditions on
 Files it does not write, and on a whole Prefix (*unchanged since* a given Prefix Revision).
+Preconditions accumulate: a later write or delete of the same Path replaces the earlier one, but
+never drops the Precondition it carried.
 _Avoid_: guard, assertion
 
 **Commit**:
