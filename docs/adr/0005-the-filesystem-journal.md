@@ -90,6 +90,25 @@ Details settled while building it (ticket 09):
   finished, reads through tidings of those Paths come from the temporary files, and the next Commit
   or `open` tries the renames again. So the all-or-nothing guarantee holds for everything that
   reads through tidings.
+
+Details settled while building it (ticket 10):
+- Finishing is tried again after 10, 50 and 200 ms, as finishing again, before `Pending`. The
+  Commit's Changes are recorded before `Pending` is returned, since it has happened. Finishing it
+  later reports nothing more.
+- While a `committed` journal is there, whether a Commit gave `Pending`, a crash interrupted it,
+  or it is being finished right then, `read`, `stat`, `list` and `stat_prefix` see the Area as
+  finishing will leave it: a Path it writes is read from its temporary file until that is renamed,
+  and a Path it deletes is absent if the File there still has the Revision the journal recorded,
+  as finishing deletes only that. The journal records the Path of a write through a symlink as
+  well as the file it replaces, for this. A Commit's Preconditions need none of it: it finishes
+  the journal first.
+- Only the Commit's own Paths are looked up. Another Path that is the same file, through a
+  symlink, is read as it is on disk until the Commit is finished. Matching by file on disk would
+  mean resolving every read's links and directories against every journaled file, for a window
+  that only a symlink and a stuck rename together open.
+- If the next Commit can't finish the journal either, it isn't made, and gives `Backend`.
+  `Pending` would say it had happened. `open` logs the failure and opens anyway, since reads show
+  the Commit; only a journal that can't be read stops it.
 - The lock only keeps out other tidings Commits. A program outside tidings that writes a File
   between step 1 and the end of step 5 is not detected by the Preconditions, and if the Commit
   writes that File, its edit is overwritten. The filesystem has no way to replace a File only if

@@ -337,9 +337,10 @@ matches a Commit this Store made, and *external* otherwise.
     `.<name>.tidings-<commit-id>-<n>`, a name no Path can have;
   - renames, then removing the journal;
   - recovery during `open`.
-- **When renames fail.** They are retried briefly, then `Pending` is returned. While a committed
-  journal still exists, reads of its Paths come from its temporary files, and the next Commit or
-  `open` finishes applying it.
+- **When renames fail.** They are retried briefly, then `Pending` is returned, with the Commit's
+  Changes recorded. While a committed journal still exists, reads of its Paths come from its
+  temporary files, and the next Commit or `open` finishes applying it. A next Commit that can't
+  finish it isn't made, and gives `Backend`; `open` still opens (ADR 0005).
 - **Preconditions.** The checks read and hash contents from disk, so edits by other programs
   count as changes. A Prefix Revision means reading and hashing every File under the Prefix, both
   when `stat_prefix` is called and when the Commit checks it. That is cheap for a config directory
@@ -428,6 +429,7 @@ matches a Commit this Store made, and *external* otherwise.
   - after the `committed` journal is written;
   - after each rename;
   - rename fails (standing in for Windows' "file in use");
+  - a pause point, which holds a Commit until the test releases it, for testing cancellation;
   - the watcher fails.
 
   A crash test stops a Commit at a point, drops the Store without any cleanup, opens it again, and

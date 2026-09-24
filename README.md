@@ -7,11 +7,10 @@ change feed.
 Status: early. Stores in memory, on SQLite and on the filesystem exist so far: reading, stat and
 listing, commits of writes and deletes with preconditions, checked paths, the change feed,
 snapshots (not on the filesystem), and on SQLite, seeing other processes' commits to the same
-databases. On the filesystem, commits are journaled, and opening a store recovers one a crash
-interrupted. Still to come on the filesystem: recovery tested at every step, `Pending` when a
-rename keeps failing, and watching, so that other processes' commits and people's edits reach the
-change feed, with the resyncs that come with it. Then the blocking API. See
-[CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
+databases. On the filesystem, commits are journaled, recovery is tested at every step, and a
+commit whose rename keeps failing gives `Pending`. Still to come on the filesystem: watching, so
+that other processes' commits and people's edits reach the change feed, with the resyncs that
+come with it. Then the blocking API. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
 
 ## Consistency
 
@@ -48,7 +47,13 @@ change feed, with the resyncs that come with it. Then the blocking API. See
 - Changes say which path changed, not what it now contains.
 - A read always returns a whole file, never a partly written one.
 - On the filesystem, a commit that a crash interrupts is finished when a store next opens the area
-  or commits to it, if it had happened, and discarded if it hadn't.
+  or commits to it, if it had happened, and discarded if it hadn't. Until then, reads through
+  tidings show it finished if it had happened.
+- On the filesystem, a commit can give `Error::Pending`, when a file can't be replaced even after
+  trying again for a moment (on Windows, while another program has it open). The commit has
+  happened: its changes are reported, and reads through tidings show it. The next commit to the
+  area, or opening a store, finishes it. If that still fails, the next commit gives
+  `Error::Backend` and isn't made, and opening a store still works.
 - A commit can require that files, or everything under a prefix, are unchanged since you read
   them, and fails with a conflict otherwise, writing nothing and naming the paths that differ. A
   precondition you stage always has to hold, even if something staged later replaces the write or
@@ -72,7 +77,9 @@ change feed, with the resyncs that come with it. Then the blocking API. See
 - No size limit or eviction for the cache area.
 - Backends are defined in this crate. You cannot plug in your own.
 - On the filesystem, other programs can see a commit half-applied. Readers going through tidings
-  can't.
+  can't, with one exception: until a commit that gave `Pending`, or that a crash interrupted, is
+  finished, another path that is the same file as one it writes or deletes, through a symlink, is
+  read as it is on disk.
 - On the filesystem, files other programs make are read and listed like any other, but names that
   aren't valid paths (not in NFC form, not UTF-8, or reserved on Windows) are left out of listings,
   prefix revisions and prefix deletes. Two names that differ only in letter case, made by another

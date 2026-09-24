@@ -25,8 +25,8 @@ use crate::backend::sqlite::{SqliteBackend, SqlitePoller};
 use crate::backend::{Backend, CommitRequest, Observed, memory::MemoryBackend};
 use crate::change::{self, FeedSender};
 use crate::{
-    Area, ChangeFeed, Committed, File, IntoPath, IntoPrefix, Origin, Path, PrefixRevision, Result,
-    Snapshot, Staging, Stat,
+    Area, ChangeFeed, Committed, Error, File, IntoPath, IntoPrefix, Origin, Path, PrefixRevision,
+    Result, Snapshot, Staging, Stat,
 };
 
 /// What an application opens to reach its Files: all three Areas, held by one Backend.
@@ -124,8 +124,10 @@ impl Store {
     /// people can see and edit them. The directories are the Area's standard directory for `app`,
     /// or are under the Root override in `options`. Opening makes each of them, and the
     /// `.tidings/` directory tidings keeps in each, if they don't exist. If a crash interrupted a
-    /// Commit, opening finishes it if it had happened, and discards it if it hadn't. Returns the
-    /// Store together with its one Change feed.
+    /// Commit, opening finishes it if it had happened, and discards it if it hadn't. So it does a
+    /// Commit that gave [`Error::Pending`](crate::Error::Pending). If one that happened still
+    /// can't be finished, the Store opens anyway, and reads show the Commit. Returns the Store
+    /// together with its one Change feed.
     ///
     /// Other processes can open the same directories, and commit to them safely: Commits are
     /// applied one at a time. Their Commits, and edits made to the Files by other programs, don't
@@ -133,8 +135,8 @@ impl Store {
     ///
     /// The filesystem has no Snapshots: see [`supports_snapshots`](Self::supports_snapshots).
     ///
-    /// Gives [`Error::Backend`](crate::Error::Backend) if a directory can't be made, or an
-    /// interrupted Commit can't be finished.
+    /// Gives [`Error::Backend`](crate::Error::Backend) if a directory can't be made, or the
+    /// record of an interrupted Commit can't be read.
     ///
     /// # Panics
     ///
@@ -250,6 +252,12 @@ impl Store {
     ///   [`LetterCaseClash`](crate::InvalidPathReason::LetterCaseClash) if a write would create a
     ///   Path that differs only in letter case from another Path in the Area.
     ///
+    /// On the filesystem, a Commit can also give [`Error::Pending`](crate::Error::Pending): it has
+    /// happened, and its Changes arrive as usual, but a File couldn't be replaced yet, even after
+    /// trying again for a moment. Reads show the Commit, and the next Commit to the Area, or
+    /// opening a Store, finishes it. If that still can't finish it, the next Commit gives
+    /// [`Error::Backend`](crate::Error::Backend), and isn't made.
+    ///
     /// A Commit can be cancelled, for example with a timeout, by dropping this future. If it is
     /// dropped while the Commit waits for the Commits before it to finish, the Commit never
     /// happens. Once the Commit has started, dropping this future hands the rest of it to a task
@@ -277,6 +285,9 @@ impl Store {
             let outcome = inner.backend.commit(request).await?;
             record_observed(&inner.feed, area, outcome.observed_before);
             inner.feed.record(area, outcome.changes, Origin::Local);
+            if outcome.pending {
+                return Err(Error::Pending);
+            }
             Ok(Committed::new(timestamp, outcome.revisions))
         };
         Started { commit: Some(Box::pin(commit)), runtime: Handle::current() }.await

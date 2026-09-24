@@ -14,9 +14,9 @@ Named failure points in test builds make every one of these cases testable on Li
 
 **Blocked by:** 09
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Named failure points exist only with the `testing` feature, using the `fail` crate or a
+- [x] Named failure points exist only with the `testing` feature, using the `fail` crate or a
       small equivalent. The points are:
       - after the `prepared` journal is written;
       - after each temporary file is written;
@@ -24,19 +24,19 @@ Named failure points in test builds make every one of these cases testable on Li
       - after each rename;
       - a rename that fails;
       - a pause point for testing cancellation.
-- [ ] For every point, a test stops the Commit there, drops the Store without cleanup, opens it
+- [x] For every point, a test stops the Commit there, drops the Store without cleanup, opens it
       again, and checks through the public API that the Commit is fully applied or fully absent,
       with no temporary files left over.
-- [ ] A rename that keeps failing after brief retries gives `Pending`. Until the renames are
+- [x] A rename that keeps failing after brief retries gives `Pending`. Until the renames are
       finished, reads of the affected Paths return the committed contents. The next Commit or
       `open` finishes the renames.
-- [ ] A filesystem Commit whose future is dropped once it has started runs to completion in the
+- [x] A filesystem Commit whose future is dropped once it has started runs to completion in the
       background, and its Changes still arrive on the feed, tested with the pause point. The
       mechanism is the Store layer's and already exists (ticket 07's review): a Commit dropped
       once it has its turn is handed to a task that finishes it, and the shared suite's
       `a_cancelled_commit_finishes_or_never_happens_and_is_reported_if_it_finishes` covers it on
       every Backend. The pause point lets a test drop the future mid-journal for certain.
-- [ ] Journal recovery is logged through `tracing` at debug level.
+- [x] Journal recovery is logged through `tracing` at debug level.
 
 **Notes from ticket 09:**
 
@@ -55,3 +55,47 @@ Named failure points in test builds make every one of these cases testable on Li
   and the retries go. Reads don't yet look at a committed journal.
 - A Commit that only deletes writes its journal once, as `committed`, so `AfterPreparedJournal`
   and `AfterTemporaryFile` never stop it.
+
+**Notes from ticket 10:**
+
+- **Failure points.** Still the small per-Store equivalent of the `fail` crate from ticket 09,
+  with `testing` only. `FailurePoint::RenameFails { n, times }` makes the rename of the Commit's
+  `n`th write fail the first `times` times it is tried through the Store, counting retries and
+  the Commits and `open` that finish it later (`usize::MAX` keeps failing). The pause point is
+  `FsOptions::pause_at(point, &Pause)`: each Commit through the Store waits at `point` (any place
+  `fail_at` can stop) until `Pause::release`, and `Pause::reached().await` says one is there. A
+  held Commit waits a minute at most, so a failing test can't hang the runtime.
+- **The crash matrix** replaces ticket 09's three piecemeal crash tests. `stop_everywhere(shape)`
+  runs one shape of Commit through every point (`AfterPreparedJournal`, each
+  `AfterTemporaryFile(n)`, `AfterCommittedJournal`, `AfterDeletes`, each `AfterRename(n)` and
+  each `RenameFails { n, usize::MAX }`), each on a fresh Area. What "all there" looks like comes
+  from committing the shape without stopping; "not there" is what the Area held before. It checks
+  a Store that was open already (as in another process) before anything finishes the Commit, then
+  a Store opened afterwards, no temporary files, and that every symlink is still a symlink. The
+  shapes: a write (one File replaced, one in a new directory), a write and a delete, a Prefix
+  delete (journal written once), the moves `a` → `a/b` and `d/e` → `d`, and a write through a
+  symlink (Unix). The pause point isn't in the matrix: a held Commit can't be dropped without its
+  thread going on, so it is tested by the cancellation test instead, and stopping at the same
+  places is what the matrix does.
+- **`Pending`.** Finishing is retried after 10, 50 and 200 ms, as finishing again (Revision-guarded
+  deletes, renamed temporary files skipped). A stop at a failure point is never retried (it
+  models the process dying). Then the Backend returns its `CommitOutcome` with `pending: true`,
+  the Store layer records the Changes and gives `Error::Pending`, so the Changes arrive once,
+  including from a dropped Commit's task. Finishing it later reports nothing.
+- **Reads while a `committed` journal is there** (`Unfinished` in journal.rs): a Path the Commit
+  writes is read from its temporary file until that is renamed, and a Path it deletes is absent if
+  the File there has the journaled Revision. `list` and `stat_prefix` apply the same. This also
+  covers a Commit that crashed after `committed` and a Commit being finished right then. The
+  journal's `replace` line now records the Path too, so that a write through a symlink is found by
+  its Path. Preconditions need none of it, since a Commit finishes the journal first.
+- **Choices recorded in ADR 0005:** only the Commit's own Paths are looked up, so another Path that
+  is the same file through a symlink reads as on disk until it is finished (README Limitations).
+  A next Commit that still can't finish the journal gives `Backend` and isn't made, rather than
+  `Pending`, which would say it had happened. `open` logs that and opens anyway; only a journal
+  that can't be read stops it.
+- **Logging.** Discarding or finishing a journal left behind, each retry, a `Pending` Commit and a
+  journal `open` leaves unfinished are logged at debug level. There is no test of the logging.
+- **Not done:** if writing the `committed` journal itself reports a failure after the rename did
+  land (the directory fsync failing, say), the Commit gives `Backend` though it happened, and its
+  Changes aren't reported. It is finished later as usual. Telling the two apart would mean reading
+  the journal back.

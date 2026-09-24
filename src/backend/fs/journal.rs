@@ -1,14 +1,15 @@
 //! The journal of ADR 0005: `.tidings/journal`, which says what a filesystem Commit is doing, so
 //! that one a crash interrupts can be finished or discarded the next time the Area is locked.
 //!
-//! It lists each temporary file with the File it replaces, and each Path the Commit deletes with
-//! the Revision of the File it deletes. A File a write replaces is either a Path, whose directories
-//! finishing may make, or, for a write through a symlink, the file the link points to, whose
-//! directory must exist. It is in one of two states:
+//! It lists each temporary file with the Path it writes and the File it replaces, and each Path
+//! the Commit deletes with the Revision of the File it deletes. A File a write replaces is either
+//! the File at its Path, whose directories finishing may make, or, for a write through a symlink,
+//! the file the link points to, whose directory must exist. It is in one of two states:
 //! - **prepared**: the temporary files may be partly written, and the Commit hasn't happened. It
 //!   is discarded: its temporary files are removed.
 //! - **committed**: every temporary file is written and on disk, and the Commit has happened. It
-//!   is finished: the deletes are made and the temporary files renamed.
+//!   is finished: the deletes are made and the temporary files renamed. Until it is, reads through
+//!   tidings see the Area as it will be once it is ([`Unfinished`]).
 //!
 //! Finishing a Commit again, after a crash part way through or just before the journal was
 //! removed, leaves the Area as finishing it once did:
@@ -26,11 +27,12 @@
 //! renames it over the journal, so the journal is always whole. It is plain text: a first line
 //! that names the format, a line with the state, then a line for each item, with fields separated
 //! by tabs, and `\`, tabs and line breaks escaped:
-//! - `write`, the temporary file, and the Path it replaces;
-//! - `replace`, the temporary file, and the file a symlink points to that it replaces;
+//! - `write`, the temporary file, and the Path whose File it replaces;
+//! - `replace`, the temporary file, the Path it writes, and the file that Path's symlink points
+//!   to, which it replaces;
 //! - `remove`, the Path, and the Revision of the File it deletes, in hexadecimal.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path as FsPath, PathBuf};
@@ -62,9 +64,10 @@ enum State {
     Committed,
 }
 
-/// A temporary file, and the File it replaces once the Commit has happened.
+/// A temporary file, the Path it writes, and the File it replaces once the Commit has happened.
 #[derive(Debug, Clone)]
 pub(super) struct Replace {
+    pub(super) path: Path,
     pub(super) temporary: PathBuf,
     pub(super) target: Target,
 }
@@ -72,9 +75,9 @@ pub(super) struct Replace {
 /// The File a temporary file replaces.
 #[derive(Debug, Clone)]
 pub(super) enum Target {
-    /// The File at a Path, whose directories finishing makes if they don't exist.
-    Path(Path),
-    /// The file a symlink at a Path points to, anywhere, in a directory that exists.
+    /// The File at the Path written, whose directories finishing makes if they don't exist.
+    Own,
+    /// The file the symlink at the Path written points to, anywhere, in a directory that exists.
     Linked(PathBuf),
 }
 
@@ -85,31 +88,71 @@ pub(super) struct Remove {
     pub(super) revision: Revision,
 }
 
-impl Target {
+/// A Commit left in the journal once it was committed, and not yet finished, as reads through
+/// tidings see it. They see the Area as finishing it will leave it: each Path it writes as its
+/// temporary file, until that is renamed, and each Path it deletes as absent, if the File there is
+/// the one it deletes, as finishing deletes only that one.
+#[derive(Debug, Default)]
+pub(super) struct Unfinished {
+    /// The temporary file of each Path the Commit writes.
+    pub(super) written: BTreeMap<Path, PathBuf>,
+    /// Each Path the Commit deletes, with the Revision of the File it deletes.
+    pub(super) removed: BTreeMap<Path, Revision>,
+}
+
+impl Replace {
     /// Where the file this replaces is on disk, in the Area whose root is `root`.
     pub(super) fn on_disk(&self, root: &FsPath) -> PathBuf {
-        match self {
-            Target::Path(path) => on_disk(root, path.as_str()),
+        match &self.target {
+            Target::Own => on_disk(root, self.path.as_str()),
             Target::Linked(target) => target.clone(),
         }
     }
 }
 
-/// Finishes or discards the Commit in the journal of `area`, if there is one. It must be called
-/// with the Area locked.
-pub(super) fn recover(area: &AreaRoot) -> Result<()> {
+impl Unfinished {
+    /// The Commit in the journal in `tidings` that isn't finished, if the journal is committed,
+    /// or nothing.
+    pub(super) fn read(tidings: &FsPath) -> Result<Unfinished> {
+        let Some(journal) = Journal::read(tidings)? else { return Ok(Unfinished::default()) };
+        if journal.state != State::Committed {
+            return Ok(Unfinished::default());
+        }
+        let written = journal.replaces.into_iter().map(|replace| (replace.path, replace.temporary));
+        let removed = journal.removes.into_iter().map(|remove| (remove.path, remove.revision));
+        Ok(Unfinished { written: written.collect(), removed: removed.collect() })
+    }
+}
+
+/// What [`recover`] did.
+pub(super) enum Recovery {
+    /// There was no Commit left in the journal, or there was and it is finished or discarded now.
+    Done,
+    /// The Commit left in the journal couldn't be finished or discarded, for this reason, even
+    /// after trying again. It is still there.
+    Left(Error),
+}
+
+/// Finishes or discards the Commit left in the journal of `area`, by a crash or by a Commit that
+/// couldn't finish, if there is one. It must be called with the Area locked. It gives an error
+/// only if the journal can't be read.
+pub(super) fn recover(area: &AreaRoot) -> Result<Recovery> {
     let tidings = area.tidings();
-    let Some(journal) = Journal::read(&tidings)? else { return Ok(()) };
-    match journal.state {
+    let Some(journal) = Journal::read(&tidings)? else { return Ok(Recovery::Done) };
+    let recovered = match journal.state {
         State::Prepared => {
-            tracing::debug!("discarding a Commit to {} a crash interrupted", area.root.display());
+            tracing::debug!("discarding a Commit to {} that never happened", area.root.display());
             journal.discard(&tidings)
         }
         State::Committed => {
-            tracing::debug!("finishing a Commit to {} a crash interrupted", area.root.display());
-            journal.finish(area, true)
+            tracing::debug!("finishing a Commit to {} left unfinished", area.root.display());
+            area.finish(&journal, true)
         }
-    }
+    };
+    Ok(match recovered {
+        Ok(()) => Recovery::Done,
+        Err(error) => Recovery::Left(error),
+    })
 }
 
 impl Journal {
@@ -177,17 +220,20 @@ impl Journal {
             not(feature = "testing"),
             expect(clippy::unused_enumerate_index, reason = "the number names a failure point")
         )]
-        for (_n, Replace { temporary, target }) in self.replaces.iter().enumerate() {
+        for (_n, replace) in self.replaces.iter().enumerate() {
+            let Replace { path, temporary, target } = replace;
             if present_at(fs::symlink_metadata(temporary), temporary)?.is_none() {
                 continue;
             }
-            if let Target::Path(path) = target {
+            if let Target::Own = target {
                 area.make_directories(path, &mut changed)?;
             }
-            let target = target.on_disk(root);
+            let target = replace.on_disk(root);
             if fs::symlink_metadata(&target).is_ok_and(|there| there.is_dir()) {
                 remove_empty_directories(&target).map_err(|error| failed(&target, error))?;
             }
+            #[cfg(feature = "testing")]
+            area.rename_fails(_n).map_err(|error| failed(temporary, error))?;
             fs::rename(temporary, &target).map_err(|error| failed(temporary, error))?;
             changed.extend(temporary.parent().map(FsPath::to_path_buf));
             changed.extend(target.parent().map(FsPath::to_path_buf));
@@ -224,12 +270,13 @@ impl Journal {
             let fields: Vec<String> = line.split('\t').map(unescape).collect();
             match fields.as_slice() {
                 [kind, temporary, path] if kind == "write" => {
-                    let target = Target::Path(parse_path(path)?);
-                    journal.replaces.push(Replace { temporary: temporary.into(), target });
+                    let (path, temporary) = (parse_path(path)?, temporary.into());
+                    journal.replaces.push(Replace { path, temporary, target: Target::Own });
                 }
-                [kind, temporary, target] if kind == "replace" => {
+                [kind, temporary, path, target] if kind == "replace" => {
+                    let (path, temporary) = (parse_path(path)?, temporary.into());
                     let target = Target::Linked(target.into());
-                    journal.replaces.push(Replace { temporary: temporary.into(), target });
+                    journal.replaces.push(Replace { path, temporary, target });
                 }
                 [kind, path, revision] if kind == "remove" => {
                     let revision = from_hex(revision).ok_or_else(|| {
@@ -250,11 +297,13 @@ impl Journal {
             State::Committed => "committed",
         };
         let mut text = format!("{FORMAT}\n{state}\n");
-        for Replace { temporary, target } in &self.replaces {
-            let temporary = escaped(temporary)?;
+        for Replace { path, temporary, target } in &self.replaces {
+            let (temporary, path) = (escaped(temporary)?, escape(path.as_str()));
             text += &match target {
-                Target::Path(path) => format!("write\t{temporary}\t{}\n", escape(path.as_str())),
-                Target::Linked(target) => format!("replace\t{temporary}\t{}\n", escaped(target)?),
+                Target::Own => format!("write\t{temporary}\t{path}\n"),
+                Target::Linked(target) => {
+                    format!("replace\t{temporary}\t{path}\t{}\n", escaped(target)?)
+                }
             };
         }
         for Remove { path, revision } in &self.removes {

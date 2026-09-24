@@ -141,9 +141,11 @@ mod fs {
 
     use tempfile::TempDir;
     use tidings::{
-        AppIdentity, Area, Error, FailurePoint, FsOptions, InvalidPathReason, Staging, Store,
+        AppIdentity, Area, ChangeKind, Error, FailurePoint, FsOptions, InvalidPathReason, Pause,
+        Staging, Store,
     };
 
+    use crate::common::{assert_nothing_more, changes, next_batch};
     use crate::suite::{Fixture, Opened};
 
     /// Opens each test's Store under a temporary Root override of its own, removed when the test
@@ -377,62 +379,34 @@ mod fs {
         assert_eq!(temporary_files(fixture.root.path()), Vec::<PathBuf>::new());
     }
 
-    /// A crash before the journal is committed leaves a Commit that never happened, which the
-    /// next Store to open the Area discards, temporary files and all.
+    /// A Commit stopped at any point, as if the process had died there, is all there or not
+    /// there at all once a Store opens the Area again, with no temporary file left behind. So is
+    /// one whose rename keeps failing, which reads show as all there before then. Each of these
+    /// runs every shape of Commit that [`Shape`] names through every point.
     #[tokio::test]
-    async fn a_commit_interrupted_before_it_was_committed_never_happens() {
-        for point in [FailurePoint::AfterPreparedJournal, FailurePoint::AfterTemporaryFile(1)] {
-            let fixture = Fs::new();
-            let Opened { store, feed: _feed } = fixture.open().await;
-            let mut staging = Staging::new(Area::Data);
-            staging.write("kept.txt", "old").unwrap();
-            staging.write("gone.txt", "gone").unwrap();
-            store.commit(staging).await.unwrap();
-            drop(store);
-
-            let Opened { store, feed: _feed } =
-                fixture.open_with(|options| options.fail_at(point)).await;
-            let mut staging = Staging::new(Area::Data);
-            staging.write("kept.txt", "new").unwrap();
-            staging.write("new/file.txt", "new").unwrap();
-            staging.delete("gone.txt").unwrap();
-            let stopped = store.commit(staging).await;
-            assert!(matches!(stopped, Err(Error::Backend(_))), "{point:?}: {stopped:?}");
-            drop(store);
-
-            let Opened { store, feed: _feed } = fixture.open().await;
-            let listed = list(&store, Area::Data).await;
-            assert_eq!(listed, ["gone.txt", "kept.txt"], "{point:?}");
-            let kept = store.read(Area::Data, "kept.txt").await.unwrap().unwrap();
-            assert_eq!(kept.contents(), "old", "{point:?}");
-            assert!(!fixture.on_disk(Area::Data, "new").exists(), "{point:?}");
-            assert_eq!(temporary_files(fixture.root.path()), Vec::<PathBuf>::new(), "{point:?}");
-        }
+    async fn a_write_is_all_or_nothing_wherever_it_stops() {
+        stop_everywhere(Shape::WRITE).await;
     }
 
-    /// A crash once the journal is committed leaves a Commit that has happened, which the next
-    /// Store to open the Area finishes. That includes moving Files where directories were, and
-    /// directories where Files were.
     #[tokio::test]
-    async fn a_commit_interrupted_once_it_was_committed_is_finished_when_a_store_opens() {
-        let fixture = Fs::new();
-        let Opened { store, feed: _feed } = fixture.open().await;
-        let mut staging = Staging::new(Area::Data);
-        staging.write("a", "a").unwrap();
-        staging.write("d/e", "e").unwrap();
-        staging.write("kept.txt", "old").unwrap();
-        store.commit(staging).await.unwrap();
-        drop(store);
+    async fn a_write_and_a_delete_are_all_or_nothing_wherever_they_stop() {
+        stop_everywhere(Shape::WRITE_AND_DELETE).await;
+    }
 
-        let Opened { store, feed: _feed } =
-            fixture.open_with(|options| options.fail_at(FailurePoint::AfterCommittedJournal)).await;
-        let stopped = store.commit(moves()).await;
-        assert!(matches!(stopped, Err(Error::Backend(_))), "{stopped:?}");
-        drop(store);
+    #[tokio::test]
+    async fn a_prefix_delete_is_all_or_nothing_wherever_it_stops() {
+        stop_everywhere(Shape::PREFIX_DELETE).await;
+    }
 
-        let Opened { store, feed: _feed } = fixture.open().await;
-        assert_moved(&store).await;
-        assert_eq!(temporary_files(fixture.root.path()), Vec::<PathBuf>::new());
+    #[tokio::test]
+    async fn moves_between_a_file_and_a_prefix_are_all_or_nothing_wherever_they_stop() {
+        stop_everywhere(Shape::MOVES).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_write_through_a_symlink_is_all_or_nothing_wherever_it_stops() {
+        stop_everywhere(Shape::THROUGH_A_SYMLINK).await;
     }
 
     /// A Store that was already open when another one's Commit was interrupted, as another
@@ -441,11 +415,7 @@ mod fs {
     async fn the_next_commit_finishes_a_commit_that_was_interrupted_once_committed() {
         let fixture = Fs::new();
         let Opened { store: other, feed: _other_feed } = fixture.open().await;
-        let mut staging = Staging::new(Area::Data);
-        staging.write("a", "a").unwrap();
-        staging.write("d/e", "e").unwrap();
-        staging.write("kept.txt", "old").unwrap();
-        other.commit(staging).await.unwrap();
+        other.commit(before_moves()).await.unwrap();
 
         let Opened { store, feed: _feed } =
             fixture.open_with(|options| options.fail_at(FailurePoint::AfterCommittedJournal)).await;
@@ -462,36 +432,6 @@ mod fs {
         other.commit(staging).await.unwrap();
         assert_moved(&other).await;
         assert_eq!(temporary_files(fixture.root.path()), Vec::<PathBuf>::new());
-    }
-
-    /// A crash while a committed Commit is being finished leaves it partly finished, which the
-    /// next Store to open the Area finishes. Finishing it again after the last rename, too, as
-    /// after a crash just before the journal was removed, leaves the Area as finishing it once
-    /// did.
-    #[tokio::test]
-    async fn a_commit_interrupted_while_finishing_is_finished_when_a_store_opens() {
-        use FailurePoint::{AfterDeletes, AfterRename};
-        // `moves` writes `a/b`, `d` and `kept.txt`, in that order.
-        for point in [AfterDeletes, AfterRename(0), AfterRename(1), AfterRename(2)] {
-            let fixture = Fs::new();
-            let Opened { store, feed: _feed } = fixture.open().await;
-            let mut staging = Staging::new(Area::Data);
-            staging.write("a", "a").unwrap();
-            staging.write("d/e", "e").unwrap();
-            staging.write("kept.txt", "old").unwrap();
-            store.commit(staging).await.unwrap();
-            drop(store);
-
-            let Opened { store, feed: _feed } =
-                fixture.open_with(|options| options.fail_at(point)).await;
-            let stopped = store.commit(moves()).await;
-            assert!(matches!(stopped, Err(Error::Backend(_))), "{point:?}: {stopped:?}");
-            drop(store);
-
-            let Opened { store, feed: _feed } = fixture.open().await;
-            assert_moved(&store).await;
-            assert_eq!(temporary_files(fixture.root.path()), Vec::<PathBuf>::new(), "{point:?}");
-        }
     }
 
     /// Finishing a Commit again deletes a File only if it is still the one the Commit deleted. A
@@ -643,7 +583,266 @@ mod fs {
         assert_eq!(temporary_files(fixture.root.path()), Vec::<PathBuf>::new());
     }
 
+    /// A rename that fails, as one does on Windows while another program has the File open, is
+    /// tried again after a moment. If it works then, the Commit finishes as usual.
+    #[tokio::test]
+    async fn a_rename_that_fails_for_a_moment_is_tried_again() {
+        let fixture = Fs::new();
+        let point = FailurePoint::RenameFails { n: 1, times: 1 };
+        let Opened { store, mut feed } = fixture.open_with(|options| options.fail_at(point)).await;
+        let mut staging = Staging::new(Area::Data);
+        staging.write("a.txt", "a").unwrap();
+        staging.write("b.txt", "b").unwrap();
+        store.commit(staging).await.unwrap();
+
+        assert_eq!(list(&store, Area::Data).await, ["a.txt", "b.txt"]);
+        let file = store.read(Area::Data, "b.txt").await.unwrap().unwrap();
+        assert_eq!(file.contents(), "b");
+        assert_eq!(
+            changes(&next_batch(&mut feed).await),
+            [("a.txt", ChangeKind::Changed), ("b.txt", ChangeKind::Changed)],
+        );
+        assert_eq!(temporary_files(fixture.root.path()), Vec::<PathBuf>::new());
+    }
+
+    /// A rename that keeps failing gives `Pending`: the Commit has happened, and its Changes
+    /// arrive once, but it isn't finished. Until it is, reads through tidings show it, and a
+    /// Store can still open. The next Commit finishes it first, or if it still can't, isn't made.
+    #[tokio::test]
+    async fn a_rename_that_keeps_failing_gives_pending_and_reads_show_the_commit() {
+        let fixture = Fs::new();
+        let Opened { store, feed: _feed } = fixture.open().await;
+        store.commit(before_moves()).await.unwrap();
+        drop(store);
+        let Opened { store: other, feed: _other_feed } = fixture.open().await;
+
+        // `moves` writes `a/b`, `d` and `kept.txt`, in that order. Its deletes are made and `a/b`
+        // is renamed, but `d` is never renamed, so neither is `kept.txt`.
+        let failing = FailurePoint::RenameFails { n: 1, times: usize::MAX };
+        let Opened { store, mut feed } =
+            fixture.open_with(|options| options.fail_at(failing)).await;
+        let pending = store.commit(moves()).await;
+        assert!(matches!(pending, Err(Error::Pending)), "{pending:?}");
+        assert_eq!(
+            changes(&next_batch(&mut feed).await),
+            [
+                ("a", ChangeKind::Removed),
+                ("a/b", ChangeKind::Changed),
+                ("d", ChangeKind::Changed),
+                ("d/e", ChangeKind::Removed),
+                ("kept.txt", ChangeKind::Changed),
+            ],
+        );
+        assert_moved(&store).await;
+        let mut modified = Vec::new();
+        for path in ["a/b", "d", "kept.txt"] {
+            let file = store.read(Area::Data, path).await.unwrap().unwrap();
+            let stat = store.stat(Area::Data, path).await.unwrap().unwrap();
+            assert_eq!((stat.modified(), stat.revision()), (file.modified(), file.revision()));
+            modified.push(stat.modified());
+        }
+        assert!(modified.iter().all(|time| *time == modified[0]), "{modified:?}");
+        let prefix_revision = store.stat_prefix(Area::Data, "").await.unwrap();
+
+        // Finishing it still fails, so the next Commit through this Store isn't made.
+        let mut staging = Staging::new(Area::Data);
+        staging.write("later.txt", "later").unwrap();
+        let refused = store.commit(staging).await;
+        assert!(matches!(refused, Err(Error::Backend(_))), "{refused:?}");
+        assert_moved(&store).await;
+        assert_nothing_more(&mut feed).await;
+
+        // A Store opens while finishing still fails, and shows the Commit too.
+        drop(store);
+        let Opened { store, feed: _feed } =
+            fixture.open_with(|options| options.fail_at(failing)).await;
+        assert_moved(&store).await;
+        assert_eq!(store.stat_prefix(Area::Data, "").await.unwrap(), prefix_revision);
+
+        // Another Store's next Commit finishes it, and its Preconditions hold against it.
+        let kept = other.read(Area::Data, "kept.txt").await.unwrap().unwrap();
+        let mut staging = Staging::new(Area::Data);
+        staging.write_back(&kept, "newer");
+        staging.require_prefix("", prefix_revision.clone()).unwrap();
+        other.commit(staging).await.unwrap();
+        for store in [&store, &other] {
+            assert_eq!(list(store, Area::Data).await, ["a/b", "d", "kept.txt"]);
+            let kept = store.read(Area::Data, "kept.txt").await.unwrap().unwrap();
+            assert_eq!(kept.contents(), "newer");
+        }
+        assert_eq!(temporary_files(fixture.root.path()), Vec::<PathBuf>::new());
+    }
+
+    /// A Commit whose future is dropped once it has started still finishes, in the background,
+    /// and its Changes arrive. Here it is dropped for certain while it is held half way through,
+    /// with its journal `prepared` and one temporary file written.
+    #[tokio::test]
+    async fn a_commit_dropped_part_way_through_still_finishes_and_is_reported() {
+        let fixture = Fs::new();
+        let pause = Pause::new();
+        let point = FailurePoint::AfterTemporaryFile(0);
+        let Opened { store, mut feed } =
+            fixture.open_with(|options| options.pause_at(point, &pause)).await;
+
+        let commit = store.commit(staged(&[("a.txt", "a"), ("b.txt", "b")], &[]));
+        tokio::select! {
+            biased;
+            finished = commit => panic!("the Commit finished while held: {finished:?}"),
+            () = pause.reached() => {}
+        }
+        // The Commit's future is dropped. Nothing of it shows yet.
+        assert_eq!(list(&store, Area::Data).await, Vec::<String>::new());
+        pause.release();
+
+        assert_eq!(
+            changes(&next_batch(&mut feed).await),
+            [("a.txt", ChangeKind::Changed), ("b.txt", ChangeKind::Changed)],
+        );
+        assert_nothing_more(&mut feed).await;
+        let written = [("a.txt", "a"), ("b.txt", "b")].map(|(p, c)| (p.to_owned(), c.to_owned()));
+        assert_eq!(contents(&store).await, written);
+        assert_eq!(temporary_files(fixture.root.path()), Vec::<PathBuf>::new());
+    }
+
     // Helpers shared by the tests above.
+
+    /// A shape of Commit that the crash tests stop at every point: what the Area holds before,
+    /// and the Commit.
+    struct Shape {
+        /// Makes what the Area holds before, with the Staging it gives and anything else.
+        set_up: fn(&Fs) -> Staging,
+        commit: fn() -> Staging,
+        /// How many Files the Commit writes.
+        writes: usize,
+    }
+
+    impl Shape {
+        /// Writes one File and makes another in a new directory.
+        const WRITE: Shape = Shape {
+            set_up: |_| staged(&[("kept.txt", "old")], &[]),
+            commit: || staged(&[("kept.txt", "new"), ("new/file.txt", "new")], &[]),
+            writes: 2,
+        };
+        const WRITE_AND_DELETE: Shape = Shape {
+            set_up: |_| staged(&[("kept.txt", "old"), ("gone.txt", "gone")], &[]),
+            commit: || staged(&[("kept.txt", "new")], &["gone.txt"]),
+            writes: 1,
+        };
+        /// Only deletes, so its journal is written only once, as `committed`.
+        const PREFIX_DELETE: Shape = Shape {
+            set_up: |_| staged(&[("p/1", "1"), ("p/q/2", "2"), ("kept.txt", "old")], &[]),
+            commit: || {
+                let mut staging = Staging::new(Area::Data);
+                staging.delete_prefix("p/").unwrap();
+                staging
+            },
+            writes: 0,
+        };
+        /// [`moves`].
+        const MOVES: Shape = Shape { set_up: |_| before_moves(), commit: moves, writes: 3 };
+        /// Writes `settings.toml`, a symlink to a File outside the Area, and `kept.txt`.
+        #[cfg(unix)]
+        const THROUGH_A_SYMLINK: Shape = Shape {
+            set_up: |fixture| {
+                let dotfiles = fixture.root.path().join("dotfiles");
+                std::fs::create_dir_all(&dotfiles).unwrap();
+                std::fs::write(dotfiles.join("settings.toml"), "old").unwrap();
+                let link = fixture.on_disk(Area::Data, "settings.toml");
+                std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+                std::os::unix::fs::symlink("../dotfiles/settings.toml", link).unwrap();
+                staged(&[("kept.txt", "old")], &[])
+            },
+            commit: || staged(&[("kept.txt", "new"), ("settings.toml", "new")], &[]),
+            writes: 2,
+        };
+    }
+
+    /// Every point a Commit that writes `writes` Files can stop at, and whether stopping there
+    /// leaves it not there at all, since it stopped before its journal was committed. Stopping
+    /// before any temporary file is written never happens to a Commit that writes none.
+    fn every_point(writes: usize) -> Vec<(FailurePoint, bool)> {
+        use FailurePoint::*;
+        let mut points = vec![(AfterPreparedJournal, writes > 0)];
+        points.extend((0..writes).map(|n| (AfterTemporaryFile(n), true)));
+        points.extend([(AfterCommittedJournal, false), (AfterDeletes, false)]);
+        points.extend((0..writes).map(|n| (AfterRename(n), false)));
+        points.extend((0..writes).map(|n| (RenameFails { n, times: usize::MAX }, false)));
+        points
+    }
+
+    /// Stops `shape`'s Commit at every point in turn, each on an Area of its own, and checks that
+    /// it is all there or not there at all, through a Store opened afterwards. Before that Store
+    /// finishes it, a Store that was open already, as in another process, reads it the same way.
+    /// A rename that keeps failing gives `Pending`, and reads show the Commit all there already.
+    /// What all there looks like comes from committing the shape without stopping.
+    async fn stop_everywhere(shape: Shape) {
+        let reference = Fs::new();
+        let Opened { store, feed: _feed } = reference.open().await;
+        store.commit((shape.set_up)(&reference)).await.unwrap();
+        store.commit((shape.commit)()).await.unwrap();
+        let applied = contents(&store).await;
+
+        for (point, absent) in every_point(shape.writes) {
+            let fixture = Fs::new();
+            let Opened { store, feed: _feed } = fixture.open().await;
+            store.commit((shape.set_up)(&fixture)).await.unwrap();
+            let before = contents(&store).await;
+            let links = symlinks(fixture.root.path());
+            drop(store);
+            let Opened { store: open_already, feed: _open_already_feed } = fixture.open().await;
+
+            let Opened { store, feed: _feed } =
+                fixture.open_with(|options| options.fail_at(point)).await;
+            let stopped = store.commit((shape.commit)()).await;
+            match (point, &stopped) {
+                (FailurePoint::RenameFails { .. }, Err(Error::Pending)) => {
+                    assert_eq!(contents(&store).await, applied, "{point:?}, pending");
+                }
+                (FailurePoint::AfterPreparedJournal, Ok(_)) if shape.writes == 0 => {}
+                (_, Err(Error::Backend(_))) => {}
+                _ => panic!("{point:?}: {stopped:?}"),
+            }
+            drop(store);
+            let expected = if absent { &before } else { &applied };
+            assert_eq!(&contents(&open_already).await, expected, "{point:?}, open already");
+
+            let Opened { store, feed: _feed } = fixture.open().await;
+            assert_eq!(&contents(&store).await, expected, "{point:?}");
+            assert_eq!(temporary_files(fixture.root.path()), Vec::<PathBuf>::new(), "{point:?}");
+            assert_eq!(symlinks(fixture.root.path()), links, "{point:?}");
+        }
+    }
+
+    /// A Staging for the Data Area that writes `writes` and deletes `deletes`.
+    fn staged(writes: &[(&str, &str)], deletes: &[&str]) -> Staging {
+        let mut staging = Staging::new(Area::Data);
+        for (path, contents) in writes {
+            staging.write(*path, *contents).unwrap();
+        }
+        for path in deletes {
+            staging.delete(*path).unwrap();
+        }
+        staging
+    }
+
+    /// Each Path in the Data Area, with its contents.
+    async fn contents(store: &Store) -> Vec<(String, String)> {
+        let mut contents = Vec::new();
+        for path in list(store, Area::Data).await {
+            let file = store.read(Area::Data, path.as_str()).await.unwrap().unwrap();
+            contents.push((path, file.contents().to_owned()));
+        }
+        contents
+    }
+
+    /// A Commit that writes the Files [`moves`] moves.
+    fn before_moves() -> Staging {
+        let mut staging = Staging::new(Area::Data);
+        staging.write("a", "a").unwrap();
+        staging.write("d/e", "e").unwrap();
+        staging.write("kept.txt", "old").unwrap();
+        staging
+    }
 
     /// A Commit that moves the File `a` to `a/b`, and the File `d/e` to `d`, and changes
     /// `kept.txt`.
@@ -670,6 +869,22 @@ mod fs {
     async fn list(store: &Store, area: Area) -> Vec<String> {
         let paths = store.list(area, "").await.unwrap();
         paths.iter().map(|path| path.as_str().to_owned()).collect()
+    }
+
+    /// Every symlink under `directory`, which isn't followed.
+    fn symlinks(directory: &FsPath) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_symlink() {
+                found.push(entry.path());
+            } else if file_type.is_dir() {
+                found.extend(symlinks(&entry.path()));
+            }
+        }
+        found.sort();
+        found
     }
 
     /// Every file under `directory` named like one of tidings' temporary files.
