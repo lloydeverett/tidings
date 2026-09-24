@@ -5,7 +5,7 @@ use crate::backend::AreaState;
 use crate::path::letter_case_fold;
 use crate::{
     Area, Error, File, IntoPath, IntoPrefix, InvalidPathReason, Path, Precondition, Prefix,
-    PrefixRevision, Result,
+    PrefixRevision, Result, Revision,
 };
 
 /// An owned set of staged writes and deletes for one Area. Nothing happens until it is committed
@@ -201,9 +201,10 @@ impl Staged {
         }
     }
 
-    /// Checks every Precondition against `current`, the Area as it is when the Commit runs. A
-    /// Backend calls this under its lock, before it writes anything. Gives [`Error::Conflict`]
-    /// with every Path where a Precondition fails. A Staging with no Preconditions reads nothing.
+    /// Checks every Precondition against `current`, the Area as it is when the Commit runs. It is
+    /// the first step of [`CommitRequest::plan`](crate::backend::CommitRequest::plan), which runs
+    /// under the Backend's lock. Gives [`Error::Conflict`] with every Path where a Precondition
+    /// fails. A Staging with no Preconditions reads nothing.
     pub(crate) fn check_preconditions(&self, current: &impl AreaState) -> Result<()> {
         let mut conflicts = BTreeSet::new();
         for (path, precondition) in &self.preconditions {
@@ -222,59 +223,89 @@ impl Staged {
         }
     }
 
-    /// Turns the Prefix deletes into deletes of the Paths under them, given every Path that
-    /// exists in the Area. A Backend calls this under its lock, when the Commit runs. A Path
-    /// staged after the Prefix delete keeps its own action.
-    pub(crate) fn expand_prefix_deletes<'a>(
-        &mut self,
-        existing: impl IntoIterator<Item = &'a Path>,
-    ) {
-        let prefixes = std::mem::take(&mut self.prefix_deletes);
-        for path in existing {
-            if prefixes.iter().any(|prefix| prefix.covers(path)) {
-                self.actions.entry(path.clone()).or_insert(Action::Delete);
+    /// Turns the Prefix deletes into deletes of the Paths under them in `current`, the Area as it
+    /// is when the Commit runs: the second step of
+    /// [`CommitRequest::plan`](crate::backend::CommitRequest::plan). A Path staged after the Prefix
+    /// delete keeps its own action.
+    pub(crate) fn expand_prefix_deletes(&mut self, current: &impl AreaState) -> Result<()> {
+        for prefix in std::mem::take(&mut self.prefix_deletes) {
+            for path in current.paths_under(&prefix)? {
+                self.actions.entry(path).or_insert(Action::Delete);
             }
         }
+        Ok(())
+    }
+
+    /// Leaves out every write that would not change the File's contents in `current`, and every
+    /// delete of a Path with no File: the third step of
+    /// [`CommitRequest::plan`](crate::backend::CommitRequest::plan). Gives the Revision of every
+    /// write, including those left out.
+    pub(crate) fn leave_out_what_changes_nothing(
+        &mut self,
+        current: &impl AreaState,
+    ) -> Result<BTreeMap<Path, Revision>> {
+        let mut revisions = BTreeMap::new();
+        let mut unchanged = Vec::new();
+        for (path, action) in &self.actions {
+            let now = current.revision(path)?;
+            let changes_nothing = match action {
+                Action::Write(contents) => {
+                    let revision = Revision::of(contents);
+                    revisions.insert(path.clone(), revision);
+                    now == Some(revision)
+                }
+                Action::Delete => now.is_none(),
+            };
+            if changes_nothing {
+                unchanged.push(path.clone());
+            }
+        }
+        for path in unchanged {
+            self.actions.remove(&path);
+        }
+        Ok(revisions)
     }
 
     /// Refuses a write that would leave two names in the Area after the Commit that some platform
-    /// can't hold together. A name is a Path, or a Prefix it is under. `existing` is every Path in
-    /// the Area. A Backend calls this under its lock, after expanding the Prefix deletes, so that
-    /// a Path deleted in the same Commit doesn't count. It refuses:
+    /// can't hold together. A name is a Path, or a Prefix it is under. `current` is the Area as it
+    /// is when the Commit runs. It is the last step of
+    /// [`CommitRequest::plan`](crate::backend::CommitRequest::plan), after the Prefix deletes are
+    /// expanded, so that a Path deleted in the same Commit doesn't count. It refuses:
     /// - names that differ only in letter case, such as `a.txt` and `A.txt`, or `a/` in `a/b` and
     ///   `A/` in `A/c` ([`InvalidPathReason::LetterCaseClash`]);
     /// - a Path that is also a Prefix of another Path, such as `a` and `a/b`
     ///   ([`InvalidPathReason::FileUnderFile`]).
     ///
-    /// Both are found by folding each name, without the `/` that ends a Prefix.
-    pub(crate) fn refuse_clashing_paths<'a>(
-        &'a self,
-        existing: impl IntoIterator<Item = &'a Path>,
-    ) -> Result<()> {
-        let written = self.actions.iter().filter(|(_, action)| matches!(action, Action::Write(_)));
-        let mut written = written.map(|(path, _)| path).peekable();
-        if written.peek().is_none() {
-            return Ok(());
-        }
-        let fold = |name: &str| letter_case_fold(without_trailing_slash(name));
+    /// Both are found by folding each name, without the `/` that ends a Prefix. Only the names
+    /// the Commit writes are folded, and the Area is asked only about those, so the check costs
+    /// what the Commit writes, not what the Area holds.
+    pub(crate) fn refuse_clashing_paths(&self, current: &impl AreaState) -> Result<()> {
         let deleted = |path: &Path| matches!(self.actions.get(path), Some(Action::Delete));
-        let mut names = HashMap::new();
-        for path in existing.into_iter().filter(|path| !deleted(path)) {
-            for name in prefixes_and_path(path) {
-                names.insert(fold(name), name);
+        // Each name written so far in this Commit, by its fold.
+        let mut written: HashMap<String, &str> = HashMap::new();
+        for (path, action) in &self.actions {
+            if !matches!(action, Action::Write(_)) {
+                continue;
             }
-        }
-        for path in written {
             for name in prefixes_and_path(path) {
-                let other = match names.entry(fold(name)) {
-                    Entry::Vacant(entry) => {
-                        entry.insert(name);
-                        continue;
-                    }
+                let fold = letter_case_fold(without_trailing_slash(name));
+                let other = match written.entry(fold) {
+                    // Another name written in this Commit.
                     Entry::Occupied(other) if *other.get() == name => continue,
-                    Entry::Occupied(other) => *other.get(),
+                    Entry::Occupied(other) => Some(without_trailing_slash(other.get()).to_owned()),
+                    // A name in the Area, apart from the Paths this Commit deletes.
+                    Entry::Vacant(entry) => {
+                        let others = current.paths_named_like(name, entry.key())?;
+                        entry.insert(name);
+                        let other = others.into_iter().find(|other| !deleted(other));
+                        // The other Path's name that folds like `name` has as many segments.
+                        let segments =
+                            name.matches('/').count() + usize::from(!name.ends_with('/'));
+                        other.map(|other| first_segments(other.as_str(), segments).to_owned())
+                    }
                 };
-                let reason = if without_trailing_slash(other) == without_trailing_slash(name) {
+                let Some(other) = other else { continue };
+                let reason = if other == without_trailing_slash(name) {
                     InvalidPathReason::FileUnderFile
                 } else {
                     InvalidPathReason::LetterCaseClash
@@ -284,6 +315,18 @@ impl Staged {
         }
         Ok(())
     }
+}
+
+/// Whether `path` has the name `name`: whether it is `name`, or is under `name` if that is a
+/// Prefix.
+pub(crate) fn has_name(path: &Path, name: &str) -> bool {
+    if name.ends_with('/') { path.as_str().starts_with(name) } else { path.as_str() == name }
+}
+
+/// The first `count` segments of `path`, at least one, without a `/` after them.
+fn first_segments(path: &str, count: usize) -> &str {
+    let end = path.match_indices('/').nth(count.saturating_sub(1));
+    end.map_or(path, |(slash, _)| &path[..slash])
 }
 
 /// `name` without the `/` that ends it if it is a Prefix, so that a Prefix and a Path of the

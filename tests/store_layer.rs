@@ -25,6 +25,11 @@ fn a_store_and_its_futures_can_be_shared_between_threads() {
     send(store.commit(Staging::new(Area::Config)));
     send(store.snapshot(Area::Config));
     send(feed.next());
+    #[cfg(feature = "sqlite")]
+    {
+        let app = tidings::AppIdentity::new("tidings tests", "tidings", "org");
+        send(Store::open_sqlite(&app, tidings::SqliteOptions::default()));
+    }
 }
 
 /// And every future a Snapshot gives.

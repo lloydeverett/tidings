@@ -4,9 +4,12 @@ Text files for an application, in three areas (config, data, cache), stored on t
 SQLite or in memory. Writes happen only through staged commits. Every change is reported on a
 change feed.
 
-Status: early. Only the in-memory Store exists so far: reading, stat and listing, commits of
-writes and deletes with preconditions, checked paths, the change feed, and snapshots. Resyncs and
-the other backends are still to come. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
+Status: early. Stores in memory and on SQLite exist so far: reading, stat and listing, commits of
+writes and deletes with preconditions, checked paths, the change feed, and snapshots. Still to
+come: the filesystem backend, resyncs, the blocking API, seeing another process's commits to the
+same SQLite databases, and commits that finish after being cancelled. Until then, on SQLite, a
+commit whose future is dropped once it has started can be applied without being reported on the
+change feed. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
 
 ## Consistency
 
@@ -52,3 +55,8 @@ the other backends are still to come. See [CONTEXT.md](CONTEXT.md) and [docs/adr
 - Backends are defined in this crate. You cannot plug in your own.
 - On the filesystem, other programs can see a commit half-applied. Readers going through tidings
   can't.
+- On SQLite, each area is a database (`config.sqlite3`, `data.sqlite3` or `cache.sqlite3`) in the
+  area's directory, written only by tidings. Other programs writing to it directly aren't
+  supported.
+- On SQLite, a snapshot held for a long time stops the database's write-ahead log from being
+  emptied, so the log grows until the snapshot is dropped.

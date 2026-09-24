@@ -12,12 +12,34 @@ pub enum Area {
     Cache,
 }
 
+impl Area {
+    /// The Area's name in lower case, which names its directory under a Root override, and its
+    /// database.
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Area::Config => "config",
+            Area::Data => "data",
+            Area::Cache => "cache",
+        }
+    }
+}
+
 /// One `T` for each Area. The only place that knows how Areas map to positions.
 #[derive(Debug, Default)]
 pub(crate) struct PerArea<T>([T; 3]);
 
 impl<T> PerArea<T> {
     const AREAS: [Area; 3] = [Area::Config, Area::Data, Area::Cache];
+
+    /// One `T` for each Area, made by `make`, or the first error it gives.
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn try_from_fn(
+        mut make: impl FnMut(Area) -> crate::Result<T>,
+    ) -> crate::Result<PerArea<T>> {
+        let [config, data, cache] = Self::AREAS;
+        Ok(PerArea([make(config)?, make(data)?, make(cache)?]))
+    }
 
     pub(crate) fn get(&self, area: Area) -> &T {
         &self.0[area as usize]

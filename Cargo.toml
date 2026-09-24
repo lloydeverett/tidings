@@ -12,7 +12,7 @@ default = ["fs", "sqlite"]
 # The filesystem Backend.
 fs = []
 # The SQLite Backend.
-sqlite = []
+sqlite = ["dep:etcetera", "dep:rusqlite", "tokio/rt"]
 # `blocking::Store`, for synchronous code.
 blocking = []
 # Failure points and helpers for tidings' own tests.
@@ -20,8 +20,10 @@ testing = []
 
 [dependencies]
 caseless = "0.2.2"
+etcetera = { version = "0.11.0", optional = true }
 jiff = "0.2.37"
 relative-path = "2.0.1"
+rusqlite = { version = "0.40.2", features = ["bundled"], optional = true }
 sanitize-filename = "0.6.0"
 thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["sync"] }
@@ -32,4 +34,5 @@ xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 # tidings' own tests always build it with `testing`, so a plain `cargo test` runs the tests that
 # need it. Dev-dependencies don't reach normal builds, or crates that depend on tidings.
 tidings = { path = ".", default-features = false, features = ["testing"] }
+tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }

@@ -7,18 +7,32 @@
 //! Once copied, the map is the Backend's alone again, so later Commits copy nothing until the next
 //! Snapshot. A Snapshot never takes the Backend's lock, so holding or reading one never holds up a
 //! Commit.
+//!
+//! Beside each Area's Files, the Backend keeps the letter-case fold of each Path, for the check
+//! every Commit makes. Snapshots don't need it, so it isn't shared with them and is never copied.
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 
-use super::{AreaState, CommitOutcome, CommitRequest, RawChange};
+use super::{AreaState, CommitOutcome, CommitRequest, Written};
 use crate::area::PerArea;
-use crate::staging::Action;
-use crate::{Area, ChangeKind, File, Path, Prefix, PrefixRevision, Result, Revision, Stat};
+use crate::path::letter_case_fold;
+use crate::staging::has_name;
+use crate::{Area, File, Path, Prefix, PrefixRevision, Result, Revision, Stat};
 
 #[derive(Debug, Default)]
 pub(crate) struct MemoryBackend {
-    areas: Mutex<PerArea<Arc<Files>>>,
+    areas: Mutex<PerArea<Held>>,
+}
+
+/// One Area as the Backend holds it.
+#[derive(Debug, Default)]
+struct Held {
+    files: Arc<Files>,
+    /// Each Path, by its [`letter_case_fold`]. No two Paths fold the same, since the check every
+    /// Commit makes refuses that.
+    folds: BTreeMap<String, Path>,
 }
 
 /// One Area's Files.
@@ -39,15 +53,15 @@ pub(crate) struct MemorySnapshot {
 
 impl MemoryBackend {
     pub(crate) fn read(&self, area: Area, path: &Path) -> Option<File> {
-        read(self.areas.lock().unwrap().get(area), path)
+        read(&self.areas.lock().unwrap().get(area).files, path)
     }
 
     pub(crate) fn stat(&self, area: Area, path: &Path) -> Option<Stat> {
-        stat(self.areas.lock().unwrap().get(area), path)
+        stat(&self.areas.lock().unwrap().get(area).files, path)
     }
 
     pub(crate) fn list(&self, area: Area, prefix: &Prefix) -> Vec<Path> {
-        list(self.areas.lock().unwrap().get(area), prefix)
+        list(&self.areas.lock().unwrap().get(area).files, prefix)
     }
 
     pub(crate) fn stat_prefix(&self, area: Area, prefix: &Prefix) -> Result<PrefixRevision> {
@@ -57,42 +71,30 @@ impl MemoryBackend {
     }
 
     pub(crate) fn snapshot(&self, area: Area) -> MemorySnapshot {
-        MemorySnapshot { files: Arc::clone(self.areas.lock().unwrap().get(area)) }
+        MemorySnapshot { files: Arc::clone(&self.areas.lock().unwrap().get(area).files) }
     }
 
-    /// Checks every Precondition, then applies every write and delete at once, under the one
-    /// lock.
+    /// Works out what the Commit changes, then changes it, all under the one lock.
     pub(crate) fn commit(&self, request: CommitRequest) -> Result<CommitOutcome> {
-        let CommitRequest { timestamp, mut staged } = request;
         let mut areas = self.areas.lock().unwrap();
-        let files = areas.get_mut(staged.area);
-        staged.check_preconditions(&**files)?;
-        staged.expand_prefix_deletes(files.keys());
-        staged.refuse_clashing_paths(files.keys())?;
-        let mut outcome = CommitOutcome::default();
-        for (path, action) in staged.actions {
-            match action {
-                Action::Write(contents) => {
-                    let revision = Revision::of(&contents);
-                    outcome.revisions.insert(path.clone(), revision);
-                    // A write that changes nothing is left out: the File keeps its time.
-                    if files.get(&path).is_some_and(|stored| stored.stat.revision() == revision) {
-                        continue;
-                    }
-                    let stat = Stat::new(timestamp, revision);
+        let held = areas.get_mut(request.staged.area);
+        let plan = request.plan(&*held)?;
+        let Held { files, folds } = held;
+        plan.apply(|path, written| {
+            match written {
+                Some(Written { contents, stat }) => {
                     let stored = Arc::new(Stored { contents, stat });
-                    Arc::make_mut(files).insert(path.clone(), stored);
-                    outcome.changes.push(RawChange { path, kind: ChangeKind::Changed });
-                }
-                Action::Delete => {
-                    if files.contains_key(&path) {
-                        Arc::make_mut(files).remove(&path);
-                        outcome.changes.push(RawChange { path, kind: ChangeKind::Removed });
+                    if Arc::make_mut(files).insert(path.clone(), stored).is_none() {
+                        folds.insert(letter_case_fold(path.as_str()), path.clone());
                     }
+                }
+                None => {
+                    Arc::make_mut(files).remove(path);
+                    folds.remove(&letter_case_fold(path.as_str()));
                 }
             }
-        }
-        Ok(outcome)
+            Ok(())
+        })
     }
 }
 
@@ -123,13 +125,26 @@ fn list(files: &Files, prefix: &Prefix) -> Vec<Path> {
     files.keys().filter(|path| prefix.covers(path)).cloned().collect()
 }
 
-impl AreaState for Files {
+impl AreaState for Held {
     fn revision(&self, path: &Path) -> Result<Option<Revision>> {
-        Ok(self.get(path).map(|stored| stored.stat.revision()))
+        Ok(self.files.get(path).map(|stored| stored.stat.revision()))
     }
 
     fn revisions_under(&self, prefix: &Prefix) -> Result<Vec<(Path, Revision)>> {
-        let under = self.iter().filter(|(path, _)| prefix.covers(path));
+        let under = self.files.iter().filter(|(path, _)| prefix.covers(path));
         Ok(under.map(|(path, stored)| (path.clone(), stored.stat.revision())).collect())
+    }
+
+    fn paths_under(&self, prefix: &Prefix) -> Result<Vec<Path>> {
+        Ok(list(&self.files, prefix))
+    }
+
+    fn paths_named_like(&self, name: &str, fold: &str) -> Result<Vec<Path>> {
+        // Every fold that starts with `fold/` sorts from `fold/` up to `fold0`, since `0` comes
+        // right after `/`.
+        let under = (Bound::Included(format!("{fold}/")), Bound::Excluded(format!("{fold}0")));
+        let under = self.folds.range::<String, _>(under).map(|(_, path)| path);
+        let folding = self.folds.get(fold).into_iter().chain(under);
+        Ok(folding.filter(|path| !has_name(path, name)).cloned().collect())
     }
 }

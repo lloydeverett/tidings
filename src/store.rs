@@ -7,8 +7,12 @@ use tokio::sync::Mutex;
 use crate::ChangeKind;
 #[cfg(feature = "testing")]
 use crate::backend::RawChange;
+#[cfg(feature = "sqlite")]
+use crate::backend::sqlite::SqliteBackend;
 use crate::backend::{Backend, CommitRequest, memory::MemoryBackend};
 use crate::change::{self, FeedSender};
+#[cfg(feature = "sqlite")]
+use crate::{AppIdentity, SqliteOptions};
 use crate::{
     Area, ChangeFeed, Committed, File, IntoPath, IntoPrefix, Origin, Path, PrefixRevision, Result,
     Snapshot, Staging, Stat,
@@ -55,6 +59,21 @@ impl Store {
     /// Store together with its one Change feed.
     pub fn open_memory() -> (Store, ChangeFeed) {
         Store::open(Backend::Memory(MemoryBackend::default()))
+    }
+
+    /// Opens a Store that keeps each Area in a SQLite database of its own, in the Area's standard
+    /// directory for `app`, or under the Root override in `options`. Opening creates the
+    /// databases and their directories if they don't exist. Returns the Store together with its
+    /// one Change feed.
+    ///
+    /// Gives [`Error::Backend`](crate::Error::Backend) if a database can't be opened or created.
+    #[cfg(feature = "sqlite")]
+    pub async fn open_sqlite(
+        app: &AppIdentity,
+        options: SqliteOptions,
+    ) -> Result<(Store, ChangeFeed)> {
+        let backend = SqliteBackend::open(app, options).await?;
+        Ok(Store::open(Backend::Sqlite(backend)))
     }
 
     fn open(backend: Backend) -> (Store, ChangeFeed) {

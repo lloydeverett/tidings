@@ -32,6 +32,14 @@ impl Path {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// A Path read back from where a Backend stored it, which was validated before it was
+    /// stored, so it isn't validated again.
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn stored(path: String) -> Path {
+        debug_assert_eq!(refusal(&path), None, "{path:?} was stored, so it should be valid");
+        Path(path)
+    }
 }
 
 /// The top-level name tidings keeps its own bookkeeping under. It is its own
@@ -116,6 +124,19 @@ fn is_reserved(name: &str) -> bool {
 /// is `I` in upper case, but doesn't fold to `i`. Folding the upper case catches both.
 pub(crate) fn letter_case_fold(name: &str) -> String {
     name.to_uppercase().chars().nfd().default_case_fold().nfd().collect()
+}
+
+/// The versions of the Unicode data [`letter_case_fold`] follows: the standard library's for upper
+/// case, `caseless`'s for folding and `unicode-normalization`'s for NFD. A fold that was stored can
+/// differ from one made with other versions.
+#[cfg(feature = "sqlite")]
+pub(crate) fn letter_case_fold_unicode_versions() -> String {
+    format!(
+        "std {:?}, caseless {:?}, unicode-normalization {:?}",
+        char::UNICODE_VERSION,
+        caseless::UNICODE_VERSION,
+        unicode_normalization::UNICODE_VERSION,
+    )
 }
 
 /// Which rule a refused Path or Prefix breaks, as given by [`Error::InvalidPath`].

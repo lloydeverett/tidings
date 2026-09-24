@@ -26,6 +26,18 @@ pub enum Error {
     /// [`Store::supports_snapshots`](crate::Store::supports_snapshots) first.
     #[error("not supported by this Store's Backend")]
     Unsupported,
+    /// The Store's Backend failed, for example because SQLite gave an error. It wraps the
+    /// underlying error.
+    #[error("the Store's Backend failed: {0}")]
+    Backend(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl Error {
+    /// The Backend failed with `error`.
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn backend(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Error {
+        Error::Backend(error.into())
+    }
 }
 
 /// A `Result` whose error is tidings' [`Error`].

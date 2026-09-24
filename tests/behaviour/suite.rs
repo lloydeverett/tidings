@@ -11,13 +11,13 @@ use tidings::{
 
 use crate::common::{assert_ended, assert_nothing_more, changes, changes_in_full, next_batch};
 
-/// How a Backend opens a fresh, empty Store for one test.
+/// How a Backend opens a fresh, empty Store for one test. Each test makes its own Fixture, so a
+/// Backend that keeps Files on disk holds the test's temporary Root override in it.
 pub trait Fixture {
     async fn open(&self) -> Opened;
 }
 
-/// A freshly opened Store. Backends that keep files on disk will also hold their temporary Root
-/// override here, so it lives as long as the test.
+/// A freshly opened Store.
 pub struct Opened {
     pub store: Store,
     pub feed: ChangeFeed,

@@ -19,6 +19,18 @@ impl Revision {
     pub(crate) fn of(contents: &str) -> Revision {
         Revision(xxh3_128(contents.as_bytes()))
     }
+
+    /// The Revision as bytes, for a Backend to store.
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn to_bytes(self) -> [u8; 16] {
+        self.0.to_le_bytes()
+    }
+
+    /// The Revision a Backend stored with [`to_bytes`](Self::to_bytes).
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn from_bytes(bytes: [u8; 16]) -> Revision {
+        Revision(u128::from_le_bytes(bytes))
+    }
 }
 
 impl fmt::Debug for Revision {
