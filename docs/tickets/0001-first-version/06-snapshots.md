@@ -28,11 +28,11 @@ supports Snapshots. Works on the memory Backend. The filesystem refusal comes wi
   `Send` (checked in tests/store_layer.rs).
 - **The memory Snapshot is copy-on-write over `Arc`s, not a persistent map.** Each Area's map is
   an `Arc<BTreeMap<Path, Arc<Stored>>>`. Taking a Snapshot clones the Area's `Arc` under the lock,
-  so it copies nothing. A Commit calls `Arc::make_mut` after its checks: if a Snapshot still
+  so it copies nothing. A Commit calls `Arc::make_mut` before its first change: if a Snapshot still
   shares the map, the map is copied first, which copies each Path and a pointer to each File but
   never a File's contents. The copy is then the Backend's alone, so later Commits copy nothing
   until the next Snapshot. So each Snapshot costs at most one copy of the Area's index, paid by
-  the first Commit to that Area while it's held, which is in line with the letter-case check
+  the first Commit that changes that Area while it's held, which is in line with the letter-case check
   every Commit already makes over every Path. A persistent map (`imbl::OrdMap`) would make that
   O(log n), at the cost of a dependency; worth it only if large Caches get snapshotted while
   committing often. The Store's own reads still read under the lock, rather than through a

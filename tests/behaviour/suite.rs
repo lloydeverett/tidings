@@ -6,7 +6,7 @@ use std::time::Duration;
 use jiff::Timestamp;
 use tidings::{
     Area, ChangeFeed, ChangeKind, Committed, Error, FeedItem, File, InvalidPathReason, Origin,
-    Precondition, Snapshot, Staging, Store,
+    Path, Precondition, Snapshot, Staging, Store,
 };
 
 use crate::common::{assert_ended, assert_nothing_more, changes, changes_in_full, next_batch};
@@ -1172,8 +1172,11 @@ pub async fn a_snapshot_reads_the_area_as_it_was_when_taken(fixture: &impl Fixtu
         (changed_before.modified(), changed_before.revision()),
     );
     assert_eq!(snapshot.stat("dir/added.txt").await.unwrap(), None);
-    assert_eq!(snapshot_list(&snapshot, "").await, ["changed.txt", "dir/kept.txt", "removed.txt"]);
-    assert_eq!(snapshot_list(&snapshot, "dir/").await, ["dir/kept.txt"]);
+    assert_eq!(
+        as_strings(&snapshot.list("").await.unwrap()),
+        ["changed.txt", "dir/kept.txt", "removed.txt"]
+    );
+    assert_eq!(as_strings(&snapshot.list("dir/").await.unwrap()), ["dir/kept.txt"]);
     // ...and only that Area.
     assert_eq!(snapshot.read("elsewhere.toml").await.unwrap(), None);
 
@@ -1267,7 +1270,7 @@ pub async fn holding_a_snapshot_does_not_hold_up_commits(fixture: &impl Fixture)
     committer.await.unwrap();
 
     assert_eq!(read(&store, Area::Data, "held.txt").await.contents(), "after 19");
-    assert_eq!(snapshot_list(&snapshot, "").await, ["held.txt"]);
+    assert_eq!(as_strings(&snapshot.list("").await.unwrap()), ["held.txt"]);
 }
 
 pub async fn a_snapshot_outlives_the_store_without_keeping_the_feed_open(fixture: &impl Fixture) {
@@ -1285,7 +1288,7 @@ pub async fn a_snapshot_outlives_the_store_without_keeping_the_feed_open(fixture
     assert_ended(&mut feed).await;
     let file = snapshot.read("settings.toml").await.unwrap().unwrap();
     assert_eq!(file.contents(), "a = 1\n");
-    assert_eq!(snapshot_list(&snapshot, "").await, ["settings.toml"]);
+    assert_eq!(as_strings(&snapshot.list("").await.unwrap()), ["settings.toml"]);
 }
 
 pub async fn a_backend_without_snapshots_refuses_one(fixture: &impl Fixture) {
@@ -1316,13 +1319,11 @@ async fn read(store: &Store, area: Area, path: &str) -> File {
 
 /// Lists the Paths under `prefix`, as strings.
 async fn list(store: &Store, area: Area, prefix: &str) -> Vec<String> {
-    let paths = store.list(area, prefix).await.unwrap();
-    paths.iter().map(|path| path.as_str().to_owned()).collect()
+    as_strings(&store.list(area, prefix).await.unwrap())
 }
 
-/// Lists the Paths under `prefix` in a Snapshot, as strings.
-async fn snapshot_list(snapshot: &Snapshot, prefix: &str) -> Vec<String> {
-    let paths = snapshot.list(prefix).await.unwrap();
+/// Paths as strings, for comparing.
+fn as_strings(paths: &[Path]) -> Vec<String> {
     paths.iter().map(|path| path.as_str().to_owned()).collect()
 }
 

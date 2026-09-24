@@ -9,31 +9,31 @@ use crate::{File, IntoPath, IntoPrefix, Path, Result, Stat};
 /// feed still ends once every Store handle has been dropped, and the Snapshot can still be read.
 #[derive(Debug)]
 pub struct Snapshot {
-    snapshot: BackendSnapshot,
+    view: BackendSnapshot,
 }
 
 impl Snapshot {
-    pub(crate) fn new(snapshot: BackendSnapshot) -> Snapshot {
-        Snapshot { snapshot }
+    pub(crate) fn new(view: BackendSnapshot) -> Snapshot {
+        Snapshot { view }
     }
 
     /// Reads the File at `path` as it was, or gives `Ok(None)` if there was none.
     pub async fn read(&self, path: impl IntoPath) -> Result<Option<File>> {
         let path = path.into_path()?;
-        self.snapshot.read(&path).await
+        self.view.read(&path).await
     }
 
     /// Gives when the File at `path` was last modified and its Revision, as they were, or
     /// `Ok(None)` if there was no File there.
     pub async fn stat(&self, path: impl IntoPath) -> Result<Option<Stat>> {
         let path = path.into_path()?;
-        self.snapshot.stat(&path).await
+        self.view.stat(&path).await
     }
 
     /// Lists the Paths of the Files that were under `prefix`, in order. The empty Prefix lists the
     /// whole Area.
     pub async fn list(&self, prefix: impl IntoPrefix) -> Result<Vec<Path>> {
         let prefix = prefix.into_prefix()?;
-        self.snapshot.list(&prefix).await
+        self.view.list(&prefix).await
     }
 }

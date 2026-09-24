@@ -683,3 +683,90 @@ Clippy (all targets, with default features, `--all-features` and `--no-default-f
 clean. `cargo test` passes with default features, `--no-default-features` and `--all-features`:
 38 behaviour tests, 5 path tests and 2 Store-layer tests. A plain `cargo test` now runs both
 Store-layer tests.
+
+---
+
+## Ticket 06: Snapshots
+
+Reviewed: `git diff be7d894...249ec8e` (commit 249ec8e). The Spec reviewer was also asked whether the copy-on-write Snapshot is truly consistent, and to judge the decision that a Snapshot doesn't keep the Store alive.
+
+### Standards
+
+**(a) Documented-standard violations**
+
+No hard violations. Checked against the spec's Implementation and Testing Decisions and ADR 0006:
+- Backends stay private and are dispatched through an enum: `BackendSnapshot` is `pub(crate)`, and there is no public trait.
+- `Unsupported` is added to the single `#[non_exhaustive]` `Error` (src/error.rs:25-28).
+- The public operations are `snapshot` and `supports_snapshots`, and a Snapshot has `read`, `stat` and `list`, as the spec lists.
+- The tests use only the public API.
+- No `tracing` was added, which is consistent because the crate has none yet.
+- README Consistency was updated with the code (spec Further Notes: "Keep them in sync").
+
+One borderline glossary point (judgement call):
+- README.md:19, "For a consistent read of several files, use a snapshot of an area." CONTEXT.md lists "consistent read" under Snapshot's _Avoid_ list. The phrase predates this diff, but the diff rewrites the line and keeps it. It describes the purpose rather than naming the concept, so this is a soft breach. Suggested fix: "To read several files without mixing commits, use a snapshot…".
+- src/backend/mod.rs:23 "read transaction" describes SQLite's mechanism, as the spec itself does, not the Snapshot concept. That's fine.
+
+**(b) Baseline smells (all judgement calls)**
+
+- **Duplicated Code, well handled:** memory.rs:112-123 extracts the free functions `read`, `stat` and `list`, which both `MemoryBackend` and `MemorySnapshot` call. No action.
+- **Duplicated Code (minor):** in tests/behaviour/suite.rs the `snapshot_list` helper at :1324 has the same shape as `list` at :1318 (list, then map with `as_str().to_owned()`). A shared `fn as_strings(&[Path]) -> Vec<String>` would remove the copy.
+- **Duplicated Code (minor):** the guard `if !store.supports_snapshots() { return; }` appears at suite.rs:1144, 1188, 1237 and 1275, and inverted at :1294. It could be folded into the suite macro, or into a `fixture.open_with_snapshots()` that returns `Option`. Tolerable as it is, and tests/behaviour/main.rs:26 (`memory_supports_snapshots`) rightly guards against the suite silently skipping everything.
+- **Repeated Switches, suppressed by a repo standard:** `Backend::supports_snapshots` (mod.rs:94) and `Backend::snapshot` (mod.rs:102) each match on the Backend, and `impl BackendSnapshot` (mod.rs:118+) repeats the match for read, stat and list. The spec mandates enum dispatch without a trait, so this is endorsed. One risk remains: `supports_snapshots` and `snapshot` state the same fact twice, and the two could disagree once fs or SQLite arrive. The behaviour tests at :1294 and main.rs:26 mitigate this.
+- **Mysterious Name (very minor):** src/snapshot.rs:12, `Snapshot { snapshot: BackendSnapshot }`. The field has the same name as its owner. `backend` or `view` would read better at `self.snapshot.read(...)`.
+- **Speculative Generality: none.** `Backend::snapshot` being `async` and returning `Result`, `BackendSnapshot` being an enum, and `a_backend_without_snapshots_refuses_one` (a no-op on memory today) are all seams that the SQLite and fs tickets in the known series need.
+
+### Spec
+
+All five ticked boxes were verified as genuinely met. `cargo test` passes: 44 behaviour tests on a 4-worker multi_thread runtime.
+
+**(a) Missing or partial.** None. Two items are deferred as planned:
+- "and that they are refused on the filesystem" (spec, Testing Decisions) belongs to ticket 09. The refusal test exists and returns early on memory, as the ticket allows (tests/behaviour/suite.rs:1291).
+- "Each Backend's module … asserts what it should answer" is so far done only for memory (tests/behaviour/main.rs:23). Tickets 07 and 09 add the other Backends.
+
+**(b) Scope creep.** None. The README changes (README.md:19-30) only describe what was built.
+
+**(c) Implemented, possibly wrong.** Nothing that breaks the spec. One nit:
+- Ticket: "each Snapshot costs at most one copy … paid by the first Commit to that Area while it's held". `Arc::make_mut` at src/backend/memory.rs:72 runs even when the Commit changes nothing (every write is unchanged, or it deletes a missing File), so such a Commit still pays for the copy. The claim is still literally true and this only costs performance, so fixing it is optional.
+
+**Is the copy-on-write Snapshot really consistent?** Yes. A Snapshot cannot see part of a Commit.
+- `MemoryBackend::commit` takes the `std::sync::Mutex` at memory.rs:66. It holds the lock across the checks (68-70), `make_mut` (72) and the whole apply loop, and it never awaits.
+- `snapshot()` clones the Area's `Arc` under the same lock (memory.rs:58-59), so a Snapshot is either wholly before or wholly after any Commit. It can never land between a Commit's checks and its apply.
+- After the copy, the old map is never touched. `Stored` is never changed in place: there is no `get_mut` or `make_mut` on it, and writes insert a new `Arc<Stored>`.
+- A Snapshot can see a Commit before that Commit's Changes reach the feed (store.rs `commit` records them after the Backend returns). That's harmless, because the spec ties Snapshots only to Commits, not to the feed.
+- `reads_through_a_snapshot_never_mix_commits` is a real test on the multi_thread runtime. Its deterministic first half, a Commit between two reads, would catch a Snapshot that reads the live map.
+
+**The decision that a Snapshot doesn't keep the Store's shared state alive.** Agreed.
+- It follows the spec: the Change feed "returns nothing once every Store handle has been dropped", and story 58 says "so that the task listening to it finishes on its own".
+- A Snapshot isn't a Store handle and can be held as long as the app likes, so holding `Arc<Inner>` would break the rule stated on `Inner` (store.rs:26-33).
+- It fits SQLite's "a read transaction on a separate connection", and it is tested (suite.rs:1273).
+- It is recorded in the ticket notes, the `BackendSnapshot` docs (backend/mod.rs:19-23) and the README. No ADR seems needed.
+- Warning for ticket 12: `blocking::Store` "runs its own internal tokio runtime". A blocking Snapshot must hold that runtime itself, not the blocking Store. Otherwise it either keeps the feed alive or stops working once the Store is dropped. Ticket 12 should say so.
+
+### Summary
+
+Standards: 0 hard violations, 1 soft glossary point ("consistent read" in the README) and 3 minor smells. The most notable is the Snapshot-support guard repeated across the suite. Spec: 0 findings against this ticket. The Snapshot was verified consistent, and the lifetime decision was endorsed. The most important note is for ticket 12: a blocking Snapshot must hold its own runtime, not the blocking Store.
+
+
+
+### Resolution
+
+1. **Standards (a), "consistent read" in the README:** fixed. The line now reads "To read several
+   files without mixing commits, use a snapshot of an area."
+2. **`Snapshot { snapshot }`:** fixed. The field is `view`.
+3. **Duplicated test code:**
+   - `snapshot_list` is gone. A new `as_strings(&[Path])` turns Paths into strings. `list` uses
+     it, and the Snapshot tests call it on `snapshot.list(..)` directly.
+   - The repeated `if !store.supports_snapshots() { return; }` guard is kept as it is. A helper
+     such as `open_with_snapshots` would still need a `let ... else { return }` at each call site,
+     so it would save little, and the plain guard shows at a glance why each test can do nothing.
+4. **Spec (c), a Commit that changes nothing still paid for the copy:** fixed. The memory Backend
+   now calls `Arc::make_mut` just before each insert or remove, so the map is copied only when a
+   Commit actually changes it (after the first call the map is unique, so later calls cost only
+   the check). The module doc and the ticket note say so.
+5. **Ticket 12, a blocking Snapshot's lifetime:** added as an unticked checkbox in
+   docs/tickets/0001-first-version/12-blocking-api.md. A blocking Snapshot holds the internal
+   runtime itself (for example an `Arc` of it), not the blocking Store.
+
+Clippy (all targets, with default features, `--all-features` and `--no-default-features`) is
+clean. `cargo test` passes with each of them: 44 behaviour tests, 5 path tests and 3 Store-layer
+tests.

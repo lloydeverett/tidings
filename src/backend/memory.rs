@@ -1,11 +1,12 @@
 //! The memory Backend: every Area lives in process memory, shared by every clone of the Store.
 //!
 //! Each Area's Files are behind an `Arc`, and each File behind one too, so a Snapshot is a clone
-//! of the Area's `Arc`: taking one copies nothing. A Commit copies the Area's map before changing
-//! it only if a Snapshot still shares it (`Arc::make_mut`), and even then copies each Path and a
-//! pointer to each File, never a File's contents. Once copied, the map is the Backend's alone
-//! again, so later Commits copy nothing until the next Snapshot. A Snapshot never takes the
-//! Backend's lock, so holding or reading one never holds up a Commit.
+//! of the Area's `Arc`: taking one copies nothing. A Commit that changes the Area copies its map
+//! first only if a Snapshot still shares it (`Arc::make_mut`), and even then copies each Path and
+//! a pointer to each File, never a File's contents. A Commit that changes nothing copies nothing.
+//! Once copied, the map is the Backend's alone again, so later Commits copy nothing until the next
+//! Snapshot. A Snapshot never takes the Backend's lock, so holding or reading one never holds up a
+//! Commit.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -68,8 +69,6 @@ impl MemoryBackend {
         staged.check_preconditions(&**files)?;
         staged.expand_prefix_deletes(files.keys());
         staged.refuse_clashing_paths(files.keys())?;
-        // Copies the map (not the Files) if a Snapshot still shares it.
-        let files = Arc::make_mut(files);
         let mut outcome = CommitOutcome::default();
         for (path, action) in staged.actions {
             match action {
@@ -81,11 +80,13 @@ impl MemoryBackend {
                         continue;
                     }
                     let stat = Stat::new(timestamp, revision);
-                    files.insert(path.clone(), Arc::new(Stored { contents, stat }));
+                    let stored = Arc::new(Stored { contents, stat });
+                    Arc::make_mut(files).insert(path.clone(), stored);
                     outcome.changes.push(RawChange { path, kind: ChangeKind::Changed });
                 }
                 Action::Delete => {
-                    if files.remove(&path).is_some() {
+                    if files.contains_key(&path) {
+                        Arc::make_mut(files).remove(&path);
                         outcome.changes.push(RawChange { path, kind: ChangeKind::Removed });
                     }
                 }

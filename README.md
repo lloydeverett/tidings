@@ -16,7 +16,7 @@ the other backends are still to come. See [CONTEXT.md](CONTEXT.md) and [docs/adr
   file's contents is left out: the file keeps its time, and no change is reported.
 - Reads are one file at a time. Reading several files can mix states from different commits.
   Every path that changes afterwards appears on the change feed, so read it again when it does.
-- For a consistent read of several files, use a snapshot of an area. Commits made while you hold
+- To read several files without mixing commits, use a snapshot of an area. Commits made while you hold
   it don't show in it, and aren't held up by it. SQLite and memory support snapshots; the
   filesystem doesn't, because other programs can change files mid-read. Check
   `supports_snapshots()`.
