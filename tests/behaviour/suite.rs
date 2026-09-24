@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use jiff::Timestamp;
 use tidings::{
-    Area, Change, ChangeFeed, ChangeKind, Error, FeedItem, File, Origin, Staging, Store,
+    Area, Change, ChangeFeed, ChangeKind, Error, FeedItem, File, InvalidPathReason, Origin,
+    Staging, Store,
 };
 
 /// How a Backend opens a fresh, empty Store for one test.
@@ -50,7 +51,7 @@ pub async fn a_committed_write_can_be_read_back(fixture: &impl Fixture) {
     staging.write("settings.toml", "theme = \"dark\"\n").unwrap();
     store.commit(staging).await.unwrap();
 
-    let file = store.read(Area::Config, "settings.toml").await.unwrap().unwrap();
+    let file = read(&store, Area::Config, "settings.toml").await;
     assert_eq!(file.contents(), "theme = \"dark\"\n");
 }
 
@@ -92,34 +93,6 @@ pub async fn a_revision_is_decided_by_the_contents_alone(fixture: &impl Fixture)
     assert_eq!(read(&store, Area::Cache, "a.txt").await.revision(), c.revision());
 }
 
-/// Waits for the next item on the Change feed, failing the test if none arrives in time.
-async fn next_item(feed: &mut ChangeFeed) -> FeedItem {
-    tokio::time::timeout(Duration::from_secs(5), feed.next())
-        .await
-        .expect("the Change feed should have sent something by now")
-        .expect("the Change feed should not have ended")
-}
-
-/// Waits for the next batch of Changes, sorted by Area and Path so it can be compared.
-async fn next_batch(feed: &mut ChangeFeed) -> Vec<Change> {
-    match next_item(feed).await {
-        FeedItem::Changes(mut batch) => {
-            batch.sort_by(|a, b| (a.area, &a.path).cmp(&(b.area, &b.path)));
-            batch
-        }
-        other => panic!("expected a batch of Changes, got {other:?}"),
-    }
-}
-
-/// Reads a File that the test expects to exist.
-async fn read(store: &Store, area: Area, path: &str) -> File {
-    store
-        .read(area, path)
-        .await
-        .unwrap()
-        .unwrap_or_else(|| panic!("{path} should exist in {area:?}"))
-}
-
 pub async fn a_commit_announces_one_batch_of_local_changes(fixture: &impl Fixture) {
     let Opened { store, mut feed } = fixture.open().await;
 
@@ -140,6 +113,7 @@ pub async fn a_commit_announces_one_batch_of_local_changes(fixture: &impl Fixtur
             (Area::Config, "themes/dark.toml", ChangeKind::Changed, Origin::Local),
         ],
     );
+    assert_nothing_more(&mut feed).await;
 }
 
 pub async fn a_staging_is_built_without_the_store(fixture: &impl Fixture) {
@@ -173,15 +147,58 @@ pub async fn a_dropped_staging_writes_nothing(fixture: &impl Fixture) {
 pub async fn an_invalid_path_is_refused_wherever_it_is_used(fixture: &impl Fixture) {
     let Opened { store, feed: _feed } = fixture.open().await;
 
-    for path in ["", "/etc/passwd", "a//b", "trailing/"] {
+    let refused = [
+        ("", InvalidPathReason::Empty),
+        ("/etc/passwd", InvalidPathReason::NotRelative),
+        ("a//b", InvalidPathReason::EmptySegment),
+        ("trailing/", InvalidPathReason::EmptySegment),
+    ];
+    for (path, expected) in refused {
         let mut staging = Staging::new(Area::Data);
-        assert!(
-            matches!(staging.write(path, "x"), Err(Error::InvalidPath { .. })),
-            "writing {path:?} should be refused",
-        );
-        assert!(
-            matches!(store.read(Area::Data, path).await, Err(Error::InvalidPath { .. })),
-            "reading {path:?} should be refused",
-        );
+        match staging.write(path, "x") {
+            Err(Error::InvalidPath { reason, .. }) => assert_eq!(reason, expected, "{path:?}"),
+            other => panic!("writing {path:?} should be refused, got {other:?}"),
+        }
+        match store.read(Area::Data, path).await {
+            Err(Error::InvalidPath { reason, .. }) => assert_eq!(reason, expected, "{path:?}"),
+            other => panic!("reading {path:?} should be refused, got {other:?}"),
+        }
+    }
+}
+
+// Helpers shared by the tests above.
+
+/// Waits for the next item on the Change feed, failing the test if none arrives in time.
+async fn next_item(feed: &mut ChangeFeed) -> FeedItem {
+    tokio::time::timeout(Duration::from_secs(5), feed.next())
+        .await
+        .expect("the Change feed should have sent something by now")
+        .expect("the Change feed should not have ended")
+}
+
+/// Waits for the next batch of Changes, sorted by Area and Path so it can be compared.
+async fn next_batch(feed: &mut ChangeFeed) -> Vec<Change> {
+    match next_item(feed).await {
+        FeedItem::Changes(mut batch) => {
+            batch.sort_by(|a, b| (a.area, &a.path).cmp(&(b.area, &b.path)));
+            batch
+        }
+        other => panic!("expected a batch of Changes, got {other:?}"),
+    }
+}
+
+/// Reads a File that the test expects to exist.
+async fn read(store: &Store, area: Area, path: &str) -> File {
+    store
+        .read(area, path)
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("{path} should exist in {area:?}"))
+}
+
+/// Checks that nothing more arrives on the Change feed for a short while.
+async fn assert_nothing_more(feed: &mut ChangeFeed) {
+    if let Ok(item) = tokio::time::timeout(Duration::from_millis(200), feed.next()).await {
+        panic!("expected nothing more on the Change feed, got {item:?}");
     }
 }

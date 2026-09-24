@@ -32,11 +32,6 @@ impl File {
         &self.contents
     }
 
-    /// The File's text contents, taken out of the File.
-    pub fn into_contents(self) -> String {
-        self.contents
-    }
-
     /// When the File was last modified. Every File in a Commit gets the same time.
     pub fn modified(&self) -> Timestamp {
         self.modified

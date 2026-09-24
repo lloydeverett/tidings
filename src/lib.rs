@@ -19,7 +19,7 @@ pub use area::Area;
 pub use change::{Change, ChangeFeed, ChangeKind, FeedItem, Origin};
 pub use error::{Error, Result};
 pub use file::File;
-pub use path::{IntoPath, Path};
+pub use path::{IntoPath, InvalidPathReason, Path};
 pub use revision::Revision;
 pub use staging::Staging;
 pub use store::Store;

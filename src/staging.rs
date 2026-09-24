@@ -7,7 +7,7 @@ use crate::{Area, IntoPath, Path, Result};
 ///
 /// A Staging is an ordinary value, built without the Store. Dropping it without committing
 /// writes nothing.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[must_use = "a Staging writes nothing until it is committed"]
 pub struct Staging {
     area: Area,

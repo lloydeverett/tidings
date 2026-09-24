@@ -1,3 +1,5 @@
+use crate::InvalidPathReason;
+
 /// Everything that can go wrong in tidings.
 ///
 /// A missing File is not an error: reading one gives `Ok(None)`.
@@ -10,7 +12,7 @@ pub enum Error {
         /// The Path as it was given.
         path: String,
         /// Which rule it breaks.
-        reason: String,
+        reason: InvalidPathReason,
     },
 }
 

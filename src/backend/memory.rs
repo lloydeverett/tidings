@@ -13,12 +13,8 @@ pub(crate) struct MemoryBackend {
     areas: Mutex<Areas>,
 }
 
-#[derive(Debug, Default)]
-struct Areas {
-    config: BTreeMap<Path, Stored>,
-    data: BTreeMap<Path, Stored>,
-    cache: BTreeMap<Path, Stored>,
-}
+/// Each Area's Files, indexed by `Area as usize`.
+type Areas = [BTreeMap<Path, Stored>; 3];
 
 /// A File as the memory Backend keeps it.
 #[derive(Debug)]
@@ -28,28 +24,10 @@ struct Stored {
     revision: Revision,
 }
 
-impl Areas {
-    fn get(&self, area: Area) -> &BTreeMap<Path, Stored> {
-        match area {
-            Area::Config => &self.config,
-            Area::Data => &self.data,
-            Area::Cache => &self.cache,
-        }
-    }
-
-    fn get_mut(&mut self, area: Area) -> &mut BTreeMap<Path, Stored> {
-        match area {
-            Area::Config => &mut self.config,
-            Area::Data => &mut self.data,
-            Area::Cache => &mut self.cache,
-        }
-    }
-}
-
 impl MemoryBackend {
     pub(crate) fn read(&self, area: Area, path: &Path) -> Option<File> {
         let areas = self.areas.lock().unwrap();
-        let stored = areas.get(area).get(path)?;
+        let stored = areas[area as usize].get(path)?;
         Some(File::new(path.clone(), stored.contents.clone(), stored.modified, stored.revision))
     }
 
@@ -57,7 +35,7 @@ impl MemoryBackend {
     pub(crate) fn commit(&self, request: CommitRequest) -> Written {
         let CommitRequest { area, timestamp, writes } = request;
         let mut areas = self.areas.lock().unwrap();
-        let files = areas.get_mut(area);
+        let files = &mut areas[area as usize];
         let mut written = Written::new();
         for (path, contents) in writes {
             let revision = Revision::of(&contents);

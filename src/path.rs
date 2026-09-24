@@ -14,7 +14,7 @@ impl Path {
     pub fn new(path: impl Into<String>) -> Result<Path> {
         let path = path.into();
         if let Some(reason) = refusal(&path) {
-            return Err(Error::InvalidPath { path, reason: reason.to_owned() });
+            return Err(Error::InvalidPath { path, reason });
         }
         Ok(Path(path))
     }
@@ -26,15 +26,37 @@ impl Path {
 }
 
 /// Why `path` is refused, if it is.
-fn refusal(path: &str) -> Option<&'static str> {
+fn refusal(path: &str) -> Option<InvalidPathReason> {
     if path.is_empty() {
-        Some("it is empty")
+        Some(InvalidPathReason::Empty)
     } else if path.starts_with('/') {
-        Some("it is not relative")
+        Some(InvalidPathReason::NotRelative)
     } else if path.split('/').any(str::is_empty) {
-        Some("it has an empty segment")
+        Some(InvalidPathReason::EmptySegment)
     } else {
         None
+    }
+}
+
+/// Which rule a refused Path breaks, as given by [`Error::InvalidPath`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum InvalidPathReason {
+    /// The Path is the empty string.
+    Empty,
+    /// The Path starts with `/`.
+    NotRelative,
+    /// The Path has an empty segment, as in `a//b` or `a/`.
+    EmptySegment,
+}
+
+impl fmt::Display for InvalidPathReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            InvalidPathReason::Empty => "it is empty",
+            InvalidPathReason::NotRelative => "it is not relative",
+            InvalidPathReason::EmptySegment => "it has an empty segment",
+        })
     }
 }
 
@@ -47,36 +69,6 @@ impl fmt::Debug for Path {
 impl fmt::Display for Path {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
-    }
-}
-
-impl AsRef<str> for Path {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<&str> for Path {
-    type Error = Error;
-
-    fn try_from(path: &str) -> Result<Path> {
-        Path::new(path)
-    }
-}
-
-impl TryFrom<String> for Path {
-    type Error = Error;
-
-    fn try_from(path: String) -> Result<Path> {
-        Path::new(path)
-    }
-}
-
-impl std::str::FromStr for Path {
-    type Err = Error;
-
-    fn from_str(path: &str) -> Result<Path> {
-        Path::new(path)
     }
 }
 
