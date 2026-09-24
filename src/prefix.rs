@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::path::refusal;
-use crate::{Error, InvalidPathReason, Result};
+use crate::{Error, InvalidPathReason, Path, Result};
 
 /// The leading part of a Path, up to a `/`, known to be valid. It names a group of Files, such as
 /// every File under `themes/`.
@@ -26,6 +26,12 @@ impl Prefix {
     /// The Prefix as a string: empty, or ending with `/`.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Whether `path` is under this Prefix. Because a Prefix ends in `/`, only whole segments
+    /// match.
+    pub(crate) fn covers(&self, path: &Path) -> bool {
+        path.as_str().starts_with(self.as_str())
     }
 }
 

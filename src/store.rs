@@ -4,7 +4,10 @@ use jiff::Timestamp;
 
 use crate::backend::{Backend, CommitRequest, memory::MemoryBackend};
 use crate::change::{self, FeedSender};
-use crate::{Area, Change, ChangeFeed, ChangeKind, File, IntoPath, Origin, Result, Staging};
+use crate::{
+    Area, Change, ChangeFeed, Committed, File, IntoPath, IntoPrefix, Origin, Path, Result, Staging,
+    Stat,
+};
 
 /// What an application opens to reach its Files: all three Areas, held by one Backend.
 ///
@@ -40,18 +43,39 @@ impl Store {
         self.inner.backend.read(area, &path).await
     }
 
-    /// Commits `staging`: applies all of its writes, or none of them. Every File written gets the
-    /// same last-modified time, and the Changes arrive on the Change feed in one batch.
-    pub async fn commit(&self, staging: Staging) -> Result<()> {
+    /// Gives when the File at `path` in `area` was last modified and its Revision, without loading
+    /// its contents, or `Ok(None)` if there is no File there.
+    pub async fn stat(&self, area: Area, path: impl IntoPath) -> Result<Option<Stat>> {
+        let path = path.into_path()?;
+        self.inner.backend.stat(area, &path).await
+    }
+
+    /// Lists the Paths of the Files under `prefix` in `area`, in order. The empty Prefix lists the
+    /// whole Area. Only the Paths are loaded, not the Files.
+    pub async fn list(&self, area: Area, prefix: impl IntoPrefix) -> Result<Vec<Path>> {
+        let prefix = prefix.into_prefix()?;
+        self.inner.backend.list(area, &prefix).await
+    }
+
+    /// Commits `staging`: applies all of its writes and deletes, or none of them. Prefix deletes
+    /// cover the Files under the Prefix at this moment.
+    ///
+    /// Every File written gets the Commit's timestamp as its last-modified time. A write that
+    /// wouldn't change the File's contents is left out, so the File keeps its time and no Change
+    /// is sent for it. The Changes arrive on the Change feed in one batch, and a Commit that
+    /// changes nothing sends none. On success, gives the timestamp and the new Revisions.
+    pub async fn commit(&self, staging: Staging) -> Result<Committed> {
         let area = staging.area();
-        let request =
-            CommitRequest { area, timestamp: Timestamp::now(), writes: staging.into_writes() };
-        let written = self.inner.backend.commit(request).await?;
-        let changes = written
-            .into_keys()
-            .map(|path| Change { area, path, kind: ChangeKind::Changed, origin: Origin::Local })
+        let timestamp = Timestamp::now();
+        let (staged, prefix_deletes) = staging.into_parts();
+        let request = CommitRequest { area, timestamp, staged, prefix_deletes };
+        let applied = self.inner.backend.commit(request).await?;
+        let changes = applied
+            .changes
+            .into_iter()
+            .map(|(path, kind)| Change { area, path, kind, origin: Origin::Local })
             .collect();
         self.inner.feed.announce(changes);
-        Ok(())
+        Ok(Committed::new(timestamp, applied.revisions))
     }
 }

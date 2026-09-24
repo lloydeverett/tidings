@@ -4,13 +4,16 @@ Text files for an application, in three areas (config, data, cache), stored on t
 SQLite or in memory. Writes happen only through staged commits. Every change is reported on a
 change feed.
 
-Status: early. Only the in-memory Store, with plain writes and reads and checked paths, exists
-so far. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
+Status: early. Only the in-memory Store exists so far: reading, stat and listing, and commits of
+writes and deletes, with checked paths. Preconditions, snapshots and the other backends are still
+to come. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
 
 ## Consistency
 
 - A commit is all-or-nothing, and only happens when you call `commit`. A staging you drop is
   discarded.
+- Every file a commit writes gets the same last-modified time. A write that wouldn't change a
+  file's contents is left out: the file keeps its time, and no change is reported.
 - Reads are one file at a time. Reading several files can mix states from different commits.
   Every path that changes afterwards appears on the change feed, so read it again when it does.
 - For a consistent read of several files, use a snapshot. SQLite and memory support snapshots;

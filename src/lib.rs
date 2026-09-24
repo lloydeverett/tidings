@@ -8,6 +8,7 @@
 mod area;
 mod backend;
 mod change;
+mod committed;
 mod error;
 mod file;
 mod path;
@@ -18,8 +19,9 @@ mod store;
 
 pub use area::Area;
 pub use change::{Change, ChangeFeed, ChangeKind, FeedItem, Origin};
+pub use committed::Committed;
 pub use error::{Error, Result};
-pub use file::File;
+pub use file::{File, Stat};
 pub use path::{IntoPath, InvalidPathReason, Path};
 pub use prefix::{IntoPrefix, Prefix};
 pub use revision::Revision;

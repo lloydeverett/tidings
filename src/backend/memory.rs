@@ -5,8 +5,9 @@ use std::sync::Mutex;
 
 use jiff::Timestamp;
 
-use super::{CommitRequest, Written};
-use crate::{Area, File, Path, Revision};
+use super::{Applied, CommitRequest};
+use crate::staging::Staged;
+use crate::{Area, ChangeKind, File, Path, Prefix, Revision, Stat};
 
 #[derive(Debug, Default)]
 pub(crate) struct MemoryBackend {
@@ -31,17 +32,47 @@ impl MemoryBackend {
         Some(File::new(path.clone(), stored.contents.clone(), stored.modified, stored.revision))
     }
 
-    /// Applies every write at once, under the one lock.
-    pub(crate) fn commit(&self, request: CommitRequest) -> Written {
-        let CommitRequest { area, timestamp, writes } = request;
+    pub(crate) fn stat(&self, area: Area, path: &Path) -> Option<Stat> {
+        let areas = self.areas.lock().unwrap();
+        let stored = areas[area as usize].get(path)?;
+        Some(Stat::new(stored.modified, stored.revision))
+    }
+
+    pub(crate) fn list(&self, area: Area, prefix: &Prefix) -> Vec<Path> {
+        let areas = self.areas.lock().unwrap();
+        areas[area as usize].keys().filter(|path| prefix.covers(path)).cloned().collect()
+    }
+
+    /// Applies every write and delete at once, under the one lock.
+    pub(crate) fn commit(&self, request: CommitRequest) -> Applied {
+        let CommitRequest { area, timestamp, mut staged, prefix_deletes } = request;
         let mut areas = self.areas.lock().unwrap();
         let files = &mut areas[area as usize];
-        let mut written = Written::new();
-        for (path, contents) in writes {
-            let revision = Revision::of(&contents);
-            files.insert(path.clone(), Stored { contents, modified: timestamp, revision });
-            written.insert(path, revision);
+        for prefix in &prefix_deletes {
+            for path in files.keys().filter(|path| prefix.covers(path)) {
+                staged.entry(path.clone()).or_insert(Staged::Delete);
+            }
         }
-        written
+        let mut applied = Applied::default();
+        for (path, staged) in staged {
+            match staged {
+                Staged::Write(contents) => {
+                    let revision = Revision::of(&contents);
+                    applied.revisions.insert(path.clone(), revision);
+                    // A write that changes nothing is left out: the File keeps its time.
+                    if files.get(&path).is_some_and(|stored| stored.revision == revision) {
+                        continue;
+                    }
+                    files.insert(path.clone(), Stored { contents, modified: timestamp, revision });
+                    applied.changes.push((path, ChangeKind::Changed));
+                }
+                Staged::Delete => {
+                    if files.remove(&path).is_some() {
+                        applied.changes.push((path, ChangeKind::Removed));
+                    }
+                }
+            }
+        }
+        applied
     }
 }
