@@ -32,6 +32,7 @@ macro_rules! behaviour_suite {
             a_staging_is_built_without_the_store,
             a_dropped_staging_writes_nothing,
             an_invalid_path_is_refused_wherever_it_is_used,
+            every_allowed_path_can_be_written_and_read_back,
         );
     };
     (@tests $fixture:expr; $($test:ident),* $(,)?) => {
@@ -147,11 +148,19 @@ pub async fn a_dropped_staging_writes_nothing(fixture: &impl Fixture) {
 pub async fn an_invalid_path_is_refused_wherever_it_is_used(fixture: &impl Fixture) {
     let Opened { store, feed: _feed } = fixture.open().await;
 
+    // One Path for each rule. tests/paths.rs has the full table.
     let refused = [
         ("", InvalidPathReason::Empty),
         ("/etc/passwd", InvalidPathReason::NotRelative),
         ("a//b", InvalidPathReason::EmptySegment),
         ("trailing/", InvalidPathReason::EmptySegment),
+        ("a/../b.txt", InvalidPathReason::DotSegment),
+        ("CON", InvalidPathReason::UnportableName),
+        ("aux.txt", InvalidPathReason::UnportableName),
+        ("trailing.", InvalidPathReason::UnportableName),
+        ("tab\there", InvalidPathReason::UnportableName),
+        ("cafe\u{301}.txt", InvalidPathReason::NotNfc),
+        (".tidings/lock", InvalidPathReason::Reserved),
     ];
     for (path, expected) in refused {
         let mut staging = Staging::new(Area::Data);
@@ -163,6 +172,30 @@ pub async fn an_invalid_path_is_refused_wherever_it_is_used(fixture: &impl Fixtu
             Err(Error::InvalidPath { reason, .. }) => assert_eq!(reason, expected, "{path:?}"),
             other => panic!("reading {path:?} should be refused, got {other:?}"),
         }
+    }
+}
+
+pub async fn every_allowed_path_can_be_written_and_read_back(fixture: &impl Fixture) {
+    let Opened { store, feed: _feed } = fixture.open().await;
+
+    let allowed = [
+        ".hidden",
+        "with space.txt",
+        "semi;colon.js",
+        "console.log",
+        "caf\u{e9}/r\u{e9}sum\u{e9}.md",
+        "\u{65e5}\u{672c}\u{8a9e}/\u{30e1}\u{30e2}.txt",
+        "notes/.tidings",
+    ];
+    let mut staging = Staging::new(Area::Data);
+    for path in allowed {
+        staging.write(path, path).unwrap();
+    }
+    store.commit(staging).await.unwrap();
+
+    for path in allowed {
+        let file = read(&store, Area::Data, path).await;
+        assert_eq!((file.path().as_str(), file.contents()), (path, path));
     }
 }
 

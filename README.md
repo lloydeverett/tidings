@@ -4,8 +4,8 @@ Text files for an application, in three areas (config, data, cache), stored on t
 SQLite or in memory. Writes happen only through staged commits. Every change is reported on a
 change feed.
 
-Status: early. Only the in-memory Store, with plain writes and reads, exists so far. See
-[CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
+Status: early. Only the in-memory Store, with plain writes and reads and checked paths, exists
+so far. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
 
 ## Consistency
 
@@ -29,6 +29,10 @@ Status: early. Only the in-memory Store, with plain writes and reads, exists so 
 ## Limitations
 
 - Text only (UTF-8). No binary files.
+- Paths follow the strictest platform's rules on every backend, so a path that works on one
+  platform works on all of them. Names Windows reserves (such as `CON` or `aux.txt`), a trailing
+  dot or space, `.` and `..`, and paths not in Unicode NFC form are refused, as is anything under
+  `.tidings/`.
 - No moving a store's data from one backend to another.
 - No size limit or eviction for the cache area.
 - Backends are defined in this crate. You cannot plug in your own.

@@ -1,11 +1,18 @@
 use std::fmt;
 
+use relative_path::{Component, RelativePath};
+
 use crate::{Error, Result};
 
 /// A File's name within its Area, known to be valid.
 ///
-/// A Path is relative and `/`-separated, with no empty segments. It can only be made by
-/// validating a string, with [`Path::new`] or through [`IntoPath`].
+/// A Path follows the strictest platform's rules, on every Backend, so a Path that works on one
+/// platform works on all of them. It is relative and `/`-separated, with no empty, `.` or `..`
+/// segments. Each segment is a name Windows accepts, the whole Path is in Unicode NFC form, and
+/// nothing is under `.tidings/`, which tidings keeps for itself. [`InvalidPathReason`] lists the
+/// rules.
+///
+/// It can only be made by validating a string, with [`Path::new`] or through [`IntoPath`].
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Path(String);
 
@@ -25,20 +32,47 @@ impl Path {
     }
 }
 
+/// The top-level name tidings keeps its own bookkeeping under, in upper case.
+const RESERVED_UPPERCASE: &str = ".TIDINGS";
+
 /// Why `path` is refused, if it is.
-fn refusal(path: &str) -> Option<InvalidPathReason> {
+pub(crate) fn refusal(path: &str) -> Option<InvalidPathReason> {
+    let segments = RelativePath::new(path).components();
     if path.is_empty() {
         Some(InvalidPathReason::Empty)
     } else if path.starts_with('/') {
         Some(InvalidPathReason::NotRelative)
-    } else if path.split('/').any(str::is_empty) {
+    } else if segments.clone().count() != path.split('/').count() {
+        // relative-path skips empty segments, so each one shows up here as a segment missing.
         Some(InvalidPathReason::EmptySegment)
+    } else if segments.clone().any(|segment| !matches!(segment, Component::Normal(_))) {
+        Some(InvalidPathReason::DotSegment)
+    } else if segments.clone().any(|segment| !is_portable_name(segment.as_str())) {
+        Some(InvalidPathReason::UnportableName)
+    } else if segments.clone().next().is_some_and(|first| is_reserved(first.as_str())) {
+        Some(InvalidPathReason::Reserved)
+    } else if !unicode_normalization::is_nfc(path) {
+        Some(InvalidPathReason::NotNfc)
     } else {
         None
     }
 }
 
-/// Which rule a refused Path breaks, as given by [`Error::InvalidPath`].
+/// Whether every platform accepts `name` as a file name, judged by the strictest rules there are:
+/// Windows'.
+fn is_portable_name(name: &str) -> bool {
+    let windows = sanitize_filename::OptionsForCheck { windows: true, truncate: true };
+    sanitize_filename::is_sanitized_with_options(name, windows)
+}
+
+/// Whether `name`, as a Path's first segment, is tidings' own. Letter case is ignored, because on a
+/// case-insensitive filesystem `.Tidings` is the same directory. Comparing in upper case, as NTFS
+/// does, also catches letters such as `ſ` that only match once uppercased.
+fn is_reserved(name: &str) -> bool {
+    name.to_uppercase() == RESERVED_UPPERCASE
+}
+
+/// Which rule a refused Path or Prefix breaks, as given by [`Error::InvalidPath`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum InvalidPathReason {
@@ -48,6 +82,19 @@ pub enum InvalidPathReason {
     NotRelative,
     /// The Path has an empty segment, as in `a//b` or `a/`.
     EmptySegment,
+    /// The Path has a `.` or `..` segment.
+    DotSegment,
+    /// A segment is not a name every platform accepts. Windows' rules decide: no reserved names
+    /// such as `CON` or `aux.txt`, none of `\ : * ? " < > |`, no control characters, no
+    /// trailing dot or space, and at most 255 bytes.
+    UnportableName,
+    /// The Path is not in Unicode NFC form. macOS treats different forms of the same character as
+    /// one name, so only one form is allowed.
+    NotNfc,
+    /// The Path is under `.tidings/`, which tidings keeps for itself.
+    Reserved,
+    /// A Prefix other than the empty one doesn't end with `/`.
+    NoTrailingSlash,
 }
 
 impl fmt::Display for InvalidPathReason {
@@ -56,6 +103,13 @@ impl fmt::Display for InvalidPathReason {
             InvalidPathReason::Empty => "it is empty",
             InvalidPathReason::NotRelative => "it is not relative",
             InvalidPathReason::EmptySegment => "it has an empty segment",
+            InvalidPathReason::DotSegment => "it has a `.` or `..` segment",
+            InvalidPathReason::UnportableName => "a segment is not a name every platform accepts",
+            InvalidPathReason::NotNfc => "it is not in Unicode NFC form",
+            InvalidPathReason::Reserved => {
+                "it is under `.tidings/`, which tidings keeps for itself"
+            }
+            InvalidPathReason::NoTrailingSlash => "it is a Prefix that doesn't end with `/`",
         })
     }
 }

@@ -9,16 +9,30 @@ Established crates do the checking; we don't write the rules ourselves.
 
 **Blocked by:** 01
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Structure is checked with `relative-path`. Refused: absolute Paths, empty segments, `.`,
+- [x] Structure is checked with `relative-path`. Refused: absolute Paths, empty segments, `.`,
       `..`, and a leading `/`.
-- [ ] Each segment is checked with `sanitize-filename` using its Windows rules. Refused, for
+- [x] Each segment is checked with `sanitize-filename` using its Windows rules. Refused, for
       example: `CON`, `aux.txt`, control characters, a trailing dot or space.
-- [ ] A Path not in Unicode NFC form is refused, checked with `unicode-normalization`.
-- [ ] Paths under the reserved `.tidings` Prefix are refused.
-- [ ] Prefixes are checked by the same rules.
-- [ ] Every operation that takes a Path or a Prefix returns `InvalidPath`: read, stat, list,
-      Staging operations.
-- [ ] A table-driven test covers accepted and refused strings, including Unicode and Windows
+- [x] A Path not in Unicode NFC form is refused, checked with `unicode-normalization`.
+- [x] Paths under the reserved `.tidings` Prefix are refused.
+- [x] Prefixes are checked by the same rules.
+- [x] Every operation that takes a Path or a Prefix returns `InvalidPath`: read, stat, list,
+      Staging operations. Only `read` and `Staging::write` exist so far, and both are covered.
+      The operations tickets 03 and 04 add get the same checks by taking `impl IntoPath` or
+      `impl IntoPrefix`.
+- [x] A table-driven test covers accepted and refused strings, including Unicode and Windows
       cases.
+
+**Notes:**
+
+- A Prefix is written and kept as either the empty string (the whole Area) or a valid Path
+  followed by `/`, such as `themes/`. That is the glossary's "the leading part of a Path, up to a
+  `/`", taken literally. The trailing `/` means a Prefix can't be mistaken for the Path of a
+  File, and `path.starts_with(prefix)` then matches whole segments only (`themes/` doesn't cover
+  `themes2/a`). `themes` without the `/` is refused with `NoTrailingSlash` rather than silently
+  treated as `themes/`.
+- `.tidings` is refused as the first segment in any letter case, compared in upper case as NTFS
+  does, so `.Tidings` and `.tidingſ` are refused too. Deeper segments named `.tidings` are
+  allowed.

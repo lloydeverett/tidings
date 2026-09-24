@@ -6,10 +6,10 @@ use crate::InvalidPathReason;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// A Path is not allowed.
+    /// A Path or Prefix is not allowed.
     #[error("invalid path {path:?}: {reason}")]
     InvalidPath {
-        /// The Path as it was given.
+        /// The Path or Prefix as it was given.
         path: String,
         /// Which rule it breaks.
         reason: InvalidPathReason,
