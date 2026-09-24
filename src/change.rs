@@ -1,7 +1,11 @@
 //! The Change feed: how a Store tells the application what changed.
 
-use tokio::sync::mpsc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
+use tokio::sync::Notify;
+
+use crate::backend::RawChange;
 use crate::{Area, Path};
 
 /// A notice that one Path in one Area was changed or removed, and by whom.
@@ -41,7 +45,8 @@ pub enum Origin {
 /// One item on the Change feed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedItem {
-    /// Changes that happened together. A Commit's Changes always arrive in the same batch.
+    /// Every Change recorded since the last item, merged per Area and Path. A Commit's Changes
+    /// always arrive in the same batch, and a batch may hold several Commits' Changes.
     Changes(Vec<Change>),
     /// Changes to this Area may have been missed: read everything you rely on in it again.
     Resync(Area),
@@ -50,38 +55,146 @@ pub enum FeedItem {
 /// The single receiver of a Store's Changes, handed over when the Store is opened.
 ///
 /// There is exactly one, and no way to get another later, so every Change after the Store is
-/// opened is reported. If it is dropped, the Store keeps working.
+/// opened is reported. If it is dropped, the Store keeps working and stops recording Changes.
+///
+/// Changes wait here until they are read, merged per Area and Path: a Path changed many times
+/// before [`next`](Self::next) is called gives one Change, so falling behind never loses a Path
+/// and the memory held grows only with the number of Paths changed.
 #[derive(Debug)]
 pub struct ChangeFeed {
-    receiver: mpsc::UnboundedReceiver<FeedItem>,
+    shared: Arc<Shared>,
 }
 
 impl ChangeFeed {
-    /// Waits for the next item. Gives `None` once every handle to the Store has been dropped.
+    /// Waits for the next item: every Change recorded since the last one, merged per Area and
+    /// Path, in one batch. A Commit's Changes are never split across batches, but a batch may
+    /// hold several Commits' Changes.
+    ///
+    /// Gives `None` once every handle to the Store has been dropped and everything recorded
+    /// before has been read.
     pub async fn next(&mut self) -> Option<FeedItem> {
-        self.receiver.recv().await
+        loop {
+            if let Some(next) = self.shared.pending.lock().unwrap().next() {
+                return next;
+            }
+            self.shared.recorded.notified().await;
+        }
+    }
+}
+
+impl Drop for ChangeFeed {
+    /// Nobody will read the Changes, so what is pending is dropped and nothing more is recorded.
+    fn drop(&mut self) {
+        let mut pending = self.shared.pending.lock().unwrap();
+        pending.feed_dropped = true;
+        pending.areas = Default::default();
+    }
+}
+
+/// What the Store's end and the Change feed share.
+#[derive(Debug, Default)]
+struct Shared {
+    pending: Mutex<Pending>,
+    /// Woken whenever something is recorded. There is only one Change feed to wake, and a
+    /// wake-up with nobody waiting is kept for the next wait, so none is missed.
+    recorded: Notify,
+}
+
+/// Every Change recorded and not yet read, merged. It holds at most one entry per Area and Path,
+/// however many Changes were recorded.
+#[derive(Debug, Default)]
+struct Pending {
+    /// The merged Changes for each Area, indexed by `Area as usize`. Kept per Area so that a
+    /// Resync, which covers a whole Area, can take the place of that Area's pending Changes: the
+    /// app reads the whole Area again after it anyway.
+    areas: [BTreeMap<Path, Merged>; 3],
+    /// Every Store handle has been dropped: once what is pending has been read, the Change feed
+    /// ends.
+    store_dropped: bool,
+    /// The Change feed has been dropped, so nothing is recorded.
+    feed_dropped: bool,
+}
+
+/// What is left of every unread Change to one Path, merged.
+#[derive(Debug)]
+struct Merged {
+    /// The latest kind.
+    kind: ChangeKind,
+    /// External if any of the Changes merged was, so an app that skips its own Changes never
+    /// misses someone else's.
+    origin: Origin,
+}
+
+impl Pending {
+    fn record(&mut self, area: Area, changes: Vec<RawChange>, origin: Origin) {
+        if self.store_dropped || self.feed_dropped {
+            return;
+        }
+        let merged = &mut self.areas[area as usize];
+        for RawChange { path, kind } in changes {
+            let merged = merged.entry(path).or_insert(Merged { kind, origin });
+            merged.kind = kind;
+            if origin == Origin::External {
+                merged.origin = Origin::External;
+            }
+        }
+    }
+
+    /// What [`ChangeFeed::next`] gives now, or `None` if it has to wait.
+    fn next(&mut self) -> Option<Option<FeedItem>> {
+        if let Some(batch) = self.take() {
+            return Some(Some(FeedItem::Changes(batch)));
+        }
+        self.store_dropped.then_some(None)
+    }
+
+    /// Everything pending, as one batch, or `None` if nothing is.
+    fn take(&mut self) -> Option<Vec<Change>> {
+        let mut batch = Vec::new();
+        for (area, merged) in Area::ALL.into_iter().zip(&mut self.areas) {
+            let changes = std::mem::take(merged).into_iter();
+            batch.extend(changes.map(|(path, Merged { kind, origin })| Change {
+                area,
+                path,
+                kind,
+                origin,
+            }));
+        }
+        (!batch.is_empty()).then_some(batch)
     }
 }
 
 /// The Store's end of its Change feed.
 #[derive(Debug)]
 pub(crate) struct FeedSender {
-    sender: mpsc::UnboundedSender<FeedItem>,
+    shared: Arc<Shared>,
 }
 
 impl FeedSender {
-    /// Sends `changes` as one batch. Once the Change feed has been dropped, nothing is sent.
-    pub(crate) fn announce(&self, changes: Vec<Change>) {
+    /// Records `changes` to `area`, all made by `origin`, merging them into what is pending. They
+    /// are recorded all at once, so that a Commit's Changes reach the Change feed in the same
+    /// batch.
+    ///
+    /// This is where every Change enters the feed, local or external: the Store layer tags each
+    /// raw change with its Origin and records it here.
+    pub(crate) fn record(&self, area: Area, changes: Vec<RawChange>, origin: Origin) {
         if changes.is_empty() {
             return;
         }
-        // An error only means the application dropped its Change feed.
-        let _ = self.sender.send(FeedItem::Changes(changes));
+        self.shared.pending.lock().unwrap().record(area, changes, origin);
+        self.shared.recorded.notify_one();
+    }
+
+    /// Ends the Change feed, once what was recorded before has been read. The Store calls it
+    /// when its last handle is dropped. Nothing recorded after it reaches the feed.
+    pub(crate) fn end(&self) {
+        self.shared.pending.lock().unwrap().store_dropped = true;
+        self.shared.recorded.notify_one();
     }
 }
 
 /// A new Change feed and the Store's end of it.
 pub(crate) fn feed() -> (FeedSender, ChangeFeed) {
-    let (sender, receiver) = mpsc::unbounded_channel();
-    (FeedSender { sender }, ChangeFeed { receiver })
+    let shared = Arc::new(Shared::default());
+    (FeedSender { shared: shared.clone() }, ChangeFeed { shared })
 }

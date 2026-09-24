@@ -11,3 +11,8 @@ pub enum Area {
     /// Files that may disappear at any time, because the user or the OS cleared them.
     Cache,
 }
+
+impl Area {
+    /// Every Area, in order.
+    pub(crate) const ALL: [Area; 3] = [Area::Config, Area::Data, Area::Cache];
+}

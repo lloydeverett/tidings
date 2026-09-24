@@ -5,8 +5,8 @@ SQLite or in memory. Writes happen only through staged commits. Every change is 
 change feed.
 
 Status: early. Only the in-memory Store exists so far: reading, stat and listing, commits of
-writes and deletes with preconditions, and checked paths. Snapshots and the other backends are
-still to come. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
+writes and deletes with preconditions, checked paths, and the change feed. Snapshots, resyncs and
+the other backends are still to come. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
 
 ## Consistency
 
@@ -20,8 +20,12 @@ still to come. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
   the filesystem doesn't, because other programs can change files mid-read. Check
   `supports_snapshots()`.
 - Every change after `open` returns is reported. Unread changes to the same path are merged into
-  one. If changes may have been missed (watching failed, or an area's directory was removed), the
-  feed sends a resync for that area instead: read it all again.
+  one: the latest kind wins, and it counts as external if any of them was, so skipping your own
+  changes never hides anyone else's. A commit's changes always arrive in the same batch. If
+  changes may have been missed (watching failed, or an area's directory was removed), the feed
+  sends a resync for that area instead: read it all again.
+- The store can be cloned and shared between tasks. The change feed ends once every clone has
+  been dropped. Dropping the change feed leaves the store working.
 - Changes say which path changed, not what it now contains.
 - A read always returns a whole file, never a partly written one.
 - A commit can require that files, or everything under a prefix, are unchanged since you read

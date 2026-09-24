@@ -57,11 +57,18 @@ macro_rules! behaviour_suite {
             a_path_differing_only_in_letter_case_is_refused,
             a_file_cannot_be_under_another_file,
             a_prefix_revision_is_only_for_its_own_area_and_prefix,
+            unread_changes_are_merged_per_path_and_the_latest_kind_wins,
+            clones_of_a_store_share_its_files_and_its_change_feed,
+            the_store_keeps_working_once_its_change_feed_is_dropped,
+            a_commit_made_before_the_feed_is_first_read_is_reported,
+            a_commits_changes_are_never_split_across_batches,
+            concurrent_commits_reach_the_feed_in_the_order_they_were_made,
         );
     };
     (@tests $fixture:expr; $($test:ident),* $(,)?) => {
         $(
-            #[tokio::test]
+            // Several threads, so that tests of concurrent Commits really run them at once.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
             async fn $test() {
                 $crate::suite::$test(&$fixture).await;
             }
@@ -556,7 +563,6 @@ pub async fn a_rename_that_conflicts_leaves_both_paths_as_they_were(fixture: &im
     change.write("old-name.toml", "a = 2\n").unwrap();
     store.commit(change).await.unwrap();
     next_batch(&mut feed).await;
-    next_batch(&mut feed).await;
 
     let mut rename = Staging::new(Area::Config);
     rename.delete_requiring(file.path(), Precondition::UnchangedSince(file.revision())).unwrap();
@@ -916,6 +922,209 @@ pub async fn a_prefix_revision_is_only_for_its_own_area_and_prefix(fixture: &imp
     store.commit(staging).await.unwrap();
 }
 
+pub async fn unread_changes_are_merged_per_path_and_the_latest_kind_wins(fixture: &impl Fixture) {
+    let Opened { store, mut feed } = fixture.open().await;
+
+    // Nothing is read until every Commit is made.
+    let mut staging = Staging::new(Area::Data);
+    staging.write("removed-last.txt", "1").unwrap();
+    staging.write("changed-last.txt", "1").unwrap();
+    store.commit(staging).await.unwrap();
+    let mut staging = Staging::new(Area::Data);
+    staging.delete("removed-last.txt").unwrap();
+    staging.delete("changed-last.txt").unwrap();
+    store.commit(staging).await.unwrap();
+    let mut staging = Staging::new(Area::Data);
+    staging.write("changed-last.txt", "2").unwrap();
+    store.commit(staging).await.unwrap();
+    // Many Commits to one Path are one Change, not one each.
+    for i in 0..1000 {
+        let mut staging = Staging::new(Area::Data);
+        staging.write("often.txt", i.to_string()).unwrap();
+        store.commit(staging).await.unwrap();
+    }
+    // The same Path in another Area is another Change.
+    let mut staging = Staging::new(Area::Config);
+    staging.write("often.txt", "config").unwrap();
+    store.commit(staging).await.unwrap();
+
+    let batch = next_batch(&mut feed).await;
+    let seen: Vec<_> =
+        batch.iter().map(|change| (change.area, change.path.as_str(), change.kind)).collect();
+    assert_eq!(
+        seen,
+        [
+            (Area::Config, "often.txt", ChangeKind::Changed),
+            (Area::Data, "changed-last.txt", ChangeKind::Changed),
+            (Area::Data, "often.txt", ChangeKind::Changed),
+            (Area::Data, "removed-last.txt", ChangeKind::Removed),
+        ],
+    );
+    assert!(batch.iter().all(|change| change.origin == Origin::Local));
+    assert_nothing_more(&mut feed).await;
+}
+
+pub async fn clones_of_a_store_share_its_files_and_its_change_feed(fixture: &impl Fixture) {
+    let Opened { store, mut feed } = fixture.open().await;
+    let clone = store.clone();
+
+    // A clone in another task commits, and the original sees the File and the Change.
+    let task = tokio::spawn(async move {
+        let mut staging = Staging::new(Area::Config);
+        staging.write("from-clone.toml", "a = 1\n").unwrap();
+        clone.commit(staging).await.unwrap();
+        clone
+    });
+    let clone = task.await.unwrap();
+    assert_eq!(read(&store, Area::Config, "from-clone.toml").await.contents(), "a = 1\n");
+    assert_eq!(changes(&next_batch(&mut feed).await), [("from-clone.toml", ChangeKind::Changed)]);
+
+    // With the original gone, the clone keeps the Change feed going.
+    drop(store);
+    assert_nothing_more(&mut feed).await;
+    let mut staging = Staging::new(Area::Config);
+    staging.write("after-drop.toml", "b = 1\n").unwrap();
+    clone.commit(staging).await.unwrap();
+    assert_eq!(changes(&next_batch(&mut feed).await), [("after-drop.toml", ChangeKind::Changed)]);
+
+    // Once the last handle is gone, what was recorded still arrives, then the feed ends.
+    let mut staging = Staging::new(Area::Config);
+    staging.write("last.toml", "c = 1\n").unwrap();
+    clone.commit(staging).await.unwrap();
+    drop(clone);
+    assert_eq!(changes(&next_batch(&mut feed).await), [("last.toml", ChangeKind::Changed)]);
+    assert_ended(&mut feed).await;
+}
+
+pub async fn the_store_keeps_working_once_its_change_feed_is_dropped(fixture: &impl Fixture) {
+    let Opened { store, feed } = fixture.open().await;
+    let mut staging = Staging::new(Area::Data);
+    staging.write("before.txt", "unread").unwrap();
+    store.commit(staging).await.unwrap();
+    drop(feed);
+
+    for i in 0..100 {
+        let mut staging = Staging::new(Area::Data);
+        staging.write(format!("after/{i}.txt"), "a").unwrap();
+        staging.delete("before.txt").unwrap();
+        store.commit(staging).await.unwrap();
+    }
+    let mut staging = Staging::new(Area::Data);
+    staging.delete_prefix("after/").unwrap();
+    staging.write("last.txt", "last").unwrap();
+    store.commit(staging).await.unwrap();
+
+    assert_eq!(list(&store, Area::Data, "").await, ["last.txt"]);
+    assert_eq!(read(&store, Area::Data, "last.txt").await.contents(), "last");
+}
+
+pub async fn a_commit_made_before_the_feed_is_first_read_is_reported(fixture: &impl Fixture) {
+    let Opened { store, mut feed } = fixture.open().await;
+
+    // Straight after opening, from a clone, with the feed not yet read at all.
+    let clone = store.clone();
+    let mut staging = Staging::new(Area::Cache);
+    staging.write("first.txt", "first").unwrap();
+    clone.commit(staging).await.unwrap();
+
+    let batch = next_batch(&mut feed).await;
+    let seen: Vec<_> = batch.iter().map(|change| (change.area, change.path.as_str())).collect();
+    assert_eq!(seen, [(Area::Cache, "first.txt")]);
+    assert_nothing_more(&mut feed).await;
+}
+
+pub async fn a_commits_changes_are_never_split_across_batches(fixture: &impl Fixture) {
+    let Opened { store, mut feed } = fixture.open().await;
+    // Many Files per Commit, so that a Commit recorded in parts would likely be read in parts.
+    const FILES: usize = 20;
+
+    // A thread of its own reads batches as they come while tasks commit, until the feed ends. On
+    // its own thread, it can wake while a Commit is being recorded, rather than after.
+    let reader = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        runtime.block_on(async move {
+            let mut batches = Vec::new();
+            while let Some(item) = feed.next().await {
+                match item {
+                    FeedItem::Changes(batch) => batches.push(batch),
+                    other => panic!("expected a batch of Changes, got {other:?}"),
+                }
+            }
+            batches
+        })
+    });
+    let committers: Vec<_> = (0..4)
+        .map(|task| {
+            let store = store.clone();
+            tokio::spawn(async move {
+                for commit in 0..25 {
+                    let mut staging = Staging::new(Area::Data);
+                    for file in 0..FILES {
+                        staging.write(format!("{task}/{commit}/{file}"), "x").unwrap();
+                    }
+                    store.commit(staging).await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+            })
+        })
+        .collect();
+    for committer in committers {
+        committer.await.unwrap();
+    }
+    drop(store);
+    let batches = reader.join().unwrap();
+
+    // Each Commit wrote its Files under its own Prefix: all of them are in one batch.
+    let mut seen = 0;
+    for batch in &batches {
+        let mut commits = std::collections::BTreeMap::<&str, usize>::new();
+        for change in batch {
+            let (commit, _file) = change.path.as_str().rsplit_once('/').unwrap();
+            *commits.entry(commit).or_default() += 1;
+        }
+        for (commit, count) in commits {
+            assert_eq!(count, FILES, "Commit {commit} was split across batches");
+            seen += 1;
+        }
+    }
+    assert_eq!(seen, 4 * 25);
+}
+
+pub async fn concurrent_commits_reach_the_feed_in_the_order_they_were_made(fixture: &impl Fixture) {
+    let Opened { store, mut feed } = fixture.open().await;
+
+    // In each round, tasks race to write and delete one Path. However the Commits land, their
+    // merged Change must end as the last of them left the File: changed if it is there, removed
+    // if it isn't. Every Commit has reached the feed once it returns, so each round is one batch.
+    for round in 0..500 {
+        let tasks: Vec<_> = (0..4)
+            .map(|task| {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    for step in 0..4 {
+                        let mut staging = Staging::new(Area::Data);
+                        if (task + step) % 2 == 0 {
+                            staging.write("raced.txt", format!("{round} {task} {step}")).unwrap();
+                        } else {
+                            staging.delete("raced.txt").unwrap();
+                        }
+                        store.commit(staging).await.unwrap();
+                    }
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let there = store.read(Area::Data, "raced.txt").await.unwrap().is_some();
+        let expected = if there { ChangeKind::Changed } else { ChangeKind::Removed };
+        let batch = next_batch(&mut feed).await;
+        assert_eq!(changes(&batch), [("raced.txt", expected)], "in round {round}");
+    }
+    assert_nothing_more(&mut feed).await;
+}
+
 // Helpers shared by the tests above.
 
 /// Waits for the next item on the Change feed, failing the test if none arrives in time.
@@ -962,6 +1171,16 @@ async fn list(store: &Store, area: Area, prefix: &str) -> Vec<String> {
 async fn assert_nothing_more(feed: &mut ChangeFeed) {
     if let Ok(item) = tokio::time::timeout(Duration::from_millis(200), feed.next()).await {
         panic!("expected nothing more on the Change feed, got {item:?}");
+    }
+}
+
+/// Checks that the Change feed has ended, and stays ended.
+async fn assert_ended(feed: &mut ChangeFeed) {
+    for _ in 0..2 {
+        let item = tokio::time::timeout(Duration::from_secs(5), feed.next())
+            .await
+            .expect("the Change feed should have ended by now");
+        assert_eq!(item, None);
     }
 }
 

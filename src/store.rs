@@ -1,17 +1,23 @@
 use std::sync::Arc;
 
 use jiff::Timestamp;
+use tokio::sync::Mutex;
 
-use crate::backend::{Backend, CommitRequest, RawChange, memory::MemoryBackend};
+#[cfg(feature = "testing")]
+use crate::ChangeKind;
+#[cfg(feature = "testing")]
+use crate::backend::RawChange;
+use crate::backend::{Backend, CommitRequest, memory::MemoryBackend};
 use crate::change::{self, FeedSender};
 use crate::{
-    Area, Change, ChangeFeed, Committed, File, IntoPath, IntoPrefix, Origin, Path, PrefixRevision,
-    Result, Staging, Stat,
+    Area, ChangeFeed, Committed, File, IntoPath, IntoPrefix, Origin, Path, PrefixRevision, Result,
+    Staging, Stat,
 };
 
 /// What an application opens to reach its Files: all three Areas, held by one Backend.
 ///
-/// A Store is a cheap handle: clones share the same Files and the same Change feed.
+/// A Store is a cheap handle that can be shared between tasks and threads: clones share the same
+/// Files and the same Change feed. The Change feed ends once every clone has been dropped.
 #[derive(Debug, Clone)]
 pub struct Store {
     inner: Arc<Inner>,
@@ -19,10 +25,28 @@ pub struct Store {
 
 /// What every clone of a Store shares. The Store layer here does everything that is the same for
 /// every Backend, and calls into the Backend for the rest.
+///
+/// The Change feed ends when this is dropped, which is when the last Store handle goes. So a
+/// task that runs for as long as the Store is open (watching for changes, polling another
+/// process's Commits) must not hold an `Arc<Inner>`, or the feed would never end: it holds only
+/// what it needs, and `Inner` stops it when dropped. A task that finishes on its own, such as a
+/// Commit left to complete in the background, may hold one, which keeps the feed open until its
+/// Changes are recorded.
 #[derive(Debug)]
 struct Inner {
     backend: Backend,
     feed: FeedSender,
+    /// Held from before a Commit is applied until its Changes are recorded, so that Commits reach
+    /// the Change feed in the order they were applied. Otherwise two Commits to the same Path
+    /// could be recorded the other way round, and the merged Change would have the wrong kind.
+    commit_order: Mutex<()>,
+}
+
+impl Drop for Inner {
+    /// The last Store handle is gone, so nothing more can be committed: the Change feed ends.
+    fn drop(&mut self) {
+        self.feed.end();
+    }
 }
 
 impl Store {
@@ -34,7 +58,8 @@ impl Store {
 
     fn open(backend: Backend) -> (Store, ChangeFeed) {
         let (feed, change_feed) = change::feed();
-        (Store { inner: Arc::new(Inner { backend, feed }) }, change_feed)
+        let inner = Inner { backend, feed, commit_order: Mutex::new(()) };
+        (Store { inner: Arc::new(inner) }, change_feed)
     }
 
     /// Reads the File at `path` in `area`, or gives `Ok(None)` if there is none.
@@ -76,8 +101,9 @@ impl Store {
     ///
     /// Every File written gets the Commit's timestamp as its last-modified time. A write that
     /// wouldn't change the File's contents is left out, so the File keeps its time and no Change
-    /// is sent for it. The Changes arrive on the Change feed in one batch, and a Commit that
-    /// changes nothing sends none. On success, gives the timestamp and the new Revisions.
+    /// is sent for it. The Changes arrive on the Change feed in the same batch, and a Commit
+    /// that changes nothing sends none. Commits reach the feed in the order they were applied.
+    /// On success, gives the timestamp and the new Revisions.
     ///
     /// Nothing is written if the Commit fails:
     /// - [`Error::Conflict`](crate::Error::Conflict) if any of the Staging's Preconditions doesn't
@@ -87,15 +113,27 @@ impl Store {
     ///   Path that differs only in letter case from another Path in the Area.
     pub async fn commit(&self, staging: Staging) -> Result<Committed> {
         let area = staging.area();
+        let _in_order = self.inner.commit_order.lock().await;
+        // Chosen in turn too, so a Commit applied later never has an earlier timestamp.
         let timestamp = Timestamp::now();
         let request = CommitRequest { timestamp, staged: staging.into_staged() };
         let outcome = self.inner.backend.commit(request).await?;
-        let changes = outcome
-            .changes
-            .into_iter()
-            .map(|RawChange { path, kind }| Change { area, path, kind, origin: Origin::Local })
-            .collect();
-        self.inner.feed.announce(changes);
+        self.inner.feed.record(area, outcome.changes, Origin::Local);
         Ok(Committed::new(timestamp, outcome.revisions))
+    }
+
+    /// Records an external Change to `path` in `area` on the Change feed, as if another process
+    /// had made it, without changing any File. For tidings' own tests of how the Store layer
+    /// merges external Changes, since the memory Backend never observes any.
+    #[cfg(feature = "testing")]
+    pub fn inject_external_change(
+        &self,
+        area: Area,
+        path: impl IntoPath,
+        kind: ChangeKind,
+    ) -> Result<()> {
+        let change = RawChange { path: path.into_path()?, kind };
+        self.inner.feed.record(area, vec![change], Origin::External);
+        Ok(())
     }
 }
