@@ -53,7 +53,9 @@ come with it. Then the blocking API. See [CONTEXT.md](CONTEXT.md) and [docs/adr]
   trying again for a moment (on Windows, while another program has it open). The commit has
   happened: its changes are reported, and reads through tidings show it. The next commit to the
   area, or opening a store, finishes it. If that still fails, the next commit gives
-  `Error::Backend` and isn't made, and opening a store still works.
+  `Error::Backend` and isn't made, and opening a store still works. So while a program holds a
+  file open, every commit to that area fails, even one that doesn't touch the file, until the
+  file is released: the error says so, and to try again later.
 - A commit can require that files, or everything under a prefix, are unchanged since you read
   them, and fails with a conflict otherwise, writing nothing and naming the paths that differ. A
   precondition you stage always has to hold, even if something staged later replaces the write or

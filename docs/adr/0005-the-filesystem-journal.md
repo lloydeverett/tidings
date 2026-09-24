@@ -106,9 +106,17 @@ Details settled while building it (ticket 10):
   symlink, is read as it is on disk until the Commit is finished. Matching by file on disk would
   mean resolving every read's links and directories against every journaled file, for a window
   that only a symlink and a stuck rename together open.
-- If the next Commit can't finish the journal either, it isn't made, and gives `Backend`.
-  `Pending` would say it had happened. `open` logs the failure and opens anyway, since reads show
-  the Commit; only a journal that can't be read stops it.
+- If the next Commit can't finish the journal either, it isn't made, and gives `Backend`, with a
+  message saying that an earlier Commit can't be finished yet and to try again later, and the
+  failure as its source. `Pending` would say it had happened. So while a program holds a File
+  open, every Commit to the Area fails until it lets go. `open` logs the failure and opens
+  anyway, since reads show the Commit; only a journal that can't be read stops it.
+- Writing the journal as `committed` can fail once it has been renamed into place, as when forcing
+  its directory to disk fails. So if that step fails, the journal is read back: if it is
+  `committed`, the Commit has happened, and is finished and reported as usual; otherwise it is
+  discarded, and the Commit gives the error.
+- The journal's first line is `tidings journal 2`, since the `replace` line gained the Path. A
+  journal in another format is refused as one this version doesn't know.
 - The lock only keeps out other tidings Commits. A program outside tidings that writes a File
   between step 1 and the end of step 5 is not detected by the Preconditions, and if the Commit
   writes that File, its edit is overwritten. The filesystem has no way to replace a File only if

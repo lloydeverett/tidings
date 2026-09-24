@@ -1449,5 +1449,108 @@ No Speculative Generality found. `Pause`, `pause_at` and `RenameFails { times }`
 
 ### Spec
 
-_Pending: the Spec review was still running when this entry was written._
+The first run of this review was stopped when the session paused. It was run again in full when the work resumed.
 
+`cargo test` passes. The rest was checked with a scratch probe crate (scratchpad/probe10) that adds:
+- `stat`, and `stat_prefix` over `""`, `a/`, `d/`, `p/` and `p/q/`
+- a dropped Commit that gets `Pending`
+- a journal in the old format
+- a Pause that is never released
+
+**(a) Missing or partial**
+
+1. **The known gap (point 4) breaks story 47**, "a Change for every Path that changes".
+   - At fs.rs:646 (`journal.commit(&tidings)?`), the rename of the journal can land and then the directory fsync can fail. The app gets `Backend`, reads already show the Commit, and its Changes are never recorded.
+   - Ticket 11's note says the watcher compares events against what reads through tidings show, so it won't report these Changes later either. They are lost for good.
+   - The fix is cheap. When that call fails, read the journal back with the existing `Journal::read`. If it says `committed`, carry on finishing and give `Pending` with the Changes recorded. That matches the ADR: "The Commit's Changes are recorded before `Pending` is returned, since it has happened." Recommended.
+2. **Pending from a dropped Commit is untested.** Only a dropped Commit that succeeds is tested (main.rs:680). The probe paused at `AfterDeletes` with `RenameFails{0,MAX}` and dropped the Commit: exactly one batch arrived, then nothing more. The behaviour is correct, but no test in the repo covers it.
+
+**(b) Scope creep**
+
+3. **The spec was edited to fit the implementation.** The Pending paragraph in docs/specs/0001-first-version.md:340-343 gained "A next Commit that can't finish it isn't made, and gives `Backend`; `open` still opens."
+   - This is defensible on the merits. There is only one journal slot, and `Pending` would falsely claim the new Commit happened. It still satisfies story 40, and ADR 0005 records it.
+   - It still needs the spec owner's approval.
+   - Consequence: while one File is held open, every Commit to that Area fails with an ordinary `Backend` after about 260 ms, including Commits to unrelated Files. The app can't tell that this failure is worth retrying.
+
+**(c) Implemented but weak or wrong**
+
+4. **The crash matrix's oracle is loose** (tests/behaviour/main.rs:797-803). The arm `(_, Err(Error::Backend(_))) => {}` accepts any `Backend` error, including one from a `RenameFails` point, so a regression from `Pending` to `Backend` would pass.
+   - Every point is genuinely reached. The probe saw the failure-point message for every `AfterTemporaryFile(n)` and `AfterRename(n)`, for every n, in every shape.
+   - Under a wider view (`stat` and `stat_prefix` too), both "already open" and "reopened" matched the uninterrupted reference at every point, so the reference is a sound oracle. The shipped test only compares `list("")` plus `read`.
+5. **Journal format** (journal.rs:49, 276-287). The format line is still `tidings journal 1`, but the `replace` line's shape changed.
+   - A journal in ticket 09's format is rejected with "…isn't an item it can have", not "a format this version doesn't know".
+   - The journal then blocks `open` and every read until someone deletes it by hand.
+   - The crate is unreleased (0.1.0, no tags), so this is minor. Bumping to `tidings journal 2` would make the message accurate.
+6. **The pause timeout masks a hang** (fs.rs:185-191). A Pause that is never released lets the Commit continue after 60 s and return `Ok`; the probe measured 60.0 s. A test that forgets `release` passes slowly instead of failing. Consider panicking or returning `Err` on timeout.
+
+Otherwise the failure points and Pause are `testing`-only, and the retry delays (10, 50 and 200 ms) are reasonable.
+
+**Verified OK (point 1).** While a `committed` journal exists, `read`, `stat`, `list` and `stat_prefix` all show the Area as finishing will leave it. That holds for `a` → `a/b` while `a` is still on disk, for `d/e` → `d`, and for a Prefix delete plus a write, at every point. The next Commit's Preconditions and checks run after recovery.
+
+One edge was noted but not counted as a finding: `list` and `stat_prefix` read the journal once, so if they run while another Store's Commit is being applied they can mix the before and after states. The filesystem promises no consistent multi-file reads (ADR 0006), and the worst effect is a spurious `Conflict`.
+
+### Summary
+
+Standards: 0 hard violations and 1 glossary slip ("applied", where the rest of the code says "finished"), plus 5 smells. The most notable is the repeated `Unfinished::read` with an overlay loop. Spec: 2 missing items, 1 spec edit that needs approval, and 3 weaknesses. The worst is the gap left open: if the directory fsync after the `committed` journal fails, the Commit has happened but the app gets `Backend` and its Changes are lost for good.
+
+
+
+### Resolution
+
+1. **Spec a1, a committed journal that reports a failure:** fixed.
+   - `AreaRoot::commit_journal` reads the journal back when writing it as `committed` fails.
+     - If it is `committed`, the Commit goes on to be finished, and gives success or `Pending`,
+       with its Changes recorded.
+     - Otherwise it is discarded, and the Commit gives the error.
+     - Only if the journal can't be read back either is the outcome unknown. It is then left for
+       the next Commit or `open`.
+   - The new `FailurePoint::CommittedJournalFails` makes that step report an error once the
+     journal is written.
+   - `a_commit_whose_journal_was_committed_despite_an_error_finishes_and_is_reported` checks the
+     success and the one batch. The point is also in the crash matrix, as "succeeds".
+   - Both tests fail with the read-back removed.
+2. **Spec a2, a dropped Commit that ends in `Pending`:** tested.
+   `a_dropped_commit_that_ends_pending_is_reported_once` pauses at `AfterCommittedJournal` with
+   `RenameFails { n: 0, times: usize::MAX }` and drops the future. It checks that exactly one
+   batch arrives, then nothing more, and that reads show the Commit.
+3. **Spec b3, the next Commit's `Backend`:** kept, as decided, pending the user's approval of the
+   spec edit. It is now as usable as the fixed error list allows.
+   - The error is a private `EarlierCommitLeft`, with the underlying failure as its `source`.
+     Its message: "this Commit wasn't made, because an earlier Commit to <area> that gave
+     `Pending` or was interrupted still can't be finished. Try again later, once nothing holds
+     its Files open, as another program can on Windows".
+   - The Pending test checks the wording and that there is a source.
+   - The README's Consistency section, `Error::Pending`'s doc and ADR 0005 say plainly that while
+     a program holds a File open, every Commit to the Area fails, even one that doesn't touch that
+     File, until it is released.
+4. **Spec c4, the loose oracle:** fixed.
+   - `every_point` gives each point an `Outcome`: `Discarded`, `Interrupted`, `Pending` or
+     `Finished`.
+   - A stop must be `Backend` carrying that point's own "stopped at the failure point <point>"
+     message. `RenameFails` must give `Pending`, and a point that is never reached, or
+     `CommittedJournalFails`, must succeed.
+   - The compared `State` now has each Path's contents, its Revision from `stat` (checked against
+     `read`'s time and Revision), and the Prefix Revisions of `""`, `a/`, `d/`, `new/`, `p/` and
+     `p/q/`.
+   - With `stat_prefix` reading the bare disk, the matrix fails.
+5. **Spec c5, the journal format:** now `tidings journal 2`, recorded in ADR 0005.
+6. **Spec c6, the pause timeout:** a Commit held for 30 seconds now panics ("a Commit held at <point>
+   was never released"). It no longer carries on.
+7. **Standards:** all done.
+   - "isn't fully applied yet" is now "isn't finished yet" in `Error::Pending`'s doc and
+     `#[error]`, and in backend/mod.rs. The spec's paragraph on failing renames says "finishes it".
+   - The overlay has moved onto `AsFinished<'a>` in journal.rs, which was `Unfinished`, and holds
+     the Area. `AreaRoot::as_finished()` is the one helper each read uses. `AsFinished` has
+     `read`, `paths_under` and `revisions_under`.
+     - `AsFinished::revisions_under` and `AreaState::revisions_under` share a free function,
+       `revisions(paths, read)`.
+   - `before_moves()` uses `staged()`.
+   - Renames: `Target::Own` is now `Target::AtPath`, and `Testing` is now `FailureSetup`. The
+     field is now `failures`. `read_committed` and `paths_committed` are now `AsFinished::read`
+     and `paths_under`, which the type name reads as "as finished".
+   - The `(FailurePoint, bool)` pair is now `(FailurePoint, Outcome)`.
+
+Clippy is clean with default features, `--all-features`, `--no-default-features`, fs only and
+sqlite only, each with `--all-targets` and without. So are rustfmt and rustdoc. `cargo test`
+passes with default features, `--no-default-features` and `--all-features`: 165 behaviour tests
+(45 without fs or sqlite).

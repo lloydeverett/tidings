@@ -29,12 +29,13 @@ pub enum Error {
         /// were added, removed or changed.
         paths: Vec<Path>,
     },
-    /// The Commit has happened, and its Changes are on the Change feed, but it isn't fully applied
-    /// yet. Only the filesystem gives it, when a File can't be replaced even after trying again
-    /// for a moment, as happens on Windows while another program has the File open. Reads through
+    /// The Commit has happened, and its Changes are on the Change feed, but it isn't finished yet.
+    /// Only the filesystem gives it, when a File can't be replaced even after trying again for a
+    /// moment, as happens on Windows while another program has the File open. Reads through
     /// tidings show the Commit already, and the next Commit to the Area, or opening a Store on it,
-    /// finishes applying it.
-    #[error("the Commit happened, but isn't fully applied yet")]
+    /// finishes it. Until then, every Commit to the Area first tries to finish it, and isn't made
+    /// if it still can't.
+    #[error("the Commit happened, but isn't finished yet")]
     Pending,
     /// The Store's Backend can't do this. A Snapshot on the filesystem gives it: check
     /// [`Store::supports_snapshots`](crate::Store::supports_snapshots) first.

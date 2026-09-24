@@ -9,7 +9,7 @@
 //!   is discarded: its temporary files are removed.
 //! - **committed**: every temporary file is written and on disk, and the Commit has happened. It
 //!   is finished: the deletes are made and the temporary files renamed. Until it is, reads through
-//!   tidings see the Area as it will be once it is ([`Unfinished`]).
+//!   tidings see the Area as it will be once it is ([`AsFinished`]).
 //!
 //! Finishing a Commit again, after a crash part way through or just before the journal was
 //! removed, leaves the Area as finishing it once did:
@@ -41,12 +41,16 @@ use atomic_write_file::AtomicWriteFile;
 
 #[cfg(feature = "testing")]
 use super::FailurePoint;
-use super::{AreaRoot, failed, on_disk, present, present_at, remove_empty_directories};
+use jiff::Timestamp;
+
+use super::{
+    AreaRoot, failed, on_disk, present, present_at, read_file, remove_empty_directories, revisions,
+};
 use crate::backend::AreaState;
-use crate::{Error, Path, Result, Revision};
+use crate::{Error, Path, Prefix, Result, Revision};
 
 /// The first line of every journal, which names its format.
-const FORMAT: &str = "tidings journal 1";
+const FORMAT: &str = "tidings journal 2";
 
 /// A Commit in progress, as the journal records it.
 #[derive(Debug)]
@@ -76,7 +80,7 @@ pub(super) struct Replace {
 #[derive(Debug, Clone)]
 pub(super) enum Target {
     /// The File at the Path written, whose directories finishing makes if they don't exist.
-    Own,
+    AtPath,
     /// The file the symlink at the Path written points to, anywhere, in a directory that exists.
     Linked(PathBuf),
 }
@@ -88,40 +92,83 @@ pub(super) struct Remove {
     pub(super) revision: Revision,
 }
 
-/// A Commit left in the journal once it was committed, and not yet finished, as reads through
-/// tidings see it. They see the Area as finishing it will leave it: each Path it writes as its
-/// temporary file, until that is renamed, and each Path it deletes as absent, if the File there is
-/// the one it deletes, as finishing deletes only that one.
-#[derive(Debug, Default)]
-pub(super) struct Unfinished {
+/// An Area as reads through tidings see it: as finishing the Commit in its journal will leave it,
+/// if the journal is committed. Each Path the Commit writes is its temporary file, until that is
+/// renamed, and each Path it deletes is absent, if the File there is the one it deletes, as
+/// finishing deletes only that one. With no committed journal, it is the Area as it is on disk.
+pub(super) struct AsFinished<'a> {
+    area: &'a AreaRoot,
     /// The temporary file of each Path the Commit writes.
-    pub(super) written: BTreeMap<Path, PathBuf>,
+    written: BTreeMap<Path, PathBuf>,
     /// Each Path the Commit deletes, with the Revision of the File it deletes.
-    pub(super) removed: BTreeMap<Path, Revision>,
+    removed: BTreeMap<Path, Revision>,
 }
 
 impl Replace {
     /// Where the file this replaces is on disk, in the Area whose root is `root`.
     pub(super) fn on_disk(&self, root: &FsPath) -> PathBuf {
         match &self.target {
-            Target::Own => on_disk(root, self.path.as_str()),
+            Target::AtPath => on_disk(root, self.path.as_str()),
             Target::Linked(target) => target.clone(),
         }
     }
 }
 
-impl Unfinished {
-    /// The Commit in the journal in `tidings` that isn't finished, if the journal is committed,
-    /// or nothing.
-    pub(super) fn read(tidings: &FsPath) -> Result<Unfinished> {
-        let Some(journal) = Journal::read(tidings)? else { return Ok(Unfinished::default()) };
-        if journal.state != State::Committed {
-            return Ok(Unfinished::default());
+impl AsFinished<'_> {
+    /// `area`, as finishing the Commit in its journal will leave it.
+    pub(super) fn of(area: &AreaRoot) -> Result<AsFinished<'_>> {
+        let mut finished = AsFinished { area, written: BTreeMap::new(), removed: BTreeMap::new() };
+        if let Some(journal) = Journal::read(&area.tidings())?
+            && journal.state == State::Committed
+        {
+            let written =
+                journal.replaces.into_iter().map(|replace| (replace.path, replace.temporary));
+            let removed = journal.removes.into_iter().map(|remove| (remove.path, remove.revision));
+            (finished.written, finished.removed) = (written.collect(), removed.collect());
         }
-        let written = journal.replaces.into_iter().map(|replace| (replace.path, replace.temporary));
-        let removed = journal.removes.into_iter().map(|remove| (remove.path, remove.revision));
-        Ok(Unfinished { written: written.collect(), removed: removed.collect() })
+        Ok(finished)
     }
+
+    /// What [`AreaRoot::read`] gives for `path`, once the Commit is finished.
+    pub(super) fn read(&self, path: &Path) -> Result<Option<(Vec<u8>, Timestamp)>> {
+        // A temporary file that is gone was renamed over the File already.
+        if let Some(temporary) = self.written.get(path)
+            && let Some(read) = read_file(temporary)?
+        {
+            return Ok(Some(read));
+        }
+        let read = self.area.read(path)?;
+        let removed = self.removed.get(path).is_some_and(|revision| {
+            read.as_ref().is_some_and(|(contents, _)| Revision::of_bytes(contents) == *revision)
+        });
+        Ok(if removed { None } else { read })
+    }
+
+    /// What [`AreaRoot::paths_under`] gives for `prefix`, once the Commit is finished.
+    pub(super) fn paths_under(&self, prefix: &Prefix) -> Result<Vec<Path>> {
+        let mut paths = Vec::new();
+        for path in self.area.paths_under(prefix)? {
+            if !self.removed.contains_key(&path) || self.read(&path)?.is_some() {
+                paths.push(path);
+            }
+        }
+        let written = self.written.keys();
+        paths.extend(written.filter(|path| path.as_str().starts_with(prefix.as_str())).cloned());
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
+    /// The Path and Revision of every File under `prefix`, in order of Path, once the Commit is
+    /// finished.
+    pub(super) fn revisions_under(&self, prefix: &Prefix) -> Result<Vec<(Path, Revision)>> {
+        revisions(self.paths_under(prefix)?, |path| self.read(path))
+    }
+}
+
+/// Whether the journal in `tidings` is `committed`.
+pub(super) fn is_committed(tidings: &FsPath) -> Result<bool> {
+    Ok(Journal::read(tidings)?.is_some_and(|journal| journal.state == State::Committed))
 }
 
 /// What [`recover`] did.
@@ -225,7 +272,7 @@ impl Journal {
             if present_at(fs::symlink_metadata(temporary), temporary)?.is_none() {
                 continue;
             }
-            if let Target::Own = target {
+            if let Target::AtPath = target {
                 area.make_directories(path, &mut changed)?;
             }
             let target = replace.on_disk(root);
@@ -271,7 +318,7 @@ impl Journal {
             match fields.as_slice() {
                 [kind, temporary, path] if kind == "write" => {
                     let (path, temporary) = (parse_path(path)?, temporary.into());
-                    journal.replaces.push(Replace { path, temporary, target: Target::Own });
+                    journal.replaces.push(Replace { path, temporary, target: Target::AtPath });
                 }
                 [kind, temporary, path, target] if kind == "replace" => {
                     let (path, temporary) = (parse_path(path)?, temporary.into());
@@ -300,7 +347,7 @@ impl Journal {
         for Replace { path, temporary, target } in &self.replaces {
             let (temporary, path) = (escaped(temporary)?, escape(path.as_str()));
             text += &match target {
-                Target::Own => format!("write\t{temporary}\t{path}\n"),
+                Target::AtPath => format!("write\t{temporary}\t{path}\n"),
                 Target::Linked(target) => {
                     format!("replace\t{temporary}\t{path}\t{}\n", escaped(target)?)
                 }

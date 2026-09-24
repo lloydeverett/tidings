@@ -44,9 +44,9 @@ silence.
 - A Commit that gave `Pending` has had its Changes recorded already. When the next Commit or
   `open` finishes it, perhaps in another process, its renames and deletes land on disk later. The
   watcher must not report them again as local Changes, nor as external ones: their contents are
-  what reads through tidings already showed (`Unfinished` in journal.rs).
-- Until then, reads use `Unfinished`, so when the watcher asks whether an event changed a File's
+  what reads through tidings already showed (`AsFinished` in journal.rs).
+- Until then, reads use `AsFinished`, so when the watcher asks whether an event changed a File's
   contents, it should compare against what a read through tidings gives, not the bare disk.
 - `FailurePoint` is `#[non_exhaustive]`; add the watcher's failure as another variant. Note that
-  `RenameFails` isn't a place `fail_at` stops at but a failure it injects, and `pause_at` takes the
-  same points.
+  `RenameFails` and `CommittedJournalFails` aren't places `fail_at` stops at but failures it
+  injects, and `pause_at` takes only the places.

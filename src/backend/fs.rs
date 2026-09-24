@@ -92,7 +92,7 @@ use std::time::{Duration, SystemTime};
 use jiff::Timestamp;
 use xxhash_rust::xxh3::xxh3_128;
 
-use self::journal::{Journal, Recovery, Remove, Replace, Target, Unfinished};
+use self::journal::{AsFinished, Journal, Recovery, Remove, Replace, Target};
 use super::{AreaState, CommitOutcome, CommitRequest, Planned, off_runtime};
 use crate::app::AppIdentity;
 use crate::area::PerArea;
@@ -129,7 +129,8 @@ impl FsOptions {
     /// left behind, when a Store opens or commits, never stops. For tidings' own tests of how an
     /// interrupted Commit is recovered.
     ///
-    /// [`FailurePoint::RenameFails`] is different: it makes a rename fail, and is described there.
+    /// [`FailurePoint::RenameFails`] and [`FailurePoint::CommittedJournalFails`] are different:
+    /// each makes a step fail, as described there.
     #[cfg(feature = "testing")]
     pub fn fail_at(mut self, point: FailurePoint) -> FsOptions {
         self.fail_at = Some(point);
@@ -138,7 +139,7 @@ impl FsOptions {
 
     /// Makes every Commit through the Store wait at `point` until `pause` is released, where
     /// [`fail_at`](Self::fail_at) would stop it. For tidings' own tests of cancelling a Commit part
-    /// way through. `point` can't be [`FailurePoint::RenameFails`], which is not a place.
+    /// way through. `point` must be a place [`fail_at`](Self::fail_at) stops a Commit at.
     #[cfg(feature = "testing")]
     pub fn pause_at(mut self, point: FailurePoint, pause: &Pause) -> FsOptions {
         self.pause_at = Some((point, pause.clone()));
@@ -180,20 +181,26 @@ impl Pause {
         self.shared.release.notify_all();
     }
 
-    /// Holds the Commit calling it, on a blocking thread, until the Pause is released, or for a
-    /// minute at most, so that a test that fails before it releases the Pause doesn't hang.
-    fn hold(&self) {
+    /// Holds the Commit calling it at `point`, on a blocking thread, until the Pause is released.
+    ///
+    /// # Panics
+    ///
+    /// If it isn't released within 30 seconds, so that a test that never releases it fails
+    /// rather than hangs.
+    fn hold(&self, point: FailurePoint) {
         self.shared.reached.notify_one();
         let released = self.shared.released.lock().unwrap_or_else(PoisonError::into_inner);
         let held =
-            self.shared.release.wait_timeout_while(released, Duration::from_secs(60), |r| !*r);
-        drop(held.unwrap_or_else(PoisonError::into_inner));
+            self.shared.release.wait_timeout_while(released, Duration::from_secs(30), |r| !*r);
+        let (_released, waited) = held.unwrap_or_else(PoisonError::into_inner);
+        assert!(!waited.timed_out(), "a Commit held at {point:?} was never released");
     }
 }
 
 /// A named point in a filesystem Commit, where [`FsOptions::fail_at`] stops it and
-/// [`FsOptions::pause_at`] holds it, or with [`RenameFails`](Self::RenameFails), a rename that
-/// fails. For tidings' own tests.
+/// [`FsOptions::pause_at`] holds it, or with [`RenameFails`](Self::RenameFails) and
+/// [`CommittedJournalFails`](Self::CommittedJournalFails), a step that fails. For tidings' own
+/// tests.
 #[cfg(feature = "testing")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -219,12 +226,15 @@ pub enum FailurePoint {
         /// How many times it fails.
         times: usize,
     },
+    /// Writing the journal as `committed` gives an error once the journal is written, as it would
+    /// if forcing its directory to disk failed.
+    CommittedJournalFails,
 }
 
 /// What [`FsOptions::fail_at`] and [`FsOptions::pause_at`] set up, for each Area of a Store.
 #[cfg(feature = "testing")]
 #[derive(Debug, Clone, Default)]
-struct Testing {
+struct FailureSetup {
     fail_at: Option<FailurePoint>,
     pause_at: Option<(FailurePoint, Pause)>,
     /// How many more times the rename [`FailurePoint::RenameFails`] names fails, shared by every
@@ -237,6 +247,21 @@ struct Testing {
 #[derive(Debug, thiserror::Error)]
 #[error("the Commit stopped at the failure point {0:?}")]
 struct Stopped(FailurePoint);
+
+/// Why a Commit wasn't made: the Commit left in the journal before it, which gave
+/// [`Error::Pending`] or was interrupted, still can't be finished or discarded, and must be first.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "this Commit wasn't made, because an earlier Commit to {} that gave `Pending` or was \
+     interrupted still can't be finished. Try again later, once nothing holds its Files open, as \
+     another program can on Windows",
+    area.display()
+)]
+struct EarlierCommitLeft {
+    area: PathBuf,
+    #[source]
+    error: Error,
+}
 
 /// How long a Commit waits before trying again to finish, each time finishing fails, before it
 /// gives [`Error::Pending`]. A program that has a File open on Windows often closes it again
@@ -255,7 +280,7 @@ impl FsBackend {
     pub(crate) async fn open(app: &AppIdentity, options: FsOptions) -> Result<FsBackend> {
         let roots = app.area_directories(options.root_override.as_deref())?;
         #[cfg(feature = "testing")]
-        let testing = Testing {
+        let failures = FailureSetup {
             fail_at: options.fail_at,
             pause_at: options.pause_at,
             renames_to_fail: Arc::new(AtomicUsize::new(match options.fail_at {
@@ -269,7 +294,7 @@ impl FsBackend {
                 let mut root = AreaRoot::open(roots.get(area).clone())?;
                 #[cfg(feature = "testing")]
                 {
-                    root.testing = testing.clone();
+                    root.failures = failures.clone();
                 }
                 let _locked = root.lock()?;
                 // Reads show a Commit that can't be finished yet, so the Store can open.
@@ -289,8 +314,7 @@ impl FsBackend {
     pub(crate) async fn read(&self, area: Area, path: &Path) -> Result<Option<File>> {
         let path = path.clone();
         self.off_runtime(area, move |root| {
-            let unfinished = Unfinished::read(&root.tidings())?;
-            let Some((contents, modified)) = root.read_committed(&unfinished, &path)? else {
+            let Some((contents, modified)) = root.as_finished()?.read(&path)? else {
                 return Ok(None);
             };
             let revision = Revision::of_bytes(&contents);
@@ -304,8 +328,7 @@ impl FsBackend {
     pub(crate) async fn stat(&self, area: Area, path: &Path) -> Result<Option<Stat>> {
         let path = path.clone();
         self.off_runtime(area, move |root| {
-            let unfinished = Unfinished::read(&root.tidings())?;
-            let read = root.read_committed(&unfinished, &path)?;
+            let read = root.as_finished()?.read(&path)?;
             Ok(read.map(|(contents, modified)| Stat::new(modified, Revision::of_bytes(&contents))))
         })
         .await
@@ -313,24 +336,13 @@ impl FsBackend {
 
     pub(crate) async fn list(&self, area: Area, prefix: &Prefix) -> Result<Vec<Path>> {
         let prefix = prefix.clone();
-        self.off_runtime(area, move |root| {
-            let unfinished = Unfinished::read(&root.tidings())?;
-            root.paths_committed(&unfinished, &prefix)
-        })
-        .await
+        self.off_runtime(area, move |root| root.as_finished()?.paths_under(&prefix)).await
     }
 
     pub(crate) async fn stat_prefix(&self, area: Area, prefix: &Prefix) -> Result<PrefixRevision> {
         let prefix = prefix.clone();
         self.off_runtime(area, move |root| {
-            let unfinished = Unfinished::read(&root.tidings())?;
-            let mut files = Vec::new();
-            for path in root.paths_committed(&unfinished, &prefix)? {
-                // A File removed since it was listed is no longer under the Prefix.
-                if let Some((contents, _)) = root.read_committed(&unfinished, &path)? {
-                    files.push((path, Revision::of_bytes(&contents)));
-                }
-            }
+            let files = root.as_finished()?.revisions_under(&prefix)?;
             Ok(PrefixRevision::of(area, prefix, files))
         })
         .await
@@ -360,7 +372,7 @@ struct AreaRoot {
     /// for `foo`, so that a Path must be checked against the names really there.
     names_fold: bool,
     #[cfg(feature = "testing")]
-    testing: Testing,
+    failures: FailureSetup,
 }
 
 /// The lock on an Area, which keeps out every other tidings Commit to it. Dropping it unlocks.
@@ -384,7 +396,7 @@ impl AreaRoot {
             root,
             names_fold: false,
             #[cfg(feature = "testing")]
-            testing: Testing::default(),
+            failures: FailureSetup::default(),
         };
         drop(area.lock_file()?);
         let tidings = area.tidings();
@@ -454,13 +466,23 @@ impl AreaRoot {
     /// stops it there, if [`FsOptions::fail_at`] chose it.
     #[cfg(feature = "testing")]
     fn stop_at(&self, point: FailurePoint) -> Result<()> {
-        if let Some((at, pause)) = &self.testing.pause_at
+        if let Some((at, pause)) = &self.failures.pause_at
             && *at == point
         {
-            pause.hold();
+            pause.hold(point);
         }
-        if self.testing.fail_at == Some(point) {
+        if self.failures.fail_at == Some(point) {
             return Err(Error::backend(Stopped(point)));
+        }
+        Ok(())
+    }
+
+    /// Gives an error for `point`, a step that fails rather than a place a Commit stops, if
+    /// [`FsOptions::fail_at`] chose it.
+    #[cfg(feature = "testing")]
+    fn fail_at(&self, point: FailurePoint) -> Result<()> {
+        if self.failures.fail_at == Some(point) {
+            return Err(Error::backend(format!("failed at the failure point {point:?}")));
         }
         Ok(())
     }
@@ -469,11 +491,11 @@ impl AreaRoot {
     /// [`FailurePoint::RenameFails`] says that rename fails this time.
     #[cfg(feature = "testing")]
     fn rename_fails(&self, n: usize) -> io::Result<()> {
-        let Some(FailurePoint::RenameFails { n: failing, .. }) = self.testing.fail_at else {
+        let Some(FailurePoint::RenameFails { n: failing, .. }) = self.failures.fail_at else {
             return Ok(());
         };
         let fails = |left: usize| left.checked_sub(1);
-        if failing == n && self.testing.renames_to_fail.fetch_update(SeqCst, SeqCst, fails).is_ok()
+        if failing == n && self.failures.renames_to_fail.fetch_update(SeqCst, SeqCst, fails).is_ok()
         {
             return Err(io::Error::other("the rename failed at FailurePoint::RenameFails"));
         }
@@ -525,51 +547,16 @@ impl AreaRoot {
         read_file(&self.file(path.as_str()))
     }
 
-    /// What [`read`](Self::read) gives for `path`, as reads through tidings see it: with the
-    /// Commit `unfinished` finished.
-    fn read_committed(
-        &self,
-        unfinished: &Unfinished,
-        path: &Path,
-    ) -> Result<Option<(Vec<u8>, Timestamp)>> {
-        // A temporary file that is gone was renamed over the File already.
-        if let Some(temporary) = unfinished.written.get(path)
-            && let Some(read) = read_file(temporary)?
-        {
-            return Ok(Some(read));
-        }
-        let read = self.read(path)?;
-        let removed = unfinished.removed.get(path).is_some_and(|revision| {
-            read.as_ref().is_some_and(|(contents, _)| Revision::of_bytes(contents) == *revision)
-        });
-        Ok(if removed { None } else { read })
-    }
-
-    /// What [`paths_under`](Self::paths_under) gives for `prefix`, as reads through tidings see
-    /// it: with the Commit `unfinished` finished.
-    fn paths_committed(&self, unfinished: &Unfinished, prefix: &Prefix) -> Result<Vec<Path>> {
-        let mut paths = Vec::new();
-        for path in self.paths_under(prefix)? {
-            if !unfinished.removed.contains_key(&path)
-                || self.read_committed(unfinished, &path)?.is_some()
-            {
-                paths.push(path);
-            }
-        }
-        let written = unfinished.written.keys();
-        paths.extend(written.filter(|path| path.as_str().starts_with(prefix.as_str())).cloned());
-        paths.sort();
-        paths.dedup();
-        Ok(paths)
+    /// The Area as reads through tidings see it, with the Commit in its journal finished.
+    fn as_finished(&self) -> Result<AsFinished<'_>> {
+        AsFinished::of(self)
     }
 
     /// Commits `request`, as the module's doc describes.
     fn commit(&self, request: CommitRequest) -> Result<CommitOutcome> {
         let _locked = self.lock()?;
         if let Recovery::Left(error) = journal::recover(self)? {
-            return Err(Error::backend(format!(
-                "a Commit before this one can't be finished yet, so this one wasn't made: {error}"
-            )));
+            return Err(Error::backend(EarlierCommitLeft { area: self.root.clone(), error }));
         }
         let timestamp = request.timestamp;
         let plan = request.plan(self)?;
@@ -604,7 +591,7 @@ impl AreaRoot {
             let Destination { directory, target, identity } =
                 self.where_to_write(&path, &removed)?;
             // Where names fold, a write under a Path deleted in another letter case is a rename.
-            let renames_case = self.names_fold && matches!(target, Target::Own);
+            let renames_case = self.names_fold && matches!(target, Target::AtPath);
             same_file.written(&path, identity, renames_case)?;
             let name = path.as_str().rsplit('/').next().unwrap_or(path.as_str());
             let temporary = directory.join(temporary_file_name(name, commit_id, n));
@@ -640,10 +627,7 @@ impl AreaRoot {
             self.stop_at(FailurePoint::AfterTemporaryFile(_n))?;
         }
 
-        // If this fails, the journal is either still as it was or already `committed`. The
-        // temporary files are all there, so the next Commit, or the next `open`, can do whichever
-        // it is: discard it or finish it.
-        journal.commit(&tidings)?;
+        self.commit_journal(&mut journal)?;
         #[cfg(feature = "testing")]
         self.stop_at(FailurePoint::AfterCommittedJournal)?;
         match self.finish(&journal, false) {
@@ -659,6 +643,37 @@ impl AreaRoot {
                 Ok(CommitOutcome { pending: true, ..outcome })
             }
         }
+    }
+
+    /// Writes `journal` as `committed`. If that fails, the journal on disk is either as it was or
+    /// `committed` already: writing it can fail once it is renamed into place, as when forcing its
+    /// directory to disk fails. So it is read back. If it is `committed`, the Commit has happened,
+    /// so this gives `Ok`, and the Commit goes on to be finished and reported. Otherwise the Commit
+    /// is discarded, and the error given. If it can't be discarded now, or the journal can't be
+    /// read, the next Commit or `open` does whichever the journal says.
+    fn commit_journal(&self, journal: &mut Journal) -> Result<()> {
+        let tidings = self.tidings();
+        let committing = journal.commit(&tidings);
+        #[cfg(feature = "testing")]
+        let committing =
+            committing.and_then(|()| self.fail_at(FailurePoint::CommittedJournalFails));
+        let Err(error) = committing else { return Ok(()) };
+        match journal::is_committed(&tidings) {
+            Ok(true) => {
+                tracing::debug!(
+                    "writing a Commit's journal in {} as committed failed, but it is: {error}",
+                    self.root.display(),
+                );
+                return Ok(());
+            }
+            Ok(false) => {
+                if let Err(discarding) = journal.discard(&tidings) {
+                    tracing::debug!("discarding a failed Commit failed: {discarding}");
+                }
+            }
+            Err(reading) => tracing::debug!("reading back a Commit's journal failed: {reading}"),
+        }
+        Err(error)
     }
 
     /// Where a write of `path` goes. `removed` holds the [`deleted_form`](Self::deleted_form) of
@@ -717,7 +732,7 @@ impl AreaRoot {
             return Err(in_the_way());
         }
         let identity = self.identity(&directory, segments[existing..].join("/").as_ref())?;
-        Ok(Destination { directory, target: Target::Own, identity })
+        Ok(Destination { directory, target: Target::AtPath, identity })
     }
 
     /// Whether whatever is at `file`, if anything, is gone once the Commit's deletes are made:
@@ -890,15 +905,8 @@ impl AreaState for AreaRoot {
     }
 
     fn revisions_under(&self, prefix: &Prefix) -> Result<Vec<(Path, Revision)>> {
-        let mut files = Vec::new();
-        for path in self.paths_under(prefix)? {
-            // Listed Paths have their own names, so they aren't checked again. A File removed
-            // since it was listed is no longer under the Prefix.
-            if let Some((contents, _)) = read_file(&self.file(path.as_str()))? {
-                files.push((path, Revision::of_bytes(&contents)));
-            }
-        }
-        Ok(files)
+        // Listed Paths have their own names, so they aren't checked again.
+        revisions(self.paths_under(prefix)?, |path| read_file(&self.file(path.as_str())))
     }
 
     fn paths_under(&self, prefix: &Prefix) -> Result<Vec<Path>> {
@@ -1022,6 +1030,21 @@ fn stopped(error: &Error) -> bool {
     #[cfg(not(feature = "testing"))]
     let _ = error;
     false
+}
+
+/// The Revision of each of `paths` that `read` finds a File at, with its Path, in the same order.
+/// A File removed since its Path was listed is left out.
+fn revisions(
+    paths: Vec<Path>,
+    mut read: impl FnMut(&Path) -> Result<Option<(Vec<u8>, Timestamp)>>,
+) -> Result<Vec<(Path, Revision)>> {
+    let mut files = Vec::new();
+    for path in paths {
+        if let Some((contents, _)) = read(&path)? {
+            files.push((path, Revision::of_bytes(&contents)));
+        }
+    }
+    Ok(files)
 }
 
 /// Whether `directory` has an entry named exactly `name`.

@@ -142,7 +142,7 @@ mod fs {
     use tempfile::TempDir;
     use tidings::{
         AppIdentity, Area, ChangeKind, Error, FailurePoint, FsOptions, InvalidPathReason, Pause,
-        Staging, Store,
+        PrefixRevision, Revision, Staging, Store,
     };
 
     use crate::common::{assert_nothing_more, changes, next_batch};
@@ -647,8 +647,15 @@ mod fs {
         // Finishing it still fails, so the next Commit through this Store isn't made.
         let mut staging = Staging::new(Area::Data);
         staging.write("later.txt", "later").unwrap();
-        let refused = store.commit(staging).await;
-        assert!(matches!(refused, Err(Error::Backend(_))), "{refused:?}");
+        match store.commit(staging).await {
+            Err(Error::Backend(error)) => {
+                let said = error.to_string();
+                assert!(said.contains("this Commit wasn't made"), "{said}");
+                assert!(said.contains("Try again later"), "{said}");
+                assert!(error.source().is_some(), "{error:?}");
+            }
+            other => panic!("the next Commit should be refused, got {other:?}"),
+        }
         assert_moved(&store).await;
         assert_nothing_more(&mut feed).await;
 
@@ -700,6 +707,52 @@ mod fs {
         );
         assert_nothing_more(&mut feed).await;
         let written = [("a.txt", "a"), ("b.txt", "b")].map(|(p, c)| (p.to_owned(), c.to_owned()));
+        assert_eq!(contents(&store).await, written);
+        assert_eq!(temporary_files(fixture.root.path()), Vec::<PathBuf>::new());
+    }
+
+    /// A dropped Commit that ends in `Pending` has happened, so its Changes arrive, once, from
+    /// the task that finishes it.
+    #[tokio::test]
+    async fn a_dropped_commit_that_ends_pending_is_reported_once() {
+        let fixture = Fs::new();
+        let pause = Pause::new();
+        let failing = FailurePoint::RenameFails { n: 0, times: usize::MAX };
+        let Opened { store, mut feed } = fixture
+            .open_with(|options| {
+                options.pause_at(FailurePoint::AfterCommittedJournal, &pause).fail_at(failing)
+            })
+            .await;
+
+        let commit = store.commit(staged(&[("a.txt", "a"), ("b.txt", "b")], &[]));
+        tokio::select! {
+            biased;
+            finished = commit => panic!("the Commit finished while held: {finished:?}"),
+            () = pause.reached() => {}
+        }
+        pause.release();
+
+        assert_eq!(
+            changes(&next_batch(&mut feed).await),
+            [("a.txt", ChangeKind::Changed), ("b.txt", ChangeKind::Changed)],
+        );
+        assert_nothing_more(&mut feed).await;
+        let written = [("a.txt", "a"), ("b.txt", "b")].map(|(p, c)| (p.to_owned(), c.to_owned()));
+        assert_eq!(contents(&store).await, written);
+    }
+
+    /// Writing the journal as `committed` can report a failure once it is written, as when forcing
+    /// its directory to disk fails. The Commit has happened then, so it is finished, and reported.
+    #[tokio::test]
+    async fn a_commit_whose_journal_was_committed_despite_an_error_finishes_and_is_reported() {
+        let fixture = Fs::new();
+        let failing = FailurePoint::CommittedJournalFails;
+        let Opened { store, mut feed } =
+            fixture.open_with(|options| options.fail_at(failing)).await;
+        store.commit(staged(&[("a.txt", "a")], &[])).await.unwrap();
+
+        assert_eq!(changes(&next_batch(&mut feed).await), [("a.txt", ChangeKind::Changed)]);
+        let written = [("a.txt".to_owned(), "a".to_owned())];
         assert_eq!(contents(&store).await, written);
         assert_eq!(temporary_files(fixture.root.path()), Vec::<PathBuf>::new());
     }
@@ -757,16 +810,34 @@ mod fs {
         };
     }
 
-    /// Every point a Commit that writes `writes` Files can stop at, and whether stopping there
-    /// leaves it not there at all, since it stopped before its journal was committed. Stopping
-    /// before any temporary file is written never happens to a Commit that writes none.
-    fn every_point(writes: usize) -> Vec<(FailurePoint, bool)> {
+    /// What a Commit gives when it meets a failure point, and what it leaves.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Outcome {
+        /// `Backend`, stopped there before its journal was committed: it never happens.
+        Discarded,
+        /// `Backend`, stopped there once its journal was committed: it is finished later.
+        Interrupted,
+        /// `Pending`: it is finished later, and reads show it finished already.
+        Pending,
+        /// It succeeds: the point is never reached, or the failure there is got over.
+        Finished,
+    }
+
+    /// Every failure point a Commit that writes `writes` Files can meet, with its [`Outcome`]. A
+    /// Commit that writes none never reaches the points before its journal is committed.
+    fn every_point(writes: usize) -> Vec<(FailurePoint, Outcome)> {
         use FailurePoint::*;
-        let mut points = vec![(AfterPreparedJournal, writes > 0)];
-        points.extend((0..writes).map(|n| (AfterTemporaryFile(n), true)));
-        points.extend([(AfterCommittedJournal, false), (AfterDeletes, false)]);
-        points.extend((0..writes).map(|n| (AfterRename(n), false)));
-        points.extend((0..writes).map(|n| (RenameFails { n, times: usize::MAX }, false)));
+        use Outcome::*;
+        let before = if writes > 0 { Discarded } else { Finished };
+        let mut points = vec![(AfterPreparedJournal, before)];
+        points.extend((0..writes).map(|n| (AfterTemporaryFile(n), Discarded)));
+        points.extend([
+            (CommittedJournalFails, Finished),
+            (AfterCommittedJournal, Interrupted),
+            (AfterDeletes, Interrupted),
+        ]);
+        points.extend((0..writes).map(|n| (AfterRename(n), Interrupted)));
+        points.extend((0..writes).map(|n| (RenameFails { n, times: usize::MAX }, Pending)));
         points
     }
 
@@ -780,13 +851,13 @@ mod fs {
         let Opened { store, feed: _feed } = reference.open().await;
         store.commit((shape.set_up)(&reference)).await.unwrap();
         store.commit((shape.commit)()).await.unwrap();
-        let applied = contents(&store).await;
+        let applied = state(&store).await;
 
-        for (point, absent) in every_point(shape.writes) {
+        for (point, outcome) in every_point(shape.writes) {
             let fixture = Fs::new();
             let Opened { store, feed: _feed } = fixture.open().await;
             store.commit((shape.set_up)(&fixture)).await.unwrap();
-            let before = contents(&store).await;
+            let before = state(&store).await;
             let links = symlinks(fixture.root.path());
             drop(store);
             let Opened { store: open_already, feed: _open_already_feed } = fixture.open().await;
@@ -794,23 +865,51 @@ mod fs {
             let Opened { store, feed: _feed } =
                 fixture.open_with(|options| options.fail_at(point)).await;
             let stopped = store.commit((shape.commit)()).await;
-            match (point, &stopped) {
-                (FailurePoint::RenameFails { .. }, Err(Error::Pending)) => {
-                    assert_eq!(contents(&store).await, applied, "{point:?}, pending");
+            match (outcome, &stopped) {
+                (Outcome::Discarded | Outcome::Interrupted, Err(Error::Backend(error))) => {
+                    let said = error.to_string();
+                    let stop = format!("stopped at the failure point {point:?}");
+                    assert!(said.contains(&stop), "{point:?}: {said}");
                 }
-                (FailurePoint::AfterPreparedJournal, Ok(_)) if shape.writes == 0 => {}
-                (_, Err(Error::Backend(_))) => {}
-                _ => panic!("{point:?}: {stopped:?}"),
+                (Outcome::Pending, Err(Error::Pending)) => {
+                    assert_eq!(state(&store).await, applied, "{point:?}, pending");
+                }
+                (Outcome::Finished, Ok(_)) => {}
+                _ => panic!("{point:?} should give {outcome:?}, got {stopped:?}"),
             }
             drop(store);
-            let expected = if absent { &before } else { &applied };
-            assert_eq!(&contents(&open_already).await, expected, "{point:?}, open already");
+            let expected = if outcome == Outcome::Discarded { &before } else { &applied };
+            assert_eq!(&state(&open_already).await, expected, "{point:?}, open already");
 
             let Opened { store, feed: _feed } = fixture.open().await;
-            assert_eq!(&contents(&store).await, expected, "{point:?}");
+            assert_eq!(&state(&store).await, expected, "{point:?}");
             assert_eq!(temporary_files(fixture.root.path()), Vec::<PathBuf>::new(), "{point:?}");
             assert_eq!(symlinks(fixture.root.path()), links, "{point:?}");
         }
+    }
+
+    /// What reads through a Store show of the Data Area: each Path's contents, and its Revision
+    /// from stat, and the Prefix Revision of each Prefix the crash tests' shapes use.
+    #[derive(Debug, PartialEq)]
+    struct State {
+        contents: Vec<(String, String)>,
+        revisions: Vec<Revision>,
+        prefix_revisions: Vec<PrefixRevision>,
+    }
+
+    async fn state(store: &Store) -> State {
+        let mut revisions = Vec::new();
+        for path in list(store, Area::Data).await {
+            let file = store.read(Area::Data, path.as_str()).await.unwrap().unwrap();
+            let stat = store.stat(Area::Data, path.as_str()).await.unwrap().unwrap();
+            assert_eq!((stat.modified(), stat.revision()), (file.modified(), file.revision()));
+            revisions.push(stat.revision());
+        }
+        let mut prefix_revisions = Vec::new();
+        for prefix in ["", "a/", "d/", "new/", "p/", "p/q/"] {
+            prefix_revisions.push(store.stat_prefix(Area::Data, prefix).await.unwrap());
+        }
+        State { contents: contents(store).await, revisions, prefix_revisions }
     }
 
     /// A Staging for the Data Area that writes `writes` and deletes `deletes`.
@@ -837,11 +936,7 @@ mod fs {
 
     /// A Commit that writes the Files [`moves`] moves.
     fn before_moves() -> Staging {
-        let mut staging = Staging::new(Area::Data);
-        staging.write("a", "a").unwrap();
-        staging.write("d/e", "e").unwrap();
-        staging.write("kept.txt", "old").unwrap();
-        staging
+        staged(&[("a", "a"), ("d/e", "e"), ("kept.txt", "old")], &[])
     }
 
     /// A Commit that moves the File `a` to `a/b`, and the File `d/e` to `d`, and changes

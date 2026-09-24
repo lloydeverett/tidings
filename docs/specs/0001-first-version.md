@@ -339,7 +339,7 @@ matches a Commit this Store made, and *external* otherwise.
   - recovery during `open`.
 - **When renames fail.** They are retried briefly, then `Pending` is returned, with the Commit's
   Changes recorded. While a committed journal still exists, reads of its Paths come from its
-  temporary files, and the next Commit or `open` finishes applying it. A next Commit that can't
+  temporary files, and the next Commit or `open` finishes it. A next Commit that can't
   finish it isn't made, and gives `Backend`; `open` still opens (ADR 0005).
 - **Preconditions.** The checks read and hash contents from disk, so edits by other programs
   count as changes. A Prefix Revision means reading and hashing every File under the Prefix, both

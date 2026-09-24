@@ -64,12 +64,16 @@ Named failure points in test builds make every one of these cases testable on Li
   the Commits and `open` that finish it later (`usize::MAX` keeps failing). The pause point is
   `FsOptions::pause_at(point, &Pause)`: each Commit through the Store waits at `point` (any place
   `fail_at` can stop) until `Pause::release`, and `Pause::reached().await` says one is there. A
-  held Commit waits a minute at most, so a failing test can't hang the runtime.
+  Commit held for 30 seconds panics, so a test that never releases it fails rather than hangs.
+  After the review, `FailurePoint::CommittedJournalFails` makes writing the `committed` journal
+  report an error once it is written.
 - **The crash matrix** replaces ticket 09's three piecemeal crash tests. `stop_everywhere(shape)`
   runs one shape of Commit through every point (`AfterPreparedJournal`, each
-  `AfterTemporaryFile(n)`, `AfterCommittedJournal`, `AfterDeletes`, each `AfterRename(n)` and
-  each `RenameFails { n, usize::MAX }`), each on a fresh Area. What "all there" looks like comes
-  from committing the shape without stopping; "not there" is what the Area held before. It checks
+  `AfterTemporaryFile(n)`, `CommittedJournalFails`, `AfterCommittedJournal`, `AfterDeletes`,
+  each `AfterRename(n)` and each `RenameFails { n, usize::MAX }`), each on a fresh Area. Each
+  point's result is exact: the failure point's own stop, `Pending`, or success. What "all there"
+  looks like comes from committing the shape without stopping; "not there" is what the Area held
+  before. Both are compared through `list`, `read`, `stat` and `stat_prefix`. It checks
   a Store that was open already (as in another process) before anything finishes the Commit, then
   a Store opened afterwards, no temporary files, and that every symlink is still a symlink. The
   shapes: a write (one File replaced, one in a new directory), a write and a delete, a Prefix
@@ -82,7 +86,7 @@ Named failure points in test builds make every one of these cases testable on Li
   models the process dying). Then the Backend returns its `CommitOutcome` with `pending: true`,
   the Store layer records the Changes and gives `Error::Pending`, so the Changes arrive once,
   including from a dropped Commit's task. Finishing it later reports nothing.
-- **Reads while a `committed` journal is there** (`Unfinished` in journal.rs): a Path the Commit
+- **Reads while a `committed` journal is there** (`AsFinished` in journal.rs): a Path the Commit
   writes is read from its temporary file until that is renamed, and a Path it deletes is absent if
   the File there has the journaled Revision. `list` and `stat_prefix` apply the same. This also
   covers a Commit that crashed after `committed` and a Commit being finished right then. The
@@ -95,7 +99,9 @@ Named failure points in test builds make every one of these cases testable on Li
   that can't be read stops it.
 - **Logging.** Discarding or finishing a journal left behind, each retry, a `Pending` Commit and a
   journal `open` leaves unfinished are logged at debug level. There is no test of the logging.
-- **Not done:** if writing the `committed` journal itself reports a failure after the rename did
-  land (the directory fsync failing, say), the Commit gives `Backend` though it happened, and its
-  Changes aren't reported. It is finished later as usual. Telling the two apart would mean reading
-  the journal back.
+- **Writing the `committed` journal can report a failure after its rename landed** (the
+  directory fsync failing, say). After the review, the journal is read back then: if it is
+  `committed`, the Commit goes on to be finished and reported; otherwise it is discarded and gives
+  the error. Only if the journal can't be read back either are the Changes of a Commit that
+  happened lost.
+- **The journal format** is `tidings journal 2` after the review, since the `replace` line changed.
