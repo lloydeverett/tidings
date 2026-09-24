@@ -12,7 +12,7 @@ default = ["fs", "sqlite"]
 # The filesystem Backend.
 fs = []
 # The SQLite Backend.
-sqlite = ["dep:etcetera", "dep:rusqlite"]
+sqlite = ["dep:etcetera", "dep:rusqlite", "tokio/time"]
 # `blocking::Store`, for synchronous code.
 blocking = []
 # Failure points and helpers for tidings' own tests.

@@ -382,7 +382,8 @@ otherwise.
 - Cargo features:
   - `fs` and `sqlite`, both on by default;
   - `blocking`;
-  - `testing`, which enables the failure points, injecting external Changes and shared test
+  - `testing`, which enables the failure points, injecting external Changes, a short retention
+    for the SQLite change log (so that a test can see a Store miss Commits) and shared test
     helpers. tidings' own tests always build with it.
 - Edition 2024, `rust-version` 1.94, Apache-2.0.
 - Main dependencies: tokio, jiff, etcetera, relative-path, sanitize-filename,

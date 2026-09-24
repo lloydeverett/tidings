@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use jiff::Timestamp;
 
 use crate::staging::{Action, Staged};
-use crate::{Area, ChangeKind, File, Path, Prefix, PrefixRevision, Result, Revision, Stat};
+use crate::{Area, ChangeKind, File, Origin, Path, Prefix, PrefixRevision, Result, Revision, Stat};
 
 /// The Backend a Store was opened on.
 #[derive(Debug)]
@@ -91,6 +91,21 @@ pub(crate) struct CommitOutcome {
     pub(crate) revisions: BTreeMap<Path, Revision>,
     /// Each Path the Commit changed or removed, in order.
     pub(crate) changes: Vec<RawChange>,
+    /// What other Stores did to the Area before this Commit that this Store hasn't recorded on
+    /// its Change feed yet, in the order they did it. Only SQLite, which reads it from its change
+    /// log, gives any.
+    pub(crate) before: Vec<Observed>,
+}
+
+/// Something a Backend observed in an Area's change log, which Commits by every Store on the same
+/// storage go into.
+#[derive(Debug)]
+#[cfg_attr(not(feature = "sqlite"), expect(dead_code, reason = "only SQLite has a change log"))]
+pub(crate) enum Observed {
+    /// A Commit, and each Path it changed or removed. Its Origin is local if this Store made it.
+    Commit { origin: Origin, changes: Vec<RawChange> },
+    /// Commits were pruned from the log before this Store read them, so their Changes are missed.
+    Missed,
 }
 
 /// A change a Backend made or observed, before the Store layer tags it with its Area and Origin.
@@ -143,7 +158,7 @@ impl Plan {
             change(&path, planned)?;
             changes.push(RawChange { path, kind });
         }
-        Ok(CommitOutcome { revisions: self.revisions, changes })
+        Ok(CommitOutcome { revisions: self.revisions, changes, before: Vec::new() })
     }
 }
 

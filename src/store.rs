@@ -6,14 +6,15 @@ use std::task::{Context, Poll};
 use jiff::Timestamp;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
+use tokio::task::AbortHandle;
 
 #[cfg(feature = "testing")]
 use crate::ChangeKind;
 #[cfg(feature = "testing")]
 use crate::backend::RawChange;
 #[cfg(feature = "sqlite")]
-use crate::backend::sqlite::SqliteBackend;
-use crate::backend::{Backend, CommitRequest, memory::MemoryBackend};
+use crate::backend::sqlite::{SqliteBackend, SqlitePoller};
+use crate::backend::{Backend, CommitRequest, Observed, memory::MemoryBackend};
 use crate::change::{self, FeedSender};
 #[cfg(feature = "sqlite")]
 use crate::{AppIdentity, SqliteOptions};
@@ -47,7 +48,12 @@ struct Inner {
     /// Held from before a Commit is applied until its Changes are recorded, so that Commits reach
     /// the Change feed in the order they were applied. Otherwise two Commits to the same Path
     /// could be recorded the other way round, and the merged Change would have the wrong kind.
+    /// The task that follows other Stores' Commits holds it too, from reading them until they are
+    /// recorded.
     commit_order: Arc<Mutex<()>>,
+    /// The task that follows other Stores' Commits, if the Backend has one. It is stopped when
+    /// the Store is dropped.
+    following: Option<AbortHandle>,
 }
 
 /// A Commit that has started. It runs in place while the app waits for it. If the app stops
@@ -94,6 +100,9 @@ impl Drop for Started {
 impl Drop for Inner {
     /// The last Store handle is gone, so nothing more can be committed: the Change feed ends.
     fn drop(&mut self) {
+        if let Some(following) = &self.following {
+            following.abort();
+        }
         self.feed.end();
     }
 }
@@ -102,7 +111,14 @@ impl Store {
     /// Opens a Store that keeps its Files in memory, for tests and short-lived data. Returns the
     /// Store together with its one Change feed.
     pub fn open_memory() -> (Store, ChangeFeed) {
-        Store::open(Backend::Memory(MemoryBackend::default()))
+        let (feed, change_feed) = change::feed();
+        let inner = Inner {
+            backend: Backend::Memory(MemoryBackend::default()),
+            feed,
+            commit_order: Arc::default(),
+            following: None,
+        };
+        (Store { inner: Arc::new(inner) }, change_feed)
     }
 
     /// Opens a Store that keeps each Area in a SQLite database of its own, in the Area's standard
@@ -110,20 +126,32 @@ impl Store {
     /// databases and their directories if they don't exist. Returns the Store together with its
     /// one Change feed.
     ///
+    /// Other processes can open the same databases, and commit to them safely: Commits are
+    /// applied one at a time. Every poll interval in `options`, the Store checks for their
+    /// Commits, which arrive on the Change feed as external Changes, each Commit's in one batch.
+    ///
     /// Gives [`Error::Backend`](crate::Error::Backend) if a database can't be opened or created.
+    ///
+    /// # Panics
+    ///
+    /// If it isn't called from within a tokio runtime.
     #[cfg(feature = "sqlite")]
     pub async fn open_sqlite(
         app: &AppIdentity,
         options: SqliteOptions,
     ) -> Result<(Store, ChangeFeed)> {
-        let backend = SqliteBackend::open(app, options).await?;
-        Ok(Store::open(Backend::Sqlite(backend)))
-    }
-
-    fn open(backend: Backend) -> (Store, ChangeFeed) {
+        let (backend, poller) = SqliteBackend::open(app, options).await?;
         let (feed, change_feed) = change::feed();
-        let inner = Inner { backend, feed, commit_order: Arc::default() };
-        (Store { inner: Arc::new(inner) }, change_feed)
+        let commit_order = Arc::default();
+        let following =
+            tokio::spawn(follow_other_stores(poller, feed.clone(), Arc::clone(&commit_order)));
+        let inner = Inner {
+            backend: Backend::Sqlite(backend),
+            feed,
+            commit_order,
+            following: Some(following.abort_handle()),
+        };
+        Ok((Store { inner: Arc::new(inner) }, change_feed))
     }
 
     /// Reads the File at `path` in `area`, or gives `Ok(None)` if there is none.
@@ -217,6 +245,7 @@ impl Store {
             let timestamp = Timestamp::now();
             let request = CommitRequest { timestamp, staged: staging.into_staged() };
             let outcome = inner.backend.commit(request).await?;
+            record_observed(&inner.feed, area, outcome.before);
             inner.feed.record(area, outcome.changes, Origin::Local);
             Ok(Committed::new(timestamp, outcome.revisions))
         };
@@ -236,5 +265,42 @@ impl Store {
         let change = RawChange { path: path.into_path()?, kind };
         self.inner.feed.record(area, vec![change], Origin::External);
         Ok(())
+    }
+}
+
+/// Records on `feed` what the Backend observed in `area`, in order: each Commit in one batch.
+fn record_observed(feed: &FeedSender, area: Area, observed: Vec<Observed>) {
+    for observed in observed {
+        match observed {
+            Observed::Commit { origin, changes } => feed.record(area, changes, origin),
+            Observed::Missed => feed.resync(area),
+        }
+    }
+}
+
+/// Records other Stores' Commits to the SQLite databases as the poller notices them, until the
+/// Store is dropped and stops it. It holds only the Store's end of the Change feed and its turn
+/// with Commits, not the Store, so that the feed still ends.
+///
+/// If an Area's change log can't be read, a Resync for the Area is sent, once until it can be
+/// read again.
+#[cfg(feature = "sqlite")]
+async fn follow_other_stores(poller: SqlitePoller, feed: FeedSender, commit_order: Arc<Mutex<()>>) {
+    let mut failing = Vec::new();
+    loop {
+        for area in poller.wait().await {
+            let _turn = commit_order.lock().await;
+            match poller.read(area).await {
+                Ok(observed) => {
+                    failing.retain(|failed| *failed != area);
+                    record_observed(&feed, area, observed);
+                }
+                Err(_) if failing.contains(&area) => {}
+                Err(_) => {
+                    failing.push(area);
+                    feed.resync(area);
+                }
+            }
+        }
     }
 }

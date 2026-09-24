@@ -50,6 +50,12 @@ impl<T> PerArea<T> {
     }
 
     /// Each Area with its `T`, in order of Area.
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (Area, &T)> {
+        Self::AREAS.into_iter().zip(&self.0)
+    }
+
+    /// Each Area with its `T`, in order of Area.
     pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (Area, &mut T)> {
         Self::AREAS.into_iter().zip(&mut self.0)
     }

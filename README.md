@@ -5,9 +5,10 @@ SQLite or in memory. Writes happen only through staged commits. Every change is 
 change feed.
 
 Status: early. Stores in memory and on SQLite exist so far: reading, stat and listing, commits of
-writes and deletes with preconditions, checked paths, the change feed, and snapshots. Still to
-come: the filesystem backend, resyncs, the blocking API, and seeing another process's commits to
-the same SQLite databases. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
+writes and deletes with preconditions, checked paths, the change feed, snapshots, and on SQLite,
+seeing other processes' commits to the same databases. Still to come: the filesystem backend,
+with its watching and the resyncs that come with it, and the blocking API. See
+[CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
 
 ## Consistency
 
@@ -28,8 +29,15 @@ the same SQLite databases. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr)
 - Every change after `open` returns is reported. Unread changes to the same path are merged into
   one: the latest kind wins, and it counts as external if any of them was, so skipping your own
   changes never hides anyone else's. A commit's changes always arrive in the same batch. If
-  changes may have been missed (watching failed, or an area's directory was removed), the feed
-  sends a resync for that area instead: read it all again.
+  changes may have been missed (watching failed, an area's directory was removed, or on SQLite,
+  the store fell too far behind other processes' commits), the feed sends a resync for that area
+  instead: read it all again.
+- On SQLite, several processes can open the same store and commit to it. Their commits are applied
+  one at a time, and preconditions hold exactly between them. Each store checks for the others'
+  commits every poll interval (100 ms by default, set in `SqliteOptions`) and reports them as
+  external changes, each commit's in one batch, in the order they were applied. They are kept
+  for 10 minutes for stores that haven't seen them yet: a store that falls further behind than
+  that, because its process was stopped, say, gets a resync instead.
 - The store can be cloned and shared between tasks. The change feed ends once every clone has
   been dropped, even if a snapshot is still held. Dropping the change feed leaves the store
   working.

@@ -107,15 +107,31 @@ struct Shared {
 /// however many Changes were recorded.
 #[derive(Debug, Default)]
 struct Unread {
-    /// The merged Changes for each Area. Kept per Area so that a Resync, which covers a whole
-    /// Area, can take the place of that Area's unread Changes: the app reads the whole Area again
-    /// after it anyway.
-    areas: PerArea<BTreeMap<Path, Merged>>,
+    /// What is unread for each Area. Kept per Area so that a Resync, which covers a whole Area,
+    /// can take the place of that Area's unread Changes: the app reads the whole Area again after
+    /// it anyway.
+    areas: PerArea<UnreadInArea>,
     /// Every Store handle has been dropped: once what is unread has been read, the Change feed
     /// ends.
     store_dropped: bool,
     /// The Change feed has been dropped, so nothing is recorded.
     feed_dropped: bool,
+}
+
+/// What is unread for one Area.
+#[derive(Debug)]
+enum UnreadInArea {
+    /// The merged Changes to each Path.
+    Changes(BTreeMap<Path, Merged>),
+    /// A Resync. It took the place of the Area's unread Changes, and Changes recorded for the
+    /// Area until it is read add nothing to it: reading the Area again after it covers them.
+    Resync,
+}
+
+impl Default for UnreadInArea {
+    fn default() -> UnreadInArea {
+        UnreadInArea::Changes(BTreeMap::new())
+    }
 }
 
 /// What is left of every unread Change to one Path, merged.
@@ -143,7 +159,9 @@ impl Unread {
         if self.store_dropped || self.feed_dropped {
             return;
         }
-        let merged = self.areas.get_mut(area);
+        let UnreadInArea::Changes(merged) = self.areas.get_mut(area) else {
+            return;
+        };
         for RawChange { path, kind } in changes {
             let merged = merged.entry(path).or_insert(Merged { kind, origin });
             merged.kind = kind;
@@ -153,7 +171,21 @@ impl Unread {
         }
     }
 
+    fn resync(&mut self, area: Area) {
+        if self.store_dropped || self.feed_dropped {
+            return;
+        }
+        *self.areas.get_mut(area) = UnreadInArea::Resync;
+    }
+
+    /// Resyncs first, one Area at a time, then a batch of every other Area's Changes.
     fn next(&mut self) -> Next {
+        for (area, unread) in self.areas.iter_mut() {
+            if let UnreadInArea::Resync = unread {
+                *unread = UnreadInArea::default();
+                return Next::Item(FeedItem::Resync(area));
+            }
+        }
         match self.take() {
             Some(batch) => Next::Item(FeedItem::Changes(batch)),
             None if self.store_dropped => Next::Ended,
@@ -161,10 +193,11 @@ impl Unread {
         }
     }
 
-    /// Everything unread, as one batch, or `None` if there is nothing.
+    /// Every unread Change, as one batch, or `None` if there is none.
     fn take(&mut self) -> Option<Vec<Change>> {
         let mut batch = Vec::new();
-        for (area, merged) in self.areas.iter_mut() {
+        for (area, unread) in self.areas.iter_mut() {
+            let UnreadInArea::Changes(merged) = unread else { continue };
             let changes = std::mem::take(merged).into_iter();
             batch.extend(changes.map(|(path, Merged { kind, origin })| Change {
                 area,
@@ -177,8 +210,9 @@ impl Unread {
     }
 }
 
-/// The Store's end of its Change feed.
-#[derive(Debug)]
+/// The Store's end of its Change feed. A clone doesn't keep the feed open: it ends when the Store
+/// calls [`end`](Self::end).
+#[derive(Debug, Clone)]
 pub(crate) struct FeedSender {
     shared: Arc<Shared>,
 }
@@ -195,6 +229,13 @@ impl FeedSender {
             return;
         }
         self.shared.unread.lock().unwrap().record(area, changes, origin);
+        self.shared.recorded.notify_one();
+    }
+
+    /// Records that Changes to `area` may have been missed. The Resync takes the place of the
+    /// Area's unread Changes, and those recorded for it until the Resync is read.
+    pub(crate) fn resync(&self, area: Area) {
+        self.shared.unread.lock().unwrap().resync(area);
         self.shared.recorded.notify_one();
     }
 
