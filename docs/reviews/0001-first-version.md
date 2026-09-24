@@ -1121,3 +1121,164 @@ Clippy (all targets, with default features, `--all-features` and `--no-default-f
 clean, and so is rustdoc. `cargo test` passes with each: 96 behaviour tests (45 without `sqlite`),
 5 path tests, 3 Store-layer tests and the SQLite unit test. The SQLite tests pass on repeated
 runs. Removing the gap check still fails the Resync test.
+
+---
+
+## Ticket 09: Filesystem backend, storage and journaled Commits
+
+Reviewed: `git diff f8a57c7...57b0085` (commit 57b0085). The Spec reviewer was also asked to check the journal against ADR 0005: whether finishing a Commit a second time is safe (idempotent), where the fsyncs go, symlinks, locking between two Stores, names on disk that aren't valid Paths, and the failure points added early. The checks used crash-simulation probes.
+
+### Standards
+
+**(a) Breaches of documented standards**
+
+1. **Tests inspect internal state.** This is the one likely hard violation. The spec's Testing Decisions say a test "never looks at journal files, tables or internal state", and the only exceptions are failure points and injecting external Changes.
+   - `tests/behaviour/main.rs:489` `temporary_files()` walks the Root override looking for `.tidings-` temporary files. Tests assert on it at :331, :369, :401, :427 and :456.
+   - `tests/behaviour/main.rs:205` asserts that `.tidings/` exists.
+   - Defensible only because leftover temporary files are visible to a user in their config directory. If that is the intended reading, write it into the spec. Otherwise, check the outcome through `list`/`read` only.
+   - Direct on-disk reads and writes of Files (`write_directly`, `on_disk`, the mtime check at :298) are permitted by "filesystem: write to, delete from … the Area directory directly".
+2. **Failure points exist outside `testing`.** Soft breach. The spec says failure points "exist only with the `testing` feature". But `FailurePoint` and `stop_at` (`src/backend/fs.rs:106-118`, `:203-208`) are always compiled, and the `stop_at` calls stay in `commit` (:329, :341, :348). Only the `pub use` in `src/lib.rs` and `FsOptions::fail_at` are gated. Without the feature they do nothing, but they are still present.
+
+Checked and conforming:
+- `tracing` is used at debug level only (`fs.rs:337`, `journal.rs:62,66`).
+- `NotText` was added to the single `#[non_exhaustive]` `Error`.
+- The Backend stays `pub(crate)`, and the features keep their shape.
+- ADR 0005's step order holds: Preconditions are checked before the journal is written.
+- CONTEXT's `_Avoid_` words: "directory" and "entry" are used only for real on-disk directories and `DirEntry`, never for a Prefix or a File.
+
+**(b) Baseline smells (all judgement calls)**
+
+- **Duplicated Code: turning a Path into a place on disk.** `AreaRoot::file` (`fs.rs:228`) splits on `/` and extends, while `Journal::finish` (`journal.rs:120`) uses `root.join(path.as_str())`. Two answers to one question can drift apart on Windows. Share one function.
+- **Duplicated Code: handling "not found".** `match … { Ok, Err(e) if is_absent(&e) => …, Err(e) => failed(..) }` appears 11 times: in `fs.rs` (:267, :272, :380, :431, :481) and in `journal.rs` (:102, :128, :162, :224, :270). A small `absent_ok(result, path)` helper would collapse them.
+- **Data Clumps / parallel vectors.** In `fs.rs:300-331`, `writes: Vec<(Path, String)>` and `journal.replaces` are built separately, then re-paired by index (`journal.replaces.iter().zip(&writes)`). The contents belong with each `Replace`, or in a local struct holding both.
+- **Mysterious Name.** The `Kind` enum at `fs.rs:417` is too generic next to `ChangeKind`. `OnDisk` or `EntryKind` would say what it describes.
+- **Primitive Obsession (minor).** Test helpers take the Area as a `&str` (`on_disk("config", …)`, `main.rs:170`) when the `Area` enum exists. Forgivable, because `Area::name` is `pub(crate)`.
+
+Not flagged:
+- Enum dispatch in `backend/mod.rs`, because the spec mandates no public trait.
+- `temporary_file_name` living in `path.rs` beside the check that recognises such names, which keeps the name format in one place.
+- `FsBackend` delegating to `AreaRoot`. That is the boundary between async and blocking code, not a Middle Man.
+
+### Spec
+
+`cargo test --features testing` passes (152 behaviour tests), and `--no-default-features --features fs` builds. The probes were a scratch crate, `scratchpad/probe09/`. A crash at the very end of finishing was simulated by putting a saved `.tidings/journal` back after the Commit had finished, then reopening the Store.
+
+**What checks out**
+- **The lock** is held across recovery, the Preconditions and finishing (fs.rs:242-256, 295). `open` also recovers under the lock.
+- **The journal** records every temporary file, each resolved target and each delete.
+- **Finishing again** was tried after the whole Commit, after only the deletes, and after some of the renames (probes P1, P1b, P1c). All three were idempotent for ordinary moves.
+- **Discarding a `prepared` journal** removes every temporary file.
+- **Durability:** the temporary files are forced to disk. So is the journal, and atomic-write-file forces its directory.
+- **Failure points:** the public API exists only with `testing` (lib.rs). Building three of them here, ahead of ticket 10, is a small step.
+
+**(a) Missing or partial**
+- The spec says: "`InvalidPath`: includes letter-case clashes, and a File under another File (`a` beside `a/b`)" (spec:270). This change adds a new `FileUnderFile` refusal for obstacles on disk (fs.rs:524-546), but only the ticket and the module doc record it.
+  - In probe P5, after `delete_prefix("p/")` the Prefix `p/` lists as empty, yet writing `p` is refused, because `p/` still holds `cafe\u{301}.txt`.
+  - This belongs in ADR 0004 or 0005, the spec and the README Limitations.
+- The spec's Path rules (spec:229) still name only `.tidings`. They should also name the newly reserved temporary-file name.
+
+**(c) Implemented but wrong**
+1. **Finishing again is not idempotent when two Paths are the same file.** ADR 0005:43 says "Finishing a Commit again changes nothing", which fails in two cases.
+   - **A symlink (P2).** `a` is a link to `b`, and one Commit writes `a` and deletes `b`. Finishing leaves `a` and `b` both reading "new a". Finishing again deletes `b` first (journal.rs:119-131), then skips the rename. The write is lost and `a` is left dangling.
+   - **A case-insensitive filesystem** (found by reading the code; it can't be tested on Linux). The shared check accepts "delete `Foo`, write `foo`" (P4 on the memory Backend). Finishing again would delete the new `foo`.
+   - Worse, in the case-insensitive situation with identical contents, `leave_out_what_changes_nothing` (staging.rs:250) sees `foo` as already present and drops the write. The delete then removes the File on the first finish, with no crash at all.
+   - Not forcing the journal's removal to disk is only as safe as this idempotency. The comment at journal.rs:217 also admits that finishing again can re-apply a delete to a File another program has created since, which contradicts the ADR's wording.
+2. **A dangling symlink escapes the Area (P3).**
+   - Writing to a link that points at `<outside>/deep/er/y.txt` creates `deep/er` outside the root.
+   - For a link to `/nonexistent/q`, the Commit tries to put its temporary file in `/`.
+   - The cause: neither `nearest_directory` (fs.rs:604) nor the walk that refuses obstacles (fs.rs:538) stops at the Area root or at the link's own directory.
+   - This behaviour is neither specified nor documented.
+3. **A minor gap in durability.** When finishing creates nested directories (`a/b/c`), only the temporary file's directory and the target's directory are forced to disk (journal.rs:143-144). The directory in between (`a`) is not.
+
+**Names on disk that aren't valid Paths** are left out of `list`, `stat_prefix` and Prefix deletes, as the README documents. Names that differ only in letter case are both listed.
+
+**(b) Scope creep:** nothing substantial.
+
+### Summary
+
+Standards: 1 likely hard violation and 1 soft breach, plus 5 smells. The hard violation is that tests inspect temporary files and `.tidings/` on disk. The soft breach is failure-point code compiled outside `testing`. Spec: 2 documentation gaps and 3 wrong behaviours. The worst is that finishing a Commit again is not idempotent when two Paths are the same file (through a symlink, or letter case on a case-insensitive filesystem). On a case-insensitive filesystem, renaming `Foo` to `foo` with the same contents deletes the File even without a crash.
+
+
+### Resolution
+
+1. **Spec c1, two Paths that are the same file:** fixed in three parts, recorded in ADR 0005.
+   - **(a) Exact names.** A Path now names only the file with exactly its name. `open` finds out
+     whether the Area's filesystem ignores letter case, by checking whether `.tidings/LOCK` finds
+     `.tidings/lock` while no entry has that name. Where it does, `read`, `stat`, the Commit's
+     `revision` and `list` of a Prefix check each name on the way against its directory's entries.
+     So `read("foo")` gives nothing and `list` shows `Foo` when only `Foo` is there, which keeps
+     them consistent. `revisions_under` skips the check for Paths it has just listed.
+     - The case-only rename (delete `Foo`, write `foo`) now keeps its write even when the contents
+       are the same, because `foo` is absent.
+     - When a write's File or directory is found under another case, that match must be removed by
+       the Commit's deletes. Its temporary file then goes in the nearest directory that exists
+       under its own name. While finishing, a directory emptied under the old case is removed
+       before the directory is made in the new case. That is how the suite's `Themes/` rename
+       would work on macOS.
+     - I can't test this on Linux, so it is reasoned through step by step against the suite's
+       case test, and documented. Only letter case is detected. Case-sensitive APFS, which
+       ignores Unicode normalization, and HFS+, which stores names in NFD, aren't handled. ADR
+       0005 says so.
+   - **(b) The same file on disk is refused.** Before the journal is written, each written or
+     deleted Path's file on disk is worked out: its directory as `canonicalize` gives it, plus
+     the rest of the name. A second Path that comes out the same is refused with the new
+     `InvalidPathReason::SameFile`. That covers the P2 shape (write `a`, delete `b`), writes to
+     both `a` and `b`, two links to one File, and a symlinked directory. Deleting the link itself
+     and writing the File are two files, so that Commit still goes through. The case-only rename
+     isn't refused, because its two names differ. I went with refusing, as suggested, rather than
+     defining what such a Commit means.
+   - **(c) Deletes that are safe to repeat.** `Planned::Remove` now carries the Revision of the
+     File it removes. That Revision comes from `leave_out_what_changes_nothing`, which reads it
+     anyway. The journal records it: `remove <Path> <revision>`. Finishing again deletes a File
+     only if it is still there under exactly its name with that Revision. So a File that one of the
+     Commit's writes, or another program, has put there since is left alone. The only exception is
+     a File another program wrote there since with the very same contents. ADR 0005 and the
+     journal's module doc now say this, and the old comment in `remove` is replaced.
+   - **Tests.**
+     - `a_commit_interrupted_while_finishing_is_finished_when_a_store_opens` stops the moves Commit
+       at `AfterDeletes` and at `AfterRename(0)`, `(1)` and `(2)`, the last of which leaves only
+       the journal's removal undone.
+     - `finishing_a_commit_again_keeps_a_file_written_since_where_it_deleted_one`.
+     - `a_commit_to_two_paths_that_are_the_same_file_is_refused` (Unix).
+     - Each fails with its behaviour removed. The two new failure points exist only with `testing`,
+       and finishing a Commit left behind never stops at one.
+   - Reasoning through the case-insensitive path turned up a bug in my first version of (b). A
+     write whose directory doesn't exist yet got an identity from its last segment only, so
+     `x.txt` beside `new/x.txt` was refused. The identity now carries the whole rest of the name.
+     `files_named_alike_in_directories_still_to_be_made_are_different_files` covers it.
+2. **Spec c2, a dangling symlink escapes the Area:** fixed.
+   - A write through a symlink puts its temporary file next to the file the link points to. If
+     that directory doesn't exist, the Commit is refused with `Backend` ("… in a directory that
+     doesn't exist …") before the journal is written.
+   - The journal now tells a `write` to a Path, whose directories finishing may make (only under
+     the root), apart from a `replace` through a link, which never makes a directory.
+   - The nearest existing directory is found from the root down, so it can't leave the Area.
+   - `a_write_through_a_symlink_never_makes_a_directory` (Unix) covers a link to
+     `<outside>/deep/er/y.toml`, one to `/nonexistent/q.toml`, and the dotfiles case, a link to a
+     missing File in a directory that exists, which still works.
+3. **Spec c3:** fixed. Finishing now makes missing directories one at a time from the root down
+   (`AreaRoot::make_directories`). It forces each one it made, and the directory it was made in,
+   to disk.
+4. **Spec a, documentation:** fixed.
+   - The on-disk `FileUnderFile` refusal, including P5, and `SameFile` are in ADR 0005, the spec's
+     `InvalidPath` line, the `InvalidPathReason` docs and the README Limitations.
+   - The spec's Path rules now name the reserved temporary-file name.
+5. **Standards a1, tests that look at the disk:** the spec's Testing Decisions now have a fourth
+   exception. Filesystem tests may check that no tidings temporary files are left in the Area
+   directory, since a person sees them there. The `.tidings/` existence assertion is gone.
+6. **Standards a2:** fixed. `FailurePoint`, `stop_at` (now `AreaRoot::stop_at`) and every call
+   to it exist only with `testing`. A plain `cargo clippy` without the feature is clean too. The
+   loops whose index names a failure point `expect` clippy's unused-index lint without it.
+7. **Smells:** all fixed.
+   - `on_disk(root, path)` is the one Path-to-disk function. `AreaRoot::file` and the journal
+     both use it.
+   - `present` and `present_at` replace the not-found matches.
+   - Each write's contents travel with its `Replace` in a `Writing`.
+   - `Kind` is now `OnDisk`.
+   - The test helpers take an `Area`.
+
+Clippy is clean with default features, `--all-features`, `--no-default-features`, `fs` only and
+`sqlite` only, both with `--all-targets` and without it, so also without `testing`. So are
+rustfmt and rustdoc. `cargo test` passes with default features, `--no-default-features` and
+`--all-features`: 157 behaviour tests (45 without fs or sqlite), 5 path tests, 3 Store-layer
+tests and the SQLite unit test.

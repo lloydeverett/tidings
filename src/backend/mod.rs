@@ -85,8 +85,14 @@ pub(crate) struct Plan {
 pub(crate) enum Planned {
     /// Writes the File with these contents and this Stat.
     Write { contents: String, stat: Stat },
-    /// Removes the File.
-    Remove,
+    /// Removes the File, which has this Revision.
+    Remove {
+        #[cfg_attr(
+            not(feature = "fs"),
+            expect(dead_code, reason = "only the filesystem journals it")
+        )]
+        revision: Revision,
+    },
 }
 
 /// What a Commit did.
@@ -135,14 +141,14 @@ impl CommitRequest {
         let CommitRequest { timestamp, mut staged } = self;
         staged.check_preconditions(current)?;
         staged.expand_prefix_deletes(current)?;
-        let revisions = staged.leave_out_what_changes_nothing(current)?;
+        let (revisions, removed) = staged.leave_out_what_changes_nothing(current)?;
         staged.refuse_clashing_paths(current)?;
         let changes = staged.actions.into_iter().map(|(path, action)| {
             let planned = match action {
                 Action::Write(contents) => {
                     Planned::Write { contents, stat: Stat::new(timestamp, revisions[&path]) }
                 }
-                Action::Delete => Planned::Remove,
+                Action::Delete => Planned::Remove { revision: removed[&path] },
             };
             (path, planned)
         });
@@ -161,7 +167,7 @@ impl Plan {
         for (path, planned) in self.changes {
             let kind = match planned {
                 Planned::Write { .. } => ChangeKind::Changed,
-                Planned::Remove => ChangeKind::Removed,
+                Planned::Remove { .. } => ChangeKind::Removed,
             };
             change(&path, planned)?;
             changes.push(RawChange { path, kind });

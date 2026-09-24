@@ -239,31 +239,33 @@ impl Staged {
     /// Leaves out every write that would not change the File's contents in `current`, and every
     /// delete of a Path with no File: the third step of
     /// [`CommitRequest::plan`](crate::backend::CommitRequest::plan). Gives the Revision of every
-    /// write, including those left out.
+    /// write, including those left out, and the Revision of each File a delete removes.
     pub(crate) fn leave_out_what_changes_nothing(
         &mut self,
         current: &impl AreaState,
-    ) -> Result<BTreeMap<Path, Revision>> {
-        let mut revisions = BTreeMap::new();
+    ) -> Result<(BTreeMap<Path, Revision>, BTreeMap<Path, Revision>)> {
+        let (mut written, mut removed) = (BTreeMap::new(), BTreeMap::new());
         let mut unchanged = Vec::new();
         for (path, action) in &self.actions {
             let now = current.revision(path)?;
-            let changes_nothing = match action {
-                Action::Write(contents) => {
+            match (action, now) {
+                (Action::Write(contents), now) => {
                     let revision = Revision::of(contents);
-                    revisions.insert(path.clone(), revision);
-                    now == Some(revision)
+                    written.insert(path.clone(), revision);
+                    if now == Some(revision) {
+                        unchanged.push(path.clone());
+                    }
                 }
-                Action::Delete => now.is_none(),
-            };
-            if changes_nothing {
-                unchanged.push(path.clone());
+                (Action::Delete, Some(now)) => {
+                    removed.insert(path.clone(), now);
+                }
+                (Action::Delete, None) => unchanged.push(path.clone()),
             }
         }
         for path in unchanged {
             self.actions.remove(&path);
         }
-        Ok(revisions)
+        Ok((written, removed))
     }
 
     /// Refuses a write that would leave two names in the Area after the Commit that some platform

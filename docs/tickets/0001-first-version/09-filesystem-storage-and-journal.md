@@ -60,11 +60,13 @@ through the link. Snapshots are refused. The whole shared suite passes, except t
   journal and temporary files and finish. `paths_named_like` lists only the directories along the
   name, one segment at a time, keeping the entries whose fold matches, so the letter-case and
   File-under-File check costs what the Commit writes.
-- **The journal records** each temporary file with its target (absolute, after following
-  symlinks) and each Path deleted (relative to the root). The directories to make and remove
-  follow from those, so they aren't recorded. Finishing is idempotent, so a crash while finishing
-  is finished again: a delete skips a Path that is gone or is now a directory, a rename skips a
-  temporary file that is gone, and emptied directories are removed as far up as they are empty.
+- **The journal records** each temporary file with the Path it replaces, or, through a symlink,
+  the absolute file the link points to, and each Path deleted with its Revision (added after the
+  review). The directories to make and remove follow from those, so they aren't recorded. A crash
+  while finishing is finished again: a delete is made only if the File is still there under
+  exactly its name with that Revision, a rename skips a temporary file that is gone, and emptied
+  directories are removed as far up as they are empty. See the review's Resolution for the
+  same-file cases that made this necessary.
   Paths on disk must be valid Unicode to be journaled; a symlink into a directory whose name isn't
   gives `Backend` rather than being written.
 - **File-under-File moves (the new checkbox).** Finishing makes the deletes first, removing each
@@ -91,7 +93,8 @@ through the link. Snapshots are refused. The whole shared suite passes, except t
   hashed for Revisions from its bytes (`Revision::of_bytes`), and gives `NotText` from `read` but
   not from `stat`. Reading checks the file's metadata before opening it, so a FIFO is never opened.
 - **Symlinks.** A write follows the chain of links on the final segment (up to 40) and writes the
-  temporary file next to the final target, so the links stay. A delete removes the link itself.
+  temporary file next to the final target, so the links stay. The target's directory must exist
+  (after the review): no directory is ever made outside the Area. A delete removes the link itself.
   Reads and listings follow links, to Files and directories; listing skips a link back to a
   directory it is already in.
 - **Timestamps.** Each temporary file gets the Commit's timestamp with `File::set_modified` before
@@ -110,8 +113,9 @@ through the link. Snapshots are refused. The whole shared suite passes, except t
   the journal for the next Commit or `open` (ticket 10 turns this into `Pending`). If writing a
   temporary file fails, the Commit is discarded at once.
 - **Failure points.** Recovery needs a crash to test, so a small per-Store equivalent of the `fail`
-  crate is here, with the three points recovery needs: `AfterPreparedJournal`,
-  `AfterTemporaryFile(n)` and `AfterCommittedJournal`. `FsOptions::fail_at(point)` makes every
+  crate is here, with the points recovery needs: `AfterPreparedJournal`, `AfterTemporaryFile(n)`
+  and `AfterCommittedJournal`, and after the review `AfterDeletes` and `AfterRename(n)`, all only
+  with `testing`. `FsOptions::fail_at(point)` makes every
   Commit through that Store stop there, as if the process had died: it gives `Backend` and leaves
   everything on disk. Being per Store, it works with tests running in parallel, which the `fail`
   crate's process-wide configuration wouldn't. Ticket 10 adds the rest (after each rename, a

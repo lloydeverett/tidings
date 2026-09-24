@@ -211,7 +211,15 @@ pub enum InvalidPathReason {
     /// A Commit would leave a File under another File, as with `a` and `a/b`: a Path can't also
     /// be a Prefix of another Path. A filesystem can't hold both, since `a` would have to be a
     /// file and a directory at once.
+    ///
+    /// On the filesystem, a Commit is also refused with it when something on disk that isn't a
+    /// File stands where a File it writes, or a directory for one, must go, and the Commit
+    /// doesn't remove it: a directory holding names that aren't Paths, a symlink to nothing, or
+    /// another kind of file.
     FileUnderFile,
+    /// A filesystem Commit would write or delete two Paths that are the same file on disk, as a
+    /// symlink and the File it points to are, or two symlinks to one File.
+    SameFile,
 }
 
 impl fmt::Display for InvalidPathReason {
@@ -233,6 +241,9 @@ impl fmt::Display for InvalidPathReason {
             }
             InvalidPathReason::FileUnderFile => {
                 "it would be under another File, or have other Files under it"
+            }
+            InvalidPathReason::SameFile => {
+                "it is the same file on disk as another Path the Commit writes or deletes"
             }
         })
     }

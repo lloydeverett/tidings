@@ -226,7 +226,8 @@ SQLite database per Area, or in memory.
     `..` segments, no leading `/`.
   - Each segment is checked with `sanitize-filename` using its Windows rules.
   - NFC form is checked with `unicode-normalization`.
-  - Anything under the reserved `.tidings` Prefix is refused.
+  - Anything under the reserved `.tidings` Prefix is refused, and so is any segment named like the
+    filesystem Backend's temporary files (`.<name>.tidings-<commit-id>-<n>`, ADR 0005).
   - A Prefix is checked the same way.
   - Refusing Paths that differ only in letter case needs the Area's contents, so it happens at
     Commit time (see Backend). The same goes for the Prefixes they are under, and for a Path that
@@ -268,7 +269,9 @@ SQLite database per Area, or in memory.
     ones under the Prefix that were added, removed or changed.
   - `Pending`: decided but not fully applied.
   - `InvalidPath`: includes letter-case clashes, and a File under another File (`a` beside
-    `a/b`).
+    `a/b`). On the filesystem, also something on disk that isn't a Path standing where a File or
+    its directory must go (`FileUnderFile`), and two Paths that are the same file on disk through a
+    symlink (`SameFile`), both refused before anything is written (ADR 0005).
   - `Backend`.
 - **Revision**: opaque to the app. On every Backend it is a hash of the File's contents, using a
   fast, established 128-bit hash chosen during implementation. The same hash detects writes and
@@ -402,7 +405,9 @@ matches a Commit this Store made, and *external* otherwise.
   `testing` feature: starting a failure point, and injecting an external Change into the Store
   layer (see "memory" below). A third is narrower still: one unit test inside the SQLite Backend
   makes the stored letter-case folds stale, as new Unicode data would, and then checks through
-  the public API that opening the Store folds them again. No public API can make a fold stale.
+  the public API that opening the Store folds them again. No public API can make a fold stale. A
+  fourth: filesystem tests may check that no tidings temporary files are left in the Area
+  directory, since a person sees them there.
 - **Main seam: the public Store API, run on every Backend.** One behaviour suite, written once, is
   instantiated for the filesystem, SQLite and memory Backends and for the blocking Store. This is
   the same approach as OpenDAL's behaviour tests, which run one suite against every service.

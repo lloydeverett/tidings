@@ -87,7 +87,7 @@ impl MemoryBackend {
                         folds.insert(letter_case_fold(path.as_str()), path.clone());
                     }
                 }
-                Planned::Remove => {
+                Planned::Remove { .. } => {
                     Arc::make_mut(files).remove(path);
                     folds.remove(&letter_case_fold(path.as_str()));
                 }

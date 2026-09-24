@@ -167,12 +167,17 @@ mod fs {
         }
 
         /// Where `path` in `area` is on disk.
-        fn on_disk(&self, area: &str, path: &str) -> PathBuf {
-            self.root.path().join(area).join(path)
+        fn on_disk(&self, area: Area, path: &str) -> PathBuf {
+            let directory = match area {
+                Area::Config => "config",
+                Area::Data => "data",
+                Area::Cache => "cache",
+            };
+            self.root.path().join(directory).join(path)
         }
 
         /// Writes `contents` to `path` in `area` directly, as another program would.
-        fn write_directly(&self, area: &str, path: &str, contents: impl AsRef<[u8]>) {
+        fn write_directly(&self, area: Area, path: &str, contents: impl AsRef<[u8]>) {
             let file = self.on_disk(area, path);
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
             std::fs::write(file, contents).unwrap();
@@ -200,25 +205,24 @@ mod fs {
     async fn each_area_is_a_directory_people_can_see_the_files_in() {
         let fixture = Fs::new();
         let Opened { store, feed: _feed } = fixture.open().await;
-        for area in ["config", "data", "cache"] {
-            assert!(fixture.on_disk(area, "").is_dir(), "{area}");
-            assert!(fixture.on_disk(area, ".tidings").is_dir(), "{area}");
+        for area in [Area::Config, Area::Data, Area::Cache] {
+            assert!(fixture.on_disk(area, "").is_dir(), "{area:?}");
         }
 
         let mut staging = Staging::new(Area::Config);
         staging.write("themes/dark.toml", "dark = true\n").unwrap();
         store.commit(staging).await.unwrap();
-        let on_disk = std::fs::read_to_string(fixture.on_disk("config", "themes/dark.toml"));
+        let on_disk = std::fs::read_to_string(fixture.on_disk(Area::Config, "themes/dark.toml"));
         assert_eq!(on_disk.unwrap(), "dark = true\n");
-        assert!(!fixture.on_disk("data", "themes").exists());
+        assert!(!fixture.on_disk(Area::Data, "themes").exists());
     }
 
     #[tokio::test]
     async fn files_other_programs_make_are_read_and_listed() {
         let fixture = Fs::new();
         let Opened { store, feed: _feed } = fixture.open().await;
-        fixture.write_directly("config", "settings.toml", "a = 1\n");
-        fixture.write_directly("config", "themes/dark.toml", "dark = true\n");
+        fixture.write_directly(Area::Config, "settings.toml", "a = 1\n");
+        fixture.write_directly(Area::Config, "themes/dark.toml", "dark = true\n");
 
         assert_eq!(list(&store, Area::Config).await, ["settings.toml", "themes/dark.toml"]);
         let file = store.read(Area::Config, "themes/dark.toml").await.unwrap().unwrap();
@@ -235,27 +239,31 @@ mod fs {
     async fn names_on_disk_that_are_not_paths_are_left_out() {
         let fixture = Fs::new();
         let Opened { store, feed: _feed } = fixture.open().await;
-        fixture.write_directly("data", "kept.txt", "kept");
+        fixture.write_directly(Area::Data, "kept.txt", "kept");
         let before = store.stat_prefix(Area::Data, "").await.unwrap();
 
         // Not in NFC form.
-        fixture.write_directly("data", "cafe\u{301}.txt", "x");
-        fixture.write_directly("data", "re\u{301}sume\u{301}/cv.txt", "x");
+        fixture.write_directly(Area::Data, "cafe\u{301}.txt", "x");
+        fixture.write_directly(Area::Data, "re\u{301}sume\u{301}/cv.txt", "x");
         // Named like tidings' own, or like its temporary files.
-        fixture.write_directly("data", ".tidings/other.txt", "x");
-        fixture.write_directly("data", ".kept.txt.tidings-0123456789abcdef0123456789abcdef-0", "x");
+        fixture.write_directly(Area::Data, ".tidings/other.txt", "x");
+        fixture.write_directly(
+            Area::Data,
+            ".kept.txt.tidings-0123456789abcdef0123456789abcdef-0",
+            "x",
+        );
         // Names Windows can't hold, which Windows can't make either.
         #[cfg(not(windows))]
         {
-            fixture.write_directly("data", "CON", "x");
-            fixture.write_directly("data", "what?/a.txt", "x");
+            fixture.write_directly(Area::Data, "CON", "x");
+            fixture.write_directly(Area::Data, "what?/a.txt", "x");
         }
         // Not valid UTF-8.
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
             let name = std::ffi::OsStr::from_bytes(b"not \xff utf-8.txt");
-            std::fs::write(fixture.on_disk("data", "").join(name), "x").unwrap();
+            std::fs::write(fixture.on_disk(Area::Data, "").join(name), "x").unwrap();
         }
 
         assert_eq!(list(&store, Area::Data).await, ["kept.txt"]);
@@ -268,7 +276,7 @@ mod fs {
     async fn a_file_that_is_not_utf8_is_listed_but_reading_it_says_so() {
         let fixture = Fs::new();
         let Opened { store, feed: _feed } = fixture.open().await;
-        fixture.write_directly("cache", "image.png", [0x89, b'P', b'N', b'G', 0xff, 0xfe]);
+        fixture.write_directly(Area::Cache, "image.png", [0x89, b'P', b'N', b'G', 0xff, 0xfe]);
 
         match store.read(Area::Cache, "image.png").await {
             Err(Error::NotText { path }) => assert_eq!(path.as_str(), "image.png"),
@@ -295,7 +303,7 @@ mod fs {
         let committed = store.commit(staging).await.unwrap();
 
         for path in ["a.txt", "b/c.txt"] {
-            let modified = std::fs::metadata(fixture.on_disk("data", path)).unwrap().modified();
+            let modified = std::fs::metadata(fixture.on_disk(Area::Data, path)).unwrap().modified();
             assert_eq!(modified.unwrap(), SystemTime::from(committed.timestamp()), "{path}");
         }
     }
@@ -313,7 +321,7 @@ mod fs {
         // One link that is relative, to another that isn't.
         std::os::unix::fs::symlink(dotfiles.join("app/settings.toml"), dotfiles.join("current"))
             .unwrap();
-        let link = fixture.on_disk("config", "settings.toml");
+        let link = fixture.on_disk(Area::Config, "settings.toml");
         std::os::unix::fs::symlink("../dotfiles/current", &link).unwrap();
 
         let file = store.read(Area::Config, "settings.toml").await.unwrap().unwrap();
@@ -338,7 +346,7 @@ mod fs {
     async fn what_is_on_disk_but_not_a_file_makes_way_or_refuses_the_commit() {
         let fixture = Fs::new();
         let Opened { store, feed: _feed } = fixture.open().await;
-        std::fs::create_dir_all(fixture.on_disk("data", "empty/inside")).unwrap();
+        std::fs::create_dir_all(fixture.on_disk(Area::Data, "empty/inside")).unwrap();
         let mut staging = Staging::new(Area::Data);
         staging.write("empty", "a File now").unwrap();
         store.commit(staging).await.unwrap();
@@ -346,12 +354,12 @@ mod fs {
         assert_eq!(file.contents(), "a File now");
 
         // A directory with a name in it that no Path has.
-        fixture.write_directly("data", "held/cafe\u{301}.txt", "x");
+        fixture.write_directly(Area::Data, "held/cafe\u{301}.txt", "x");
         let mut refused = vec![("held", "held")];
         // A symlink to nothing, where a directory would have to go.
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink("nowhere", fixture.on_disk("data", "dangling")).unwrap();
+            std::os::unix::fs::symlink("nowhere", fixture.on_disk(Area::Data, "dangling")).unwrap();
             refused.push(("dangling/a.txt", "dangling/a.txt"));
         }
         for (path, expected) in refused {
@@ -397,7 +405,7 @@ mod fs {
             assert_eq!(listed, ["gone.txt", "kept.txt"], "{point:?}");
             let kept = store.read(Area::Data, "kept.txt").await.unwrap().unwrap();
             assert_eq!(kept.contents(), "old", "{point:?}");
-            assert!(!fixture.on_disk("data", "new").exists(), "{point:?}");
+            assert!(!fixture.on_disk(Area::Data, "new").exists(), "{point:?}");
             assert_eq!(temporary_files(fixture.root.path()), Vec::<PathBuf>::new(), "{point:?}");
         }
     }
@@ -453,6 +461,168 @@ mod fs {
         staging.delete("later.txt").unwrap();
         other.commit(staging).await.unwrap();
         assert_moved(&other).await;
+        assert_eq!(temporary_files(fixture.root.path()), Vec::<PathBuf>::new());
+    }
+
+    /// A crash while a committed Commit is being finished leaves it partly finished, which the
+    /// next Store to open the Area finishes. Finishing it again after the last rename, too, as
+    /// after a crash just before the journal was removed, leaves the Area as finishing it once
+    /// did.
+    #[tokio::test]
+    async fn a_commit_interrupted_while_finishing_is_finished_when_a_store_opens() {
+        use FailurePoint::{AfterDeletes, AfterRename};
+        // `moves` writes `a/b`, `d` and `kept.txt`, in that order.
+        for point in [AfterDeletes, AfterRename(0), AfterRename(1), AfterRename(2)] {
+            let fixture = Fs::new();
+            let Opened { store, feed: _feed } = fixture.open().await;
+            let mut staging = Staging::new(Area::Data);
+            staging.write("a", "a").unwrap();
+            staging.write("d/e", "e").unwrap();
+            staging.write("kept.txt", "old").unwrap();
+            store.commit(staging).await.unwrap();
+            drop(store);
+
+            let Opened { store, feed: _feed } =
+                fixture.open_with(|options| options.fail_at(point)).await;
+            let stopped = store.commit(moves()).await;
+            assert!(matches!(stopped, Err(Error::Backend(_))), "{point:?}: {stopped:?}");
+            drop(store);
+
+            let Opened { store, feed: _feed } = fixture.open().await;
+            assert_moved(&store).await;
+            assert_eq!(temporary_files(fixture.root.path()), Vec::<PathBuf>::new(), "{point:?}");
+        }
+    }
+
+    /// Finishing a Commit again deletes a File only if it is still the one the Commit deleted. A
+    /// File another program wrote there since stays.
+    #[tokio::test]
+    async fn finishing_a_commit_again_keeps_a_file_written_since_where_it_deleted_one() {
+        let fixture = Fs::new();
+        let Opened { store, feed: _feed } = fixture.open().await;
+        let mut staging = Staging::new(Area::Data);
+        staging.write("old.txt", "old").unwrap();
+        store.commit(staging).await.unwrap();
+        drop(store);
+
+        let Opened { store, feed: _feed } =
+            fixture.open_with(|options| options.fail_at(FailurePoint::AfterRename(0))).await;
+        let mut rename = Staging::new(Area::Data);
+        rename.delete("old.txt").unwrap();
+        rename.write("new.txt", "old").unwrap();
+        assert!(matches!(store.commit(rename).await, Err(Error::Backend(_))));
+        drop(store);
+        fixture.write_directly(Area::Data, "old.txt", "written since");
+
+        let Opened { store, feed: _feed } = fixture.open().await;
+        assert_eq!(list(&store, Area::Data).await, ["new.txt", "old.txt"]);
+        let since = store.read(Area::Data, "old.txt").await.unwrap().unwrap();
+        assert_eq!(since.contents(), "written since");
+    }
+
+    /// Two Paths can be the same file on disk, through a symlink. A Commit that writes or deletes
+    /// both is refused, since which of them wins would depend on the order they land in.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_commit_to_two_paths_that_are_the_same_file_is_refused() {
+        let fixture = Fs::new();
+        let Opened { store, feed: _feed } = fixture.open().await;
+        fixture.write_directly(Area::Data, "b", "b");
+        std::os::unix::fs::symlink("b", fixture.on_disk(Area::Data, "a")).unwrap();
+        std::os::unix::fs::symlink("b", fixture.on_disk(Area::Data, "c")).unwrap();
+        std::os::unix::fs::symlink("sub", fixture.on_disk(Area::Data, "linked")).unwrap();
+        fixture.write_directly(Area::Data, "sub/x", "x");
+
+        type Stage = fn(&mut Staging);
+        let refused: [(&str, Stage); 4] = [
+            ("write a, delete b", |staging| {
+                staging.write("a", "new a").unwrap();
+                staging.delete("b").unwrap();
+            }),
+            ("write a, write b", |staging| {
+                staging.write("a", "new a").unwrap();
+                staging.write("b", "new b").unwrap();
+            }),
+            ("write a, write c", |staging| {
+                staging.write("a", "new a").unwrap();
+                staging.write("c", "new c").unwrap();
+            }),
+            ("through a directory", |staging| {
+                staging.write("linked/x", "new x").unwrap();
+                staging.delete("sub/x").unwrap();
+            }),
+        ];
+        for (doing, stage) in refused {
+            let mut staging = Staging::new(Area::Data);
+            stage(&mut staging);
+            match store.commit(staging).await {
+                Err(Error::InvalidPath { reason: InvalidPathReason::SameFile, .. }) => {}
+                other => panic!("{doing} should be refused, got {other:?}"),
+            }
+        }
+        for (path, contents) in [("a", "b"), ("b", "b"), ("c", "b"), ("sub/x", "x")] {
+            let file = store.read(Area::Data, path).await.unwrap().unwrap();
+            assert_eq!(file.contents(), contents, "{path}");
+        }
+        assert!(std::fs::symlink_metadata(fixture.on_disk(Area::Data, "a")).unwrap().is_symlink());
+
+        // A delete of the link itself, and a write of the File, are two files.
+        let mut staging = Staging::new(Area::Data);
+        staging.delete("a").unwrap();
+        staging.write("b", "new b").unwrap();
+        store.commit(staging).await.unwrap();
+        assert_eq!(store.read(Area::Data, "a").await.unwrap(), None);
+    }
+
+    /// Files with the same name in different directories are different files, even while their
+    /// directories don't exist yet.
+    #[tokio::test]
+    async fn files_named_alike_in_directories_still_to_be_made_are_different_files() {
+        let fixture = Fs::new();
+        let Opened { store, feed: _feed } = fixture.open().await;
+        let mut staging = Staging::new(Area::Data);
+        for path in ["x.txt", "new/x.txt", "new/deeper/x.txt"] {
+            staging.write(path, path).unwrap();
+        }
+        store.commit(staging).await.unwrap();
+        assert_eq!(list(&store, Area::Data).await, ["new/deeper/x.txt", "new/x.txt", "x.txt"]);
+    }
+
+    /// A write through a symlink to a File that doesn't exist yet makes the File, if the
+    /// directory it would be in exists. tidings never makes a directory outside the Area, so
+    /// otherwise the write is refused, before anything is written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_write_through_a_symlink_never_makes_a_directory() {
+        let fixture = Fs::new();
+        let Opened { store, feed: _feed } = fixture.open().await;
+        let outside = fixture.root.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let link = |path: &str, to: &FsPath| {
+            std::os::unix::fs::symlink(to, fixture.on_disk(Area::Config, path)).unwrap();
+        };
+        link("new.toml", &outside.join("new.toml"));
+        link("deep.toml", &outside.join("deep/er/y.toml"));
+        link("nowhere.toml", FsPath::new("/nonexistent/q.toml"));
+
+        let mut staging = Staging::new(Area::Config);
+        staging.write("new.toml", "new").unwrap();
+        store.commit(staging).await.unwrap();
+        assert_eq!(std::fs::read_to_string(outside.join("new.toml")).unwrap(), "new");
+
+        for path in ["deep.toml", "nowhere.toml"] {
+            let mut staging = Staging::new(Area::Config);
+            staging.write(path, "x").unwrap();
+            match store.commit(staging).await {
+                Err(Error::Backend(error)) => {
+                    let said = error.to_string();
+                    assert!(said.contains("a directory that doesn't exist"), "{path}: {said}");
+                }
+                other => panic!("writing {path} should be refused, got {other:?}"),
+            }
+        }
+        assert!(!outside.join("deep").exists());
+        assert!(!FsPath::new("/nonexistent").exists());
         assert_eq!(temporary_files(fixture.root.path()), Vec::<PathBuf>::new());
     }
 

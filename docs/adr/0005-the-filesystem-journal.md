@@ -34,14 +34,40 @@ Details settled while building it (ticket 09):
 - The `-<n>` in a temporary file's name keeps two of a Commit's temporary files apart when they
   go in the same directory, which the next point allows.
 - When a target's directory doesn't exist yet, its temporary file goes in the nearest directory
-  above it that does, and the directory is made in step 5, after the deletes. That is how a File
-  moves under its own name in one Commit: the file `a` must be deleted before the directory `a/`
-  can be made for `a/b`. Likewise, deleting `d/e` removes the emptied directory `d/` before a File
-  is renamed onto `d`.
+  above it that does, within the Area, and the directory is made in step 5, after the deletes.
+  That is how a File moves under its own name in one Commit: the file `a` must be deleted before
+  the directory `a/` can be made for `a/b`. Likewise, deleting `d/e` removes the emptied directory
+  `d/` before a File is renamed onto `d`. Each directory made or changed is forced to disk before
+  the journal is removed.
+- A write through a symlink goes to the file the link points to, and its temporary file next to
+  that. tidings never makes a directory outside the Area, so if the directory the link points into
+  doesn't exist, the Commit is refused with `Backend` before step 2.
+- Between steps 1 and 2, the Commit is also refused, with `InvalidPath`, where finishing it could
+  go wrong. With `FileUnderFile`, if something that isn't a Path stands where a File it writes, or
+  a directory for one, must go, and the Commit's deletes don't remove it: a directory holding
+  names that aren't Paths, a symlink to nothing, or another kind of file. The checks every Backend
+  shares can't see these, and meeting one in step 5 would leave a Commit that can never be
+  finished. With `SameFile`, if two of its Paths are the same file on disk, as a symlink and the
+  File it points to are, or two links to one File. Otherwise one Path's delete could remove what
+  another's write put there, and which wins would depend on the order they land in.
+- A Path names only the file with exactly its name. Where the filesystem ignores letter case
+  (macOS's and Windows' by default, found out when a Store opens, from whether `.tidings/LOCK`
+  finds `.tidings/lock`), reads check each name on the way against the directory's entries, so
+  `foo` is absent when only `Foo` is there. So a Commit that renames `Foo` to `foo` deletes `Foo`
+  and writes `foo`, even with the same contents, and finishing it again doesn't delete `foo`: see
+  the next point. Letter case is the only difference this detects; a filesystem that keeps letter
+  case apart but ignores Unicode normalization isn't detected.
+- Finishing a Commit again, after a crash part way through or just before the journal was
+  removed, leaves the Area as finishing it once did. A temporary file that is gone was renamed
+  already, and is skipped. The journal records the Revision of each File a delete removes, and
+  finishing again deletes a File only if it is still there under exactly its name with that
+  Revision: so a File that one of the Commit's writes, or another program, has put there since is
+  left alone. Only a File another program wrote there since with the very same contents would be
+  deleted again.
 - A Commit that only deletes has no temporary files, so its journal is written only once, as
   `committed`.
-- Removing the journal isn't forced to disk. Finishing a Commit again changes nothing, and the
-  next Commit's journal replaces a stale one before it changes anything.
+- Removing the journal isn't forced to disk. If a power cut loses that, the Commit is finished
+  again, as above, and the next Commit's journal replaces a stale one before it changes anything.
 
 ## Consequences
 
