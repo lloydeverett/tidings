@@ -30,9 +30,9 @@ so far. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
 
 - Text only (UTF-8). No binary files.
 - Paths follow the strictest platform's rules on every backend, so a path that works on one
-  platform works on all of them. Names Windows reserves (such as `CON` or `aux.txt`), a trailing
-  dot or space, `.` and `..`, and paths not in Unicode NFC form are refused, as is anything under
-  `.tidings/`.
+  platform works on all of them. Names Windows reserves (such as `CON`, `aux.txt` or `COM¹`),
+  control characters, a trailing dot or space, `.` and `..`, and paths not in Unicode NFC form are
+  refused, as is anything under `.tidings/`.
 - No moving a store's data from one backend to another.
 - No size limit or eviction for the cache area.
 - Backends are defined in this crate. You cannot plug in your own.

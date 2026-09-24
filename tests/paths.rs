@@ -17,6 +17,8 @@ const ACCEPTED: &[&str] = &[
     "console.log",
     "CONFIG",
     "com10",
+    "CONIN.txt",
+    "not CON.txt",
     "a.b.c",
     // Unicode, in NFC form.
     "caf\u{e9}/r\u{e9}sum\u{e9}.md",
@@ -46,6 +48,19 @@ const REFUSED: &[(&str, InvalidPathReason)] = &[
     ("Com1.tar.gz", InvalidPathReason::UnportableName),
     ("lpt9", InvalidPathReason::UnportableName),
     ("prn/a.txt", InvalidPathReason::UnportableName),
+    // More reserved names, which sanitize-filename misses: the superscript-digit ports, the
+    // console's own names, and any reserved name with spaces before its extension.
+    ("COM\u{b9}", InvalidPathReason::UnportableName),
+    ("com\u{b2}", InvalidPathReason::UnportableName),
+    ("COM\u{b3}.txt", InvalidPathReason::UnportableName),
+    ("LPT\u{b9}", InvalidPathReason::UnportableName),
+    ("lpt\u{b2}.log", InvalidPathReason::UnportableName),
+    ("LPT\u{b3}", InvalidPathReason::UnportableName),
+    ("CONIN$", InvalidPathReason::UnportableName),
+    ("conout$.txt", InvalidPathReason::UnportableName),
+    ("CON .txt", InvalidPathReason::UnportableName),
+    ("NUL .txt", InvalidPathReason::UnportableName),
+    ("aux  .tar.gz", InvalidPathReason::UnportableName),
     // Characters Windows doesn't allow in a name.
     ("back\\slash", InvalidPathReason::UnportableName),
     ("C:/Windows", InvalidPathReason::UnportableName),
@@ -59,6 +74,8 @@ const REFUSED: &[(&str, InvalidPathReason)] = &[
     ("tab\there", InvalidPathReason::UnportableName),
     ("nul\u{0}byte", InvalidPathReason::UnportableName),
     ("c1\u{85}control", InvalidPathReason::UnportableName),
+    ("del\u{7f}", InvalidPathReason::UnportableName),
+    ("\u{7f}", InvalidPathReason::UnportableName),
     // A trailing dot or space, which Windows drops.
     ("trailing.", InvalidPathReason::UnportableName),
     ("trailing ", InvalidPathReason::UnportableName),

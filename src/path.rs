@@ -58,11 +58,43 @@ pub(crate) fn refusal(path: &str) -> Option<InvalidPathReason> {
     }
 }
 
-/// Whether every platform accepts `name` as a file name, judged by the strictest rules there are:
-/// Windows'.
+/// Whether every platform accepts `name` as one segment of a Path, judged by the strictest rules
+/// there are: Windows'. sanitize-filename does the checking, with the supplement below.
 fn is_portable_name(name: &str) -> bool {
-    let windows = sanitize_filename::OptionsForCheck { windows: true, truncate: true };
-    sanitize_filename::is_sanitized_with_options(name, windows)
+    is_sanitized_for_windows(name)
+        && !name.chars().any(char::is_control)
+        && !is_device_name_sanitize_filename_misses(name)
+}
+
+fn is_sanitized_for_windows(name: &str) -> bool {
+    let windows_rules = sanitize_filename::OptionsForCheck { windows: true, truncate: true };
+    sanitize_filename::is_sanitized_with_options(name, windows_rules)
+}
+
+// The supplement: names Windows refuses that sanitize-filename (0.6, and 0.7.0-beta too) lets
+// through. Only these documented gaps are covered here; everything else is the crate's. Control
+// characters are covered above with `char::is_control`, because the crate misses DEL (U+007F).
+
+/// Device names Windows reserves that sanitize-filename doesn't list: the ports with superscript
+/// digits, and the console's own names. In upper case.
+const DEVICE_NAMES_SANITIZE_FILENAME_MISSES: &[&str] = &[
+    "COM\u{b9}",
+    "COM\u{b2}",
+    "COM\u{b3}",
+    "LPT\u{b9}",
+    "LPT\u{b2}",
+    "LPT\u{b3}",
+    "CONIN$",
+    "CONOUT$",
+];
+
+/// Whether Windows reads `name` as a device, in a way sanitize-filename misses. Windows ignores an
+/// extension and any spaces before it, so `NUL.txt` and `NUL .txt` are both `NUL`; the crate knows
+/// only the first. So its check is repeated on the name as Windows reads it.
+fn is_device_name_sanitize_filename_misses(name: &str) -> bool {
+    let device = name.split_once('.').map_or(name, |(base, _)| base).trim_end_matches(' ');
+    DEVICE_NAMES_SANITIZE_FILENAME_MISSES.contains(&device.to_uppercase().as_str())
+        || !is_sanitized_for_windows(device)
 }
 
 /// Whether `name`, as a Path's first segment, is tidings' own. Letter case is ignored, because on a
@@ -85,7 +117,7 @@ pub enum InvalidPathReason {
     /// The Path has a `.` or `..` segment.
     DotSegment,
     /// A segment is not a name every platform accepts. Windows' rules decide: no reserved names
-    /// such as `CON` or `aux.txt`, none of `\ : * ? " < > |`, no control characters, no
+    /// such as `CON`, `aux.txt` or `COM¹`, none of `\ : * ? " < > |`, no control characters, no
     /// trailing dot or space, and at most 255 bytes.
     UnportableName,
     /// The Path is not in Unicode NFC form. macOS treats different forms of the same character as

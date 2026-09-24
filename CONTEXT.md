@@ -46,8 +46,9 @@ are safe on every platform. No two Paths in an Area may differ only by letter ca
 _Avoid_: key, filename
 
 **Prefix**:
-The leading part of a Path, up to a `/`, used to list or delete a group of Files. Directories exist
-only as Prefixes: there are no empty directories.
+The leading part of a Path, up to a `/`, used to list or delete a group of Files. A Prefix is
+either empty, meaning the whole Area, or ends in `/`, as in `themes/`: `themes` alone is not a
+Prefix. Directories exist only as Prefixes: there are no empty directories.
 _Avoid_: directory, folder
 
 **Revision**:

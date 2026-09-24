@@ -33,6 +33,12 @@ Established crates do the checking; we don't write the rules ourselves.
   File, and `path.starts_with(prefix)` then matches whole segments only (`themes/` doesn't cover
   `themes2/a`). `themes` without the `/` is refused with `NoTrailingSlash` rather than silently
   treated as `themes/`.
+- `sanitize-filename` is supplemented. Neither 0.6 nor 0.7.0-beta refuses `COM¹`/`LPT¹` and the
+  other superscript-digit ports, `CONIN$`, `CONOUT$`, a reserved name with spaces before its
+  extension (`CON .txt`, which Windows reads as `CON`), or DEL (U+007F). ADR 0004 wants every
+  name every platform accepts, so a small, commented supplement in `src/path.rs` covers exactly
+  those gaps: a list of the missed device names, the crate's own check repeated on the name as
+  Windows reads it, and `char::is_control`. Everything else is still the crate's.
 - `.tidings` is refused as the first segment in any letter case, compared in upper case as NTFS
   does, so `.Tidings` and `.tidingſ` are refused too. Deeper segments named `.tidings` are
   allowed.
