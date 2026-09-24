@@ -574,6 +574,23 @@ mod fs {
         assert_eq!(store.read(Area::Data, "a").await.unwrap(), None);
     }
 
+    /// A directory link in the Area lists its Files under both names. Deleting a File under both
+    /// is safe, since the second delete finds nothing, so a Prefix delete covering both works.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_prefix_delete_covers_files_listed_under_a_directory_link_too() {
+        let fixture = Fs::new();
+        let Opened { store, feed: _feed } = fixture.open().await;
+        fixture.write_directly(Area::Data, "real/x", "x");
+        std::os::unix::fs::symlink("real", fixture.on_disk(Area::Data, "linked")).unwrap();
+        assert_eq!(list(&store, Area::Data).await, ["linked/x", "real/x"]);
+
+        let mut staging = Staging::new(Area::Data);
+        staging.delete_prefix("").unwrap();
+        store.commit(staging).await.unwrap();
+        assert_eq!(list(&store, Area::Data).await, Vec::<String>::new());
+    }
+
     /// Files with the same name in different directories are different files, even while their
     /// directories don't exist yet.
     #[tokio::test]

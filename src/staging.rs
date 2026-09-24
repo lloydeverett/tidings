@@ -40,6 +40,15 @@ pub(crate) struct Staged {
     prefix_preconditions: Vec<PrefixRevision>,
 }
 
+/// The Revisions [`Staged::leave_out_what_changes_nothing`] gives.
+#[derive(Debug)]
+pub(crate) struct PlannedRevisions {
+    /// The Revision of every write, including those left out.
+    pub(crate) written: BTreeMap<Path, Revision>,
+    /// The Revision of each File a delete removes.
+    pub(crate) removed: BTreeMap<Path, Revision>,
+}
+
 /// What a Staging does to one Path.
 #[derive(Debug)]
 pub(crate) enum Action {
@@ -243,7 +252,7 @@ impl Staged {
     pub(crate) fn leave_out_what_changes_nothing(
         &mut self,
         current: &impl AreaState,
-    ) -> Result<(BTreeMap<Path, Revision>, BTreeMap<Path, Revision>)> {
+    ) -> Result<PlannedRevisions> {
         let (mut written, mut removed) = (BTreeMap::new(), BTreeMap::new());
         let mut unchanged = Vec::new();
         for (path, action) in &self.actions {
@@ -265,7 +274,7 @@ impl Staged {
         for path in unchanged {
             self.actions.remove(&path);
         }
-        Ok((written, removed))
+        Ok(PlannedRevisions { written, removed })
     }
 
     /// Refuses a write that would leave two names in the Area after the Commit that some platform

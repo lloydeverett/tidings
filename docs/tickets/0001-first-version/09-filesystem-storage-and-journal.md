@@ -107,6 +107,12 @@ through the link. Snapshots are refused. The whole shared suite passes, except t
   `committed`, since it has no temporary files. On this WSL disk an fsync costs about 1.7 ms, so a
   Commit costs about 5–10 ms: the suite's 500-round `concurrent_commits_reach_the_feed...` takes
   about 60 s on the filesystem, against 17 s on SQLite.
+- **Exact names on folding filesystems (after the review).** Where the filesystem ignores letter
+  case, each read looks through every directory on the way to check the names, so reading each
+  of N Files in one flat directory costs in proportion to N, and all of them N². That is left as
+  it is, and the README says so. A possible follow-up is asking the platform for the name on disk
+  directly (`GetFinalPathNameByHandleW` or `FindFirstFileW` on Windows, `F_GETPATH` or
+  `getattrlist` on macOS), which costs the same for every File.
 - **Recovery.** `open` locks each Area and recovers its journal; so does every Commit, first, since
   another process's Commit may have been interrupted while this Store was open. Recovery is
   logged at debug level. If a step after `committed` fails, the Commit gives `Backend` and leaves

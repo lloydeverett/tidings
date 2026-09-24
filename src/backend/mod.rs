@@ -13,7 +13,7 @@ use jiff::Timestamp;
 
 #[cfg(feature = "fs")]
 use crate::Error;
-use crate::staging::{Action, Staged};
+use crate::staging::{Action, PlannedRevisions, Staged};
 use crate::{Area, ChangeKind, File, Origin, Path, Prefix, PrefixRevision, Result, Revision, Stat};
 
 /// The Backend a Store was opened on.
@@ -141,7 +141,8 @@ impl CommitRequest {
         let CommitRequest { timestamp, mut staged } = self;
         staged.check_preconditions(current)?;
         staged.expand_prefix_deletes(current)?;
-        let (revisions, removed) = staged.leave_out_what_changes_nothing(current)?;
+        let PlannedRevisions { written: revisions, removed } =
+            staged.leave_out_what_changes_nothing(current)?;
         staged.refuse_clashing_paths(current)?;
         let changes = staged.actions.into_iter().map(|(path, action)| {
             let planned = match action {

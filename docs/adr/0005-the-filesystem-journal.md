@@ -39,24 +39,35 @@ Details settled while building it (ticket 09):
   the directory `a/` can be made for `a/b`. Likewise, deleting `d/e` removes the emptied directory
   `d/` before a File is renamed onto `d`. Each directory made or changed is forced to disk before
   the journal is removed.
-- A write through a symlink goes to the file the link points to, and its temporary file next to
-  that. tidings never makes a directory outside the Area, so if the directory the link points into
-  doesn't exist, the Commit is refused with `Backend` before step 2.
+- A write through a symlink to a file goes to the file the link points to, and its temporary file
+  next to that. Such a write never makes a directory, so it can't make one outside the Area: if
+  the directory the link points into doesn't exist, the Commit is refused with `Backend` before
+  step 2. A write under a symlink to a directory is different: it makes the directories it needs
+  in that directory, wherever the link points, as writing there by hand would.
 - Between steps 1 and 2, the Commit is also refused, with `InvalidPath`, where finishing it could
   go wrong. With `FileUnderFile`, if something that isn't a Path stands where a File it writes, or
   a directory for one, must go, and the Commit's deletes don't remove it: a directory holding
   names that aren't Paths, a symlink to nothing, or another kind of file. The checks every Backend
   shares can't see these, and meeting one in step 5 would leave a Commit that can never be
   finished. With `SameFile`, if two of its Paths are the same file on disk, as a symlink and the
-  File it points to are, or two links to one File. Otherwise one Path's delete could remove what
-  another's write put there, and which wins would depend on the order they land in.
+  File it points to are, or two links to one File, and one of them is written. Otherwise one
+  Path's delete could remove what another's write put there, and which wins would depend on the
+  order they land in. Two deletes of one file are fine, as a Prefix delete over a directory link
+  and the directory it points to makes: the second finds nothing. Where names fold, which file a
+  Path is on disk is compared folded, so links to `foo` and `FOO` are one file; a write of `foo`
+  with a delete of `Foo` is still a rename.
 - A Path names only the file with exactly its name. Where the filesystem ignores letter case
   (macOS's and Windows' by default, found out when a Store opens, from whether `.tidings/LOCK`
   finds `.tidings/lock`), reads check each name on the way against the directory's entries, so
   `foo` is absent when only `Foo` is there. So a Commit that renames `Foo` to `foo` deletes `Foo`
   and writes `foo`, even with the same contents, and finishing it again doesn't delete `foo`: see
   the next point. Letter case is the only difference this detects; a filesystem that keeps letter
-  case apart but ignores Unicode normalization isn't detected.
+  case apart but ignores Unicode normalization isn't detected, and neither is Windows' letter case
+  set per directory elsewhere in the Area. The check reads the whole directory for each name on
+  the way, so reading every File of a flat directory of N Files one by one costs in proportion to
+  N². Asking the platform for a file's name as it is on disk (`GetFinalPathNameByHandleW` or
+  `FindFirstFileW` on Windows, `F_GETPATH` or `getattrlist` on macOS) would cost the same for
+  every File, and is left for later.
 - Finishing a Commit again, after a crash part way through or just before the journal was
   removed, leaves the Area as finishing it once did. A temporary file that is gone was renamed
   already, and is skipped. The journal records the Revision of each File a delete removes, and

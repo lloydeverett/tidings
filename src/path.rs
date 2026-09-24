@@ -217,8 +217,9 @@ pub enum InvalidPathReason {
     /// doesn't remove it: a directory holding names that aren't Paths, a symlink to nothing, or
     /// another kind of file.
     FileUnderFile,
-    /// A filesystem Commit would write or delete two Paths that are the same file on disk, as a
-    /// symlink and the File it points to are, or two symlinks to one File.
+    /// A filesystem Commit would write a Path, and write or delete another that is the same file
+    /// on disk, as a symlink and the File it points to are, or two symlinks to one File. Deleting
+    /// both is fine.
     SameFile,
 }
 
@@ -243,7 +244,8 @@ impl fmt::Display for InvalidPathReason {
                 "it would be under another File, or have other Files under it"
             }
             InvalidPathReason::SameFile => {
-                "it is the same file on disk as another Path the Commit writes or deletes"
+                "it is written, and is the same file on disk as another Path the Commit writes or \
+                 deletes"
             }
         })
     }

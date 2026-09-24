@@ -78,17 +78,19 @@ change feed, with the resyncs that come with it. Then the blocking API. See
   prefix revisions and prefix deletes. Two names that differ only in letter case, made by another
   program on a case-sensitive filesystem, are both listed.
 - On the filesystem, a write to a symlinked file goes through the link to the file it points to,
-  and the link stays. The directory the link points into must exist: tidings never makes a
-  directory outside the area. Reads and listings follow symlinks. A commit that writes or deletes
-  two paths that are the same file on disk, such as a link and the file it points to, is refused
-  (`InvalidPath` with `SameFile`).
+  and the link stays. The directory the link points into must exist: a write through a link to a
+  file never makes a directory. (Under a link to a directory, a write makes the directories it
+  needs in the linked directory, wherever that is.) Reads and listings follow symlinks. A commit
+  that writes a path and also writes or deletes another path that is the same file on disk, such
+  as a link and the file it points to, is refused (`InvalidPath` with `SameFile`).
 - On the filesystem, a commit is refused (`InvalidPath` with `FileUnderFile`) when something that
   isn't a file tidings can list stands where a file it writes, or a directory for one, must go: a
   directory holding only names that aren't valid paths, for example, even though listing that
   prefix shows nothing.
 - On filesystems that ignore letter case (macOS's and Windows' by default), a path names only the
   file with exactly that name: reading `foo` gives nothing when only `Foo` is there. To check,
-  reads look through each directory on the way, which costs more in large directories there.
+  each read looks through every directory on the way, so reading each of N files in one
+  directory there costs in proportion to N, and reading them all to N².
 - On the filesystem, stat reads the whole file, to hash it, and a prefix revision reads every file
   under the prefix.
 - On the filesystem, the change feed doesn't report other processes' commits, or edits made by

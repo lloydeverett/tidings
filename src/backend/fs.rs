@@ -56,8 +56,10 @@
 //! `a/b`): the directory `a/` can only be made once the file `a` is gone.
 //!
 //! **Symlinks.** A write to a Path that is a symlink goes to the File the link points to, wherever
-//! that is, and the link stays. The directory it points into must exist: tidings never makes a
-//! directory outside the Area. A delete removes the link itself.
+//! that is, and the link stays. The directory it points into must exist: a write through a link to
+//! a File never makes a directory, so it can't make one outside the Area. (A write under a
+//! symlink to a directory makes any directories it needs in that directory, wherever it is.) A
+//! delete removes the link itself.
 //!
 //! **What other programs see.** A program outside tidings can see a Commit half applied, during
 //! step 6. And one that writes a File after step 2 and before step 6 has its edit overwritten if
@@ -67,7 +69,7 @@
 
 mod journal;
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path as FsPath, PathBuf};
@@ -312,23 +314,31 @@ impl AreaRoot {
         }
     }
 
+    /// Follows `segments` down from the root while each is a directory there under exactly its
+    /// own name. The one walk from the root that reads, writes and finishing share.
+    fn own_directories(&self, segments: &[&str]) -> Result<OwnDirectories> {
+        let mut directory = self.root.clone();
+        for (count, segment) in segments.iter().enumerate() {
+            let next = directory.join(segment);
+            if next.is_dir() && self.named_exactly(&next)? {
+                directory = next;
+                continue;
+            }
+            let there = present_at(fs::symlink_metadata(&next), &next)?.is_some();
+            let next_under_other_name = there && !self.named_exactly(&next)?;
+            return Ok(OwnDirectories { directory, count, next_under_other_name });
+        }
+        Ok(OwnDirectories { directory, count: segments.len(), next_under_other_name: false })
+    }
+
     /// Whether nothing at `name`, a Path or a Prefix without its `/`, or on the way to it, is
     /// found only under another name that the filesystem treats as the same.
     fn found_under_its_own_name(&self, name: &str) -> Result<bool> {
         if !self.names_fold {
             return Ok(true);
         }
-        let mut file = self.root.clone();
-        for segment in name.split('/') {
-            file.push(segment);
-            if present_at(fs::symlink_metadata(&file), &file)?.is_none() {
-                return Ok(true);
-            }
-            if !self.named_exactly(&file)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        let segments: Vec<&str> = name.split('/').collect();
+        Ok(!self.own_directories(&segments)?.next_under_other_name)
     }
 
     /// The contents of the File at `path` and when it was last modified, or `None` if there is no
@@ -365,15 +375,19 @@ impl AreaRoot {
         for Remove { path, .. } in &removes {
             let file = self.file(path.as_str());
             let directory = file.parent().unwrap_or(&self.root);
-            same_file.check(path, identity(directory, file.file_name().unwrap_or_default())?)?;
+            let identity = self.identity(directory, file.file_name().unwrap_or_default())?;
+            same_file.deleted(path, identity);
         }
         let removed: HashSet<String> =
-            removes.iter().map(|remove| self.removal_key(remove.path.as_str())).collect();
+            removes.iter().map(|remove| self.deleted_form(remove.path.as_str())).collect();
         let commit_id = new_commit_id(timestamp);
         let mut writes = Vec::with_capacity(written.len());
         for (n, (path, contents)) in written.into_iter().enumerate() {
-            let (directory, target, identity) = self.where_to_write(&path, &removed)?;
-            same_file.check(&path, identity)?;
+            let Destination { directory, target, identity } =
+                self.where_to_write(&path, &removed)?;
+            // Where names fold, a write under a Path deleted in another letter case is a rename.
+            let renames_case = self.names_fold && matches!(target, Target::Path(_));
+            same_file.written(&path, identity, renames_case)?;
             let name = path.as_str().rsplit('/').next().unwrap_or(path.as_str());
             let temporary = directory.join(temporary_file_name(name, commit_id, n));
             writes.push(Writing { replace: Replace { temporary, target }, contents });
@@ -417,9 +431,8 @@ impl AreaRoot {
         Ok(outcome)
     }
 
-    /// Where a write of `path` goes: the directory its temporary file goes in, what it replaces,
-    /// and which file on disk that is, as [`identity`] gives it. `removed` holds the
-    /// [`removal_key`](Self::removal_key) of each Path the Commit deletes.
+    /// Where a write of `path` goes. `removed` holds the [`deleted_form`](Self::deleted_form) of
+    /// each Path the Commit deletes.
     ///
     /// A symlink is followed to the File it points to, whose directory must exist. Otherwise the
     /// File goes at `path`, and its temporary file in the nearest directory on the way that exists
@@ -430,11 +443,7 @@ impl AreaRoot {
     /// every Backend shares. This catches the rest: a directory with nothing in it, or only names
     /// that aren't Paths, a symlink to nothing or another kind of file where a directory must
     /// go, and on a filesystem that ignores letter case, a name that differs only in case.
-    fn where_to_write(
-        &self,
-        path: &Path,
-        removed: &HashSet<String>,
-    ) -> Result<(PathBuf, Target, PathBuf)> {
+    fn where_to_write(&self, path: &Path, removed: &HashSet<String>) -> Result<Destination> {
         let file = self.file(path.as_str());
         let in_the_way = || Error::InvalidPath {
             path: path.as_str().to_owned(),
@@ -455,48 +464,40 @@ impl AreaRoot {
             if target.is_dir() {
                 return Err(in_the_way());
             }
-            let identity = identity(&directory, target.file_name().unwrap_or_default())?;
-            return Ok((directory, Target::Linked(target), identity));
+            let identity = self.identity(&directory, target.file_name().unwrap_or_default())?;
+            return Ok(Destination { directory, target: Target::Linked(target), identity });
         }
 
         let segments: Vec<&str> = path.as_str().split('/').collect();
         let (directories, name) = segments.split_at(segments.len() - 1);
-        let mut directory = self.root.clone();
-        let mut obstacle = None;
-        // How many of the segments name directories that exist.
-        let mut existing = 0;
-        for segment in directories {
-            let next = directory.join(segment);
-            if next.is_dir() && self.named_exactly(&next)? {
-                directory = next;
-                existing += 1;
-            } else {
-                obstacle = Some(next);
-                break;
-            }
-        }
-        let obstacle = match obstacle {
-            Some(missing) => Some(missing),
+        let OwnDirectories { directory, count: existing, .. } =
+            self.own_directories(directories)?;
+        let obstacle = if existing < directories.len() {
+            // The first directory missing under its own name.
+            Some(directory.join(directories[existing]))
+        } else if own_name && there.as_ref().is_none_or(|there| !there.is_dir()) {
             // The File this write replaces, there under its own name, makes way.
-            None if own_name && there.as_ref().is_none_or(|there| !there.is_dir()) => None,
-            None => Some(directory.join(name[0])),
+            None
+        } else {
+            Some(directory.join(name[0]))
         };
         if let Some(obstacle) = obstacle
             && !self.removed_by_commit(&obstacle, removed)?
         {
             return Err(in_the_way());
         }
-        let identity = identity(&directory, segments[existing..].join("/").as_ref())?;
-        Ok((directory, Target::Path(path.clone()), identity))
+        let identity = self.identity(&directory, segments[existing..].join("/").as_ref())?;
+        Ok(Destination { directory, target: Target::Path(path.clone()), identity })
     }
 
     /// Whether whatever is at `file`, if anything, is gone once the Commit's deletes are made:
     /// it is a File they delete, or a directory holding nothing else, at any depth. `removed`
-    /// holds the [`removal_key`](Self::removal_key) of each Path deleted.
+    /// holds the [`deleted_form`](Self::deleted_form) of each Path deleted.
     fn removed_by_commit(&self, file: &FsPath, removed: &HashSet<String>) -> Result<bool> {
         let Some(there) = present_at(fs::symlink_metadata(file), file)? else { return Ok(true) };
         if !there.is_dir() {
-            return Ok(self.key_on_disk(file).is_some_and(|key| removed.contains(&key)));
+            let deleted = self.deleted_form_on_disk(file);
+            return Ok(deleted.is_some_and(|deleted| removed.contains(&deleted)));
         }
         let entries = fs::read_dir(file).map_err(|error| failed(file, error))?;
         for entry in entries {
@@ -508,19 +509,34 @@ impl AreaRoot {
         Ok(true)
     }
 
-    /// What [`removed_by_commit`](Self::removed_by_commit) compares for the Path `path`: the Path
-    /// itself, or where names fold, its letter-case fold, since a name found on disk may then
-    /// differ in case from the Path deleted.
-    fn removal_key(&self, path: &str) -> String {
+    /// The form in which [`removed_by_commit`](Self::removed_by_commit) compares the Path `path`
+    /// with what is on disk: the Path itself, or where names fold, its letter-case fold, since a
+    /// name found on disk may then differ in case from the Path deleted.
+    fn deleted_form(&self, path: &str) -> String {
         if self.names_fold { letter_case_fold(path) } else { path.to_owned() }
     }
 
-    /// The [`removal_key`](Self::removal_key) of `file`, a place on disk under the root, if its
+    /// The [`deleted_form`](Self::deleted_form) of `file`, a place on disk under the root, if its
     /// name is Unicode.
-    fn key_on_disk(&self, file: &FsPath) -> Option<String> {
+    fn deleted_form_on_disk(&self, file: &FsPath) -> Option<String> {
         let relative = file.strip_prefix(&self.root).ok()?;
         let segments: Option<Vec<&str>> = relative.iter().map(|segment| segment.to_str()).collect();
-        Some(self.removal_key(&segments?.join("/")))
+        Some(self.deleted_form(&segments?.join("/")))
+    }
+
+    /// Which file on disk `name` in `directory` is, whichever symlinks to directories led there:
+    /// the directory as [`fs::canonicalize`] gives it, and `name`, which may go on through
+    /// directories that don't exist yet. Where names fold, it is folded as a whole, since two
+    /// names that differ only in letter case are then one file. (If a symlink leads from there to
+    /// a filesystem that doesn't fold, that could take two files for one, which refuses a Commit
+    /// that would have been fine, never the other way round.)
+    fn identity(&self, directory: &FsPath, name: &std::ffi::OsStr) -> Result<PathBuf> {
+        let canonical = fs::canonicalize(directory).map_err(|error| failed(directory, error))?;
+        let identity = canonical.join(name);
+        match identity.to_str() {
+            Some(text) if self.names_fold => Ok(PathBuf::from(letter_case_fold(text))),
+            _ => Ok(identity),
+        }
     }
 
     /// Makes the directories the File at `path` goes in that don't exist under their own names,
@@ -528,14 +544,12 @@ impl AreaRoot {
     /// their names is removed first: a directory the Commit's deletes emptied, which on a
     /// filesystem that ignores letter case can differ from it in case.
     fn make_directories(&self, path: &Path, changed: &mut BTreeSet<PathBuf>) -> Result<()> {
-        let mut directory = self.root.clone();
         let segments: Vec<&str> = path.as_str().split('/').collect();
-        for segment in &segments[..segments.len() - 1] {
+        let directories = &segments[..segments.len() - 1];
+        let OwnDirectories { mut directory, count, .. } = self.own_directories(directories)?;
+        for segment in &directories[count..] {
             let parent = directory.clone();
             directory.push(segment);
-            if directory.is_dir() && self.named_exactly(&directory)? {
-                continue;
-            }
             if present_at(fs::symlink_metadata(&directory), &directory)?.is_some() {
                 remove_empty_directories(&directory).map_err(|error| failed(&directory, error))?;
             }
@@ -707,20 +721,59 @@ impl AreaState for AreaRoot {
     }
 }
 
-/// Refuses a second Path that is the same file on disk as one before it, as two Paths are when
-/// one is a symlink to the other. Finishing such a Commit again after a crash could lose a write,
-/// and the order its writes and deletes land in would decide what is left.
+/// Where a write goes, as [`AreaRoot::where_to_write`] works it out.
+struct Destination {
+    /// The directory its temporary file goes in.
+    directory: PathBuf,
+    /// What it replaces.
+    target: Target,
+    /// Which file on disk that is, as [`AreaRoot::identity`] gives it.
+    identity: PathBuf,
+}
+
+/// How far a Path's segments lead down from the root through directories there under exactly
+/// their own names, as [`AreaRoot::own_directories`] gives it.
+struct OwnDirectories {
+    /// The last of those directories, or the root.
+    directory: PathBuf,
+    /// How many segments they are.
+    count: usize,
+    /// Whether the segment after them is there, but only under another name that the filesystem
+    /// treats as the same.
+    next_under_other_name: bool,
+}
+
+/// Refuses a write to a file on disk that another Path of the Commit writes or deletes too, as
+/// two Paths are when one is a symlink to the other. Which of them wins would depend on the order
+/// they land in, and finishing the Commit again after a crash could lose the write. Two deletes of
+/// one file are fine, as through a directory link: the second finds nothing.
 #[derive(Default)]
 struct SameFile {
-    /// Each file on disk a Path the Commit writes or deletes is, as [`identity`] gives it.
-    seen: HashSet<PathBuf>,
+    /// Each file on disk a Path the Commit writes is, as [`AreaRoot::identity`] gives it.
+    written: HashSet<PathBuf>,
+    /// Each file on disk a Path the Commit deletes is, with the letter-case fold of each such
+    /// Path.
+    deleted: HashMap<PathBuf, Vec<String>>,
 }
 
 impl SameFile {
-    /// Gives [`SameFile`](InvalidPathReason::SameFile) for `path` if a Path before it was the file
-    /// `identity` too.
-    fn check(&mut self, path: &Path, identity: PathBuf) -> Result<()> {
-        if !self.seen.insert(identity) {
+    /// Notes that the Commit deletes `path`, the file `identity`.
+    fn deleted(&mut self, path: &Path, identity: PathBuf) {
+        self.deleted.entry(identity).or_default().push(letter_case_fold(path.as_str()));
+    }
+
+    /// Gives [`SameFile`](InvalidPathReason::SameFile) for a write of `path`, the file `identity`,
+    /// if the Commit writes that file under another Path too, or deletes it. If `renames_case`, a
+    /// delete of a Path that differs only in letter case is a rename rather than a clash: where
+    /// names fold, deleting `Foo` and writing `foo` is the same file on disk, and finishing deletes
+    /// first.
+    fn written(&mut self, path: &Path, identity: PathBuf, renames_case: bool) -> Result<()> {
+        let fold = letter_case_fold(path.as_str());
+        let deleted = self
+            .deleted
+            .get(&identity)
+            .is_some_and(|deleted| deleted.iter().any(|deleted| !renames_case || *deleted != fold));
+        if deleted || !self.written.insert(identity) {
             return Err(Error::InvalidPath {
                 path: path.as_str().to_owned(),
                 reason: InvalidPathReason::SameFile,
@@ -728,14 +781,6 @@ impl SameFile {
         }
         Ok(())
     }
-}
-
-/// Which file on disk `name` in `directory` is, whichever symlinks to directories led there: the
-/// directory as [`fs::canonicalize`] gives it, and `name`, which may go on through directories
-/// that don't exist yet.
-fn identity(directory: &FsPath, name: &std::ffi::OsStr) -> Result<PathBuf> {
-    let canonical = fs::canonicalize(directory).map_err(|error| failed(directory, error))?;
-    Ok(canonical.join(name))
 }
 
 /// Whether `directory` has an entry named exactly `name`.
@@ -791,11 +836,7 @@ fn write_temporary_file(
 ) -> io::Result<()> {
     let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&replace.temporary)?;
     file.write_all(contents.as_bytes())?;
-    let replaced = match &replace.target {
-        Target::Path(path) => area.file(path.as_str()),
-        Target::Linked(target) => target.clone(),
-    };
-    if let Some(replaced) = present(fs::metadata(&replaced))? {
+    if let Some(replaced) = present(fs::metadata(replace.target.on_disk(&area.root)))? {
         file.set_permissions(replaced.permissions())?;
     }
     file.set_modified(SystemTime::from(modified))?;

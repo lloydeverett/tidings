@@ -85,6 +85,16 @@ pub(super) struct Remove {
     pub(super) revision: Revision,
 }
 
+impl Target {
+    /// Where the file this replaces is on disk, in the Area whose root is `root`.
+    pub(super) fn on_disk(&self, root: &FsPath) -> PathBuf {
+        match self {
+            Target::Path(path) => on_disk(root, path.as_str()),
+            Target::Linked(target) => target.clone(),
+        }
+    }
+}
+
 /// Finishes or discards the Commit in the journal of `area`, if there is one. It must be called
 /// with the Area locked.
 pub(super) fn recover(area: &AreaRoot) -> Result<()> {
@@ -171,13 +181,10 @@ impl Journal {
             if present_at(fs::symlink_metadata(temporary), temporary)?.is_none() {
                 continue;
             }
-            let target = match target {
-                Target::Path(path) => {
-                    area.make_directories(path, &mut changed)?;
-                    on_disk(root, path.as_str())
-                }
-                Target::Linked(target) => target.clone(),
-            };
+            if let Target::Path(path) = target {
+                area.make_directories(path, &mut changed)?;
+            }
+            let target = target.on_disk(root);
             if fs::symlink_metadata(&target).is_ok_and(|there| there.is_dir()) {
                 remove_empty_directories(&target).map_err(|error| failed(&target, error))?;
             }

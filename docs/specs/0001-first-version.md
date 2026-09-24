@@ -270,8 +270,9 @@ SQLite database per Area, or in memory.
   - `Pending`: decided but not fully applied.
   - `InvalidPath`: includes letter-case clashes, and a File under another File (`a` beside
     `a/b`). On the filesystem, also something on disk that isn't a Path standing where a File or
-    its directory must go (`FileUnderFile`), and two Paths that are the same file on disk through a
-    symlink (`SameFile`), both refused before anything is written (ADR 0005).
+    its directory must go (`FileUnderFile`), and a write of a Path that another written or deleted
+    Path is the same file on disk as, through a symlink (`SameFile`), both refused before anything
+    is written (ADR 0005).
   - `Backend`.
 - **Revision**: opaque to the app. On every Backend it is a hash of the File's contents, using a
   fast, established 128-bit hash chosen during implementation. The same hash detects writes and

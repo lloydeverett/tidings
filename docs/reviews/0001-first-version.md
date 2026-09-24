@@ -1282,3 +1282,131 @@ Clippy is clean with default features, `--all-features`, `--no-default-features`
 rustfmt and rustdoc. `cargo test` passes with default features, `--no-default-features` and
 `--all-features`: 157 behaviour tests (45 without fs or sqlite), 5 path tests, 3 Store-layer
 tests and the SQLite unit test.
+
+### Re-review (after the fix commit 464acb5)
+
+The fix changed how the journal finishes a Commit, how names are matched, how a Commit is refused when two of its Paths are the same file (`SameFile`), and how symlinks are handled. That was substantial, so `git diff 57b0085...464acb5` was reviewed again on both axes, using updated crash probes.
+
+#### Standards
+
+**Checking the Resolution items**
+
+- **a1, tests reading the disk: fixed.** The spec's Testing Decisions now list a fourth exception, for temporary files (specs/0001:408-410). The `.tidings/` assertion is removed.
+- **a2, failure points outside `testing`: fixed.** `FailurePoint`, `stop_at` and every call to them are behind `#[cfg(feature = "testing")]` (fs.rs:98, 124, 296, 389, 406, 414; journal.rs:40, 162, 187). The `expect(unused_enumerate_index)` loops are a reasonable workaround.
+- **Smells: fixed.**
+  - `on_disk` (fs.rs:754) is shared with the journal (journal.rs:152, 177).
+  - `is_absent` now appears only inside `present` (fs.rs:847).
+  - `Writing` (fs.rs:235) replaces the parallel vectors.
+  - `Kind` is now `OnDisk`, and the test helpers take `Area`.
+- **Still conforming:** `tracing` is used at debug level only. `SameFile` was added to the existing `#[non_exhaustive]` reason enum, and nothing else new is public.
+
+**(a) New breaches of documented standards**
+
+None hard. One soft breach:
+- **CONTEXT.md:48, Path: `_Avoid_: key`.** `removal_key` and `key_on_disk` (fs.rs:514, 520) call a Path, or its letter-case fold, a "key". Something like `deleted_name` or `fold_for_removal` would keep to the glossary.
+
+**(b) New smells (all judgement calls)**
+
+- **Duplicated Code: walking from the root one segment at a time.** The same shape appears three times, and overlaps with what `on_disk` was meant to be the single answer for:
+  - `where_to_write` (fs.rs:468-477): `if next.is_dir() && self.named_exactly(&next)?`
+  - `make_directories` (fs.rs:533-537): `if directory.is_dir() && self.named_exactly(&directory)?`
+  - `found_under_its_own_name` (fs.rs:321-330)
+
+  One iterator over the segments that exist under their own names could serve all three.
+- **Duplicated Code: where a `Target` is on disk.** The match `Target::Path(p) => area.file(p) / on_disk(root, p), Target::Linked(t) => t.clone()` appears at fs.rs:794-797 and journal.rs:174-180. It belongs in one method on `Target`.
+- **Data Clumps / Primitive Obsession: positional tuples of same-typed values.** A small named struct for each would stop the values being swapped by mistake.
+  - `where_to_write -> (PathBuf, Target, PathBuf)` (fs.rs:437): the directory and the identity are easy to swap.
+  - `leave_out_what_changes_nothing -> (BTreeMap<Path, Revision>, BTreeMap<Path, Revision>)` (staging.rs:246): the written and removed Revision maps have the same type, so swapping them would still compile.
+- **Possible Feature Envy.** `Journal::finish` (journal.rs:148-196) now mostly works on `AreaRoot`: `area.root`, `revision`, `make_directories`, `stop_at` and `tidings`. Its `again: bool` flag also controls two unrelated things: whether Revisions are checked, and whether failure points fire.
+- **Brittle test.** tests/behaviour/main.rs:619 checks the wording of a `Backend` error (`said.contains("a directory that doesn't exist")`). It goes through the public API but depends on the message text. Minor.
+- **Repeated Switches (minor).** The test helper `on_disk` (main.rs:170-175) repeats the mapping in `Area::name`. Acceptable, because `name` is `pub(crate)`.
+
+**Summary:** every Standards item in the Resolution is fixed correctly. The fix adds no hard violations, one soft glossary slip ("key"), and about five small judgement-call smells. The most notable is the root-to-leaf walk, now written three times.
+
+#### Spec
+
+`cargo test --features testing` passes (157 behaviour tests). Updated probes were run from `scratchpad/probe09b/`.
+
+**Fixed and verified:**
+- **Re-finishing** is idempotent for the moves Commit. It was stopped at AfterCommittedJournal, AfterDeletes and AfterRename(0/1/2), and each time the journal was restored and the Commit finished again.
+- **The delete Revision guard** works. A File that another program rewrote with different contents survives re-finishing. One rewritten with identical contents is deleted, as documented.
+- **SameFile** refuses:
+  - writing through a link while deleting its target
+  - writing both a link and its target
+  - two links to one file
+  - a directory link used for a write plus a delete, or for two writes, even in a directory not yet created
+
+  It still allows a link plus an unrelated file, `x.txt` beside `new/x.txt`, and deleting both a link and its target.
+- **Dangling links** are refused, including a chain of links, a relative `../..` link and a link to `/nonexistent`. A dangling directory link gives `FileUnderFile`. The dotfiles case works whether the linked file exists or not.
+- **Letter case**, reasoned through for macOS and Windows:
+  - `Foo`→`foo` and `Themes/`→`themes/`, and moves between a File and a Prefix across case, all finish correctly.
+  - Re-finishing skips the delete, because `revision(Foo)` matches exact names.
+  - `read`, `stat`, `list` and `stat_prefix` agree.
+
+**(c) Implemented but wrong**
+
+1. **SameFile refuses safe deletes of two aliases, which breaks Prefix deletes.** Spec story 24: "I want to delete everything under a Prefix in a Commit".
+   - With an in-Area directory link `L`→`real/`, listing shows both `L/x` and `real/x`. `delete_prefix("")` then fails with `InvalidPath{real/x, SameFile}`, and so does deleting both aliases directly.
+   - The cause is fs.rs:364-369, which checks deletes against other deletes. Two deletes of one file are safe: the second finds nothing, and the Revision guard covers re-finishing. Only writes need checking against the rest.
+   - No test covers this.
+2. **SameFile misses aliases that differ only in letter case** (reasoned; can't be tested on Linux). The Resolution claims "two links to one File".
+   - `identity` (fs.rs:736-738) canonicalizes only the directory, never the final name.
+   - Example: `a`→`foo` and `b`→`FOO`, with `Foo` on disk, on macOS or Windows. Writing both is accepted, the second rename overwrites the first, and `a` then reads `b`'s contents. Writing `a` together with `Foo` does the same.
+   - Fix: fold the last segment when `names_fold`, or canonicalize the target when it exists.
+3. **"tidings never makes a directory outside the Area" is false** (README.md:81-82, fs.rs:59-60, ADR 0005:43). The Resolution says the walk from the root "can't leave the Area", but it can through a directory link. The probe used `D`→`<outside>/odir` and wrote `D/new/deep/f`, which created `<outside>/odir/new/deep/`. The behaviour is reasonable, so only the wording needs fixing: the bound holds for file links only.
+
+**Observations (not spec breaches)**
+- **The cost of exact names.** `has_entry` (fs.rs:742-750) reads the whole directory for every segment of every read, and a Commit repeats that in `where_to_write`. On macOS and Windows, reading N Files one by one from a flat Cache directory is O(N²). The README admits this. `FindFirstFileW` and `getattrlist` return the on-disk name in O(1).
+- `names_fold` is detected in `.tidings/` only, so Windows' per-directory case sensitivity elsewhere in the Area isn't seen.
+
+**(a) Missing:** nothing new. The documentation findings are fixed.
+
+**(b) Scope creep:** none.
+
+#### Summary
+
+Standards: every item is fixed. There are 0 hard violations, 1 soft glossary slip ("key"), and about 5 new smells. The most notable is the root-to-leaf walk, now written three times. Spec: the crash fixes, the `SameFile` refusal and the dangling-link bound are verified, but there are 3 new wrong behaviours. The worst is that `SameFile` refuses two deletes of the same file, which breaks `delete_prefix` whenever the Area holds a directory link.
+
+
+#### Resolution
+
+1. **Spec c1, `SameFile` breaks Prefix deletes:** fixed.
+   - `SameFile` now checks each write against the other writes and the deletes, never a delete
+     against another delete. Two deletes of one file are safe: the second finds nothing, and the
+     Revision guard covers finishing again.
+   - The new test `a_prefix_delete_covers_files_listed_under_a_directory_link_too` (Unix) runs
+     `delete_prefix("")` over `linked/x` and `real/x`. It failed with `SameFile` before the fix.
+2. **Spec c2, aliases that differ only in letter case:** fixed, reasoned through and documented
+   in ADR 0005.
+   - Where names fold, `AreaRoot::identity` folds the whole identity: the canonical directory plus
+     the rest of the name. So links to `foo` and `FOO` are one file, and writing both is refused.
+     So is writing `a`→`foo` together with `Foo`.
+   - A case-only rename (delete `Foo`, write `foo`) is still allowed. A delete whose Path folds
+     like the write's is a rename when the write goes to its own Path and names fold.
+   - Folding a path that a symlink leads onto a case-sensitive filesystem could take two files
+     for one. That only ever refuses a Commit that would have been fine, and it is documented.
+3. **Spec c3, the wording:** fixed in the fs.rs module doc, README Limitations and ADR 0005. The
+   bound holds for writes through a link to a file. A write under a link to a directory makes
+   the directories it needs there, wherever that is.
+4. **The cost:** left as it is, with the cost stated in the README Limitations (N² to read every
+   File of a flat directory of N, on folding filesystems), ADR 0005 and the ticket notes.
+   Platform APIs are noted as a possible follow-up: `GetFinalPathNameByHandleW` or
+   `FindFirstFileW` on Windows, and `F_GETPATH` or `getattrlist` on macOS. ADR 0005 also notes
+   that Windows' letter case, set per directory, isn't detected elsewhere in the Area.
+5. **Standards:**
+   - `removal_key` and `key_on_disk` are now `deleted_form` and `deleted_form_on_disk`.
+   - One walk from the root, `AreaRoot::own_directories`, returns an `OwnDirectories`. It serves
+     `found_under_its_own_name`, `where_to_write` and `make_directories`.
+   - `Target::on_disk(root)` is used by `write_temporary_file` and `Journal::finish`.
+   - `where_to_write` returns a `Destination { directory, target, identity }`, and
+     `leave_out_what_changes_nothing` returns `PlannedRevisions { written, removed }`.
+   - Kept: `Journal::finish`'s `again` flag. Both things it controls follow from one fact: whether
+     this is the Commit's own first finish or a recovery. The Revision check only makes sense when
+     finishing again, and failure points model crashes of the first finish.
+   - Kept: the test that checks the error message's wording. It is what shows that the refusal
+     is the "clear error" the review asked for, rather than a temporary file failing to be
+     written in a missing directory, which gives `Backend` as well.
+
+Clippy is clean with default features, `--all-features`, `--no-default-features`, fs only and
+sqlite only, each with `--all-targets` and without. So are rustfmt and rustdoc. `cargo test`
+passes with default features, `--no-default-features` and `--all-features`: 158 behaviour tests.
