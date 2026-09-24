@@ -382,7 +382,8 @@ otherwise.
 - Cargo features:
   - `fs` and `sqlite`, both on by default;
   - `blocking`;
-  - `testing`, which enables the failure points and shared test helpers.
+  - `testing`, which enables the failure points, injecting external Changes and shared test
+    helpers. tidings' own tests always build with it.
 - Edition 2024, `rust-version` 1.94, Apache-2.0.
 - Main dependencies: tokio, jiff, etcetera, relative-path, sanitize-filename,
   unicode-normalization, rusqlite, notify, notify-debouncer-full, atomic-write-file and tracing.
@@ -392,8 +393,9 @@ otherwise.
 
 - **What makes a good test.** A test uses only the public API and checks behaviour an app could
   observe: what a read returns, what a Commit does, what arrives on the Change feed. It never
-  looks at journal files, tables or internal state. The one exception is starting a failure
-  point.
+  looks at journal files, tables or internal state. There are two exceptions, both only with the
+  `testing` feature: starting a failure point, and injecting an external Change into the Store
+  layer (see "memory" below).
 - **Main seam: the public Store API, run on every Backend.** One behaviour suite, written once, is
   instantiated for the filesystem, SQLite and memory Backends and for the blocking Store. This is
   the same approach as OpenDAL's behaviour tests, which run one suite against every service.
@@ -403,7 +405,9 @@ otherwise.
   - filesystem: write to, delete from, or remove the Area directory directly;
   - SQLite and filesystem: open a second Store on the same Root override, which stands in for
     another process;
-  - memory: not applicable.
+  - memory: nothing outside tidings can reach it. To test how the Store layer merges external
+    Changes, the `testing` feature's `Store::inject_external_change` records one on the Change
+    feed without changing any File.
 - **Second seam: named failure points in the filesystem Backend.** These exist only with the
   `testing` feature, using the `fail` crate or a small equivalent. The points are:
   - after the `prepared` journal is written;

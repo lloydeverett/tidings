@@ -12,7 +12,23 @@ pub enum Area {
     Cache,
 }
 
-impl Area {
-    /// Every Area, in order.
-    pub(crate) const ALL: [Area; 3] = [Area::Config, Area::Data, Area::Cache];
+/// One `T` for each Area. The only place that knows how Areas map to positions.
+#[derive(Debug, Default)]
+pub(crate) struct PerArea<T>([T; 3]);
+
+impl<T> PerArea<T> {
+    const AREAS: [Area; 3] = [Area::Config, Area::Data, Area::Cache];
+
+    pub(crate) fn get(&self, area: Area) -> &T {
+        &self.0[area as usize]
+    }
+
+    pub(crate) fn get_mut(&mut self, area: Area) -> &mut T {
+        &mut self.0[area as usize]
+    }
+
+    /// Each Area with its `T`, in order of Area.
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (Area, &mut T)> {
+        Self::AREAS.into_iter().zip(&mut self.0)
+    }
 }

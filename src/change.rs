@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 
+use crate::area::PerArea;
 use crate::backend::RawChange;
 use crate::{Area, Path};
 
@@ -74,27 +75,29 @@ impl ChangeFeed {
     /// before has been read.
     pub async fn next(&mut self) -> Option<FeedItem> {
         loop {
-            if let Some(next) = self.shared.pending.lock().unwrap().next() {
-                return next;
+            let next = self.shared.unread.lock().unwrap().next();
+            match next {
+                Next::Item(item) => return Some(item),
+                Next::Ended => return None,
+                Next::Wait => self.shared.recorded.notified().await,
             }
-            self.shared.recorded.notified().await;
         }
     }
 }
 
 impl Drop for ChangeFeed {
-    /// Nobody will read the Changes, so what is pending is dropped and nothing more is recorded.
+    /// Nobody will read the Changes, so what is unread is dropped and nothing more is recorded.
     fn drop(&mut self) {
-        let mut pending = self.shared.pending.lock().unwrap();
-        pending.feed_dropped = true;
-        pending.areas = Default::default();
+        let mut unread = self.shared.unread.lock().unwrap();
+        unread.feed_dropped = true;
+        unread.areas = PerArea::default();
     }
 }
 
 /// What the Store's end and the Change feed share.
 #[derive(Debug, Default)]
 struct Shared {
-    pending: Mutex<Pending>,
+    unread: Mutex<Unread>,
     /// Woken whenever something is recorded. There is only one Change feed to wake, and a
     /// wake-up with nobody waiting is kept for the next wait, so none is missed.
     recorded: Notify,
@@ -103,12 +106,12 @@ struct Shared {
 /// Every Change recorded and not yet read, merged. It holds at most one entry per Area and Path,
 /// however many Changes were recorded.
 #[derive(Debug, Default)]
-struct Pending {
-    /// The merged Changes for each Area, indexed by `Area as usize`. Kept per Area so that a
-    /// Resync, which covers a whole Area, can take the place of that Area's pending Changes: the
-    /// app reads the whole Area again after it anyway.
-    areas: [BTreeMap<Path, Merged>; 3],
-    /// Every Store handle has been dropped: once what is pending has been read, the Change feed
+struct Unread {
+    /// The merged Changes for each Area. Kept per Area so that a Resync, which covers a whole
+    /// Area, can take the place of that Area's unread Changes: the app reads the whole Area again
+    /// after it anyway.
+    areas: PerArea<BTreeMap<Path, Merged>>,
+    /// Every Store handle has been dropped: once what is unread has been read, the Change feed
     /// ends.
     store_dropped: bool,
     /// The Change feed has been dropped, so nothing is recorded.
@@ -125,12 +128,22 @@ struct Merged {
     origin: Origin,
 }
 
-impl Pending {
+/// What [`ChangeFeed::next`] does now.
+enum Next {
+    /// Gives this item.
+    Item(FeedItem),
+    /// Gives `None`: the Store is gone and everything recorded has been read.
+    Ended,
+    /// Waits for something to be recorded.
+    Wait,
+}
+
+impl Unread {
     fn record(&mut self, area: Area, changes: Vec<RawChange>, origin: Origin) {
         if self.store_dropped || self.feed_dropped {
             return;
         }
-        let merged = &mut self.areas[area as usize];
+        let merged = self.areas.get_mut(area);
         for RawChange { path, kind } in changes {
             let merged = merged.entry(path).or_insert(Merged { kind, origin });
             merged.kind = kind;
@@ -140,18 +153,18 @@ impl Pending {
         }
     }
 
-    /// What [`ChangeFeed::next`] gives now, or `None` if it has to wait.
-    fn next(&mut self) -> Option<Option<FeedItem>> {
-        if let Some(batch) = self.take() {
-            return Some(Some(FeedItem::Changes(batch)));
+    fn next(&mut self) -> Next {
+        match self.take() {
+            Some(batch) => Next::Item(FeedItem::Changes(batch)),
+            None if self.store_dropped => Next::Ended,
+            None => Next::Wait,
         }
-        self.store_dropped.then_some(None)
     }
 
-    /// Everything pending, as one batch, or `None` if nothing is.
+    /// Everything unread, as one batch, or `None` if there is nothing.
     fn take(&mut self) -> Option<Vec<Change>> {
         let mut batch = Vec::new();
-        for (area, merged) in Area::ALL.into_iter().zip(&mut self.areas) {
+        for (area, merged) in self.areas.iter_mut() {
             let changes = std::mem::take(merged).into_iter();
             batch.extend(changes.map(|(path, Merged { kind, origin })| Change {
                 area,
@@ -171,7 +184,7 @@ pub(crate) struct FeedSender {
 }
 
 impl FeedSender {
-    /// Records `changes` to `area`, all made by `origin`, merging them into what is pending. They
+    /// Records `changes` to `area`, all made by `origin`, merging them into what is unread. They
     /// are recorded all at once, so that a Commit's Changes reach the Change feed in the same
     /// batch.
     ///
@@ -181,14 +194,14 @@ impl FeedSender {
         if changes.is_empty() {
             return;
         }
-        self.shared.pending.lock().unwrap().record(area, changes, origin);
+        self.shared.unread.lock().unwrap().record(area, changes, origin);
         self.shared.recorded.notify_one();
     }
 
     /// Ends the Change feed, once what was recorded before has been read. The Store calls it
     /// when its last handle is dropped. Nothing recorded after it reaches the feed.
     pub(crate) fn end(&self) {
-        self.shared.pending.lock().unwrap().store_dropped = true;
+        self.shared.unread.lock().unwrap().store_dropped = true;
         self.shared.recorded.notify_one();
     }
 }

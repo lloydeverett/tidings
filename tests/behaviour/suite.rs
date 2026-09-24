@@ -5,9 +5,11 @@ use std::time::Duration;
 
 use jiff::Timestamp;
 use tidings::{
-    Area, Change, ChangeFeed, ChangeKind, Committed, Error, FeedItem, File, InvalidPathReason,
-    Origin, Precondition, Staging, Store,
+    Area, ChangeFeed, ChangeKind, Committed, Error, FeedItem, File, InvalidPathReason, Origin,
+    Precondition, Staging, Store,
 };
+
+use crate::common::{assert_ended, assert_nothing_more, changes, changes_in_full, next_batch};
 
 /// How a Backend opens a fresh, empty Store for one test.
 pub trait Fixture {
@@ -353,13 +355,8 @@ pub async fn a_commit_announces_one_batch_of_local_changes(fixture: &impl Fixtur
     staging.write("themes/dark.toml", "b = 2\n").unwrap();
     store.commit(staging).await.unwrap();
 
-    let batch = next_batch(&mut feed).await;
-    let seen: Vec<_> = batch
-        .iter()
-        .map(|change| (change.area, change.path.as_str(), change.kind, change.origin))
-        .collect();
     assert_eq!(
-        seen,
+        changes_in_full(&next_batch(&mut feed).await),
         [
             (Area::Config, "settings.toml", ChangeKind::Changed, Origin::Local),
             (Area::Config, "themes/dark.toml", ChangeKind::Changed, Origin::Local),
@@ -948,19 +945,15 @@ pub async fn unread_changes_are_merged_per_path_and_the_latest_kind_wins(fixture
     staging.write("often.txt", "config").unwrap();
     store.commit(staging).await.unwrap();
 
-    let batch = next_batch(&mut feed).await;
-    let seen: Vec<_> =
-        batch.iter().map(|change| (change.area, change.path.as_str(), change.kind)).collect();
     assert_eq!(
-        seen,
+        changes_in_full(&next_batch(&mut feed).await),
         [
-            (Area::Config, "often.txt", ChangeKind::Changed),
-            (Area::Data, "changed-last.txt", ChangeKind::Changed),
-            (Area::Data, "often.txt", ChangeKind::Changed),
-            (Area::Data, "removed-last.txt", ChangeKind::Removed),
+            (Area::Config, "often.txt", ChangeKind::Changed, Origin::Local),
+            (Area::Data, "changed-last.txt", ChangeKind::Changed, Origin::Local),
+            (Area::Data, "often.txt", ChangeKind::Changed, Origin::Local),
+            (Area::Data, "removed-last.txt", ChangeKind::Removed, Origin::Local),
         ],
     );
-    assert!(batch.iter().all(|change| change.origin == Origin::Local));
     assert_nothing_more(&mut feed).await;
 }
 
@@ -1027,9 +1020,10 @@ pub async fn a_commit_made_before_the_feed_is_first_read_is_reported(fixture: &i
     staging.write("first.txt", "first").unwrap();
     clone.commit(staging).await.unwrap();
 
-    let batch = next_batch(&mut feed).await;
-    let seen: Vec<_> = batch.iter().map(|change| (change.area, change.path.as_str())).collect();
-    assert_eq!(seen, [(Area::Cache, "first.txt")]);
+    assert_eq!(
+        changes_in_full(&next_batch(&mut feed).await),
+        [(Area::Cache, "first.txt", ChangeKind::Changed, Origin::Local)],
+    );
     assert_nothing_more(&mut feed).await;
 }
 
@@ -1127,31 +1121,6 @@ pub async fn concurrent_commits_reach_the_feed_in_the_order_they_were_made(fixtu
 
 // Helpers shared by the tests above.
 
-/// Waits for the next item on the Change feed, failing the test if none arrives in time.
-async fn next_item(feed: &mut ChangeFeed) -> FeedItem {
-    tokio::time::timeout(Duration::from_secs(5), feed.next())
-        .await
-        .expect("the Change feed should have sent something by now")
-        .expect("the Change feed should not have ended")
-}
-
-/// Waits for the next batch of Changes, sorted by Area and Path so it can be compared.
-async fn next_batch(feed: &mut ChangeFeed) -> Vec<Change> {
-    match next_item(feed).await {
-        FeedItem::Changes(mut batch) => {
-            batch.sort_by(|a, b| (a.area, &a.path).cmp(&(b.area, &b.path)));
-            batch
-        }
-        other => panic!("expected a batch of Changes, got {other:?}"),
-    }
-}
-
-/// Each Change's Path and kind, for comparing. The tests here only commit from this Store, to one
-/// Area at a time.
-fn changes(batch: &[Change]) -> Vec<(&str, ChangeKind)> {
-    batch.iter().map(|change| (change.path.as_str(), change.kind)).collect()
-}
-
 /// Reads a File that the test expects to exist.
 async fn read(store: &Store, area: Area, path: &str) -> File {
     store
@@ -1165,23 +1134,6 @@ async fn read(store: &Store, area: Area, path: &str) -> File {
 async fn list(store: &Store, area: Area, prefix: &str) -> Vec<String> {
     let paths = store.list(area, prefix).await.unwrap();
     paths.iter().map(|path| path.as_str().to_owned()).collect()
-}
-
-/// Checks that nothing more arrives on the Change feed for a short while.
-async fn assert_nothing_more(feed: &mut ChangeFeed) {
-    if let Ok(item) = tokio::time::timeout(Duration::from_millis(200), feed.next()).await {
-        panic!("expected nothing more on the Change feed, got {item:?}");
-    }
-}
-
-/// Checks that the Change feed has ended, and stays ended.
-async fn assert_ended(feed: &mut ChangeFeed) {
-    for _ in 0..2 {
-        let item = tokio::time::timeout(Duration::from_secs(5), feed.next())
-            .await
-            .expect("the Change feed should have ended by now");
-        assert_eq!(item, None);
-    }
 }
 
 /// Checks that a Commit failed with a Conflict on exactly `expected`.

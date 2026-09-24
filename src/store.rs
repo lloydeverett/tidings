@@ -31,7 +31,8 @@ pub struct Store {
 /// process's Commits) must not hold an `Arc<Inner>`, or the feed would never end: it holds only
 /// what it needs, and `Inner` stops it when dropped. A task that finishes on its own, such as a
 /// Commit left to complete in the background, may hold one, which keeps the feed open until its
-/// Changes are recorded.
+/// Changes are recorded. Such a Commit must also carry its `commit_order` guard into the task (an
+/// owned guard, from an `Arc<Mutex<()>>`), or a later Commit could be recorded before it.
 #[derive(Debug)]
 struct Inner {
     backend: Backend,
@@ -114,7 +115,8 @@ impl Store {
     pub async fn commit(&self, staging: Staging) -> Result<Committed> {
         let area = staging.area();
         let _in_order = self.inner.commit_order.lock().await;
-        // Chosen in turn too, so a Commit applied later never has an earlier timestamp.
+        // Taken in turn too, so Commits read the clock in the order they are applied. The wall
+        // clock can step backwards, so their timestamps are in that order only while it doesn't.
         let timestamp = Timestamp::now();
         let request = CommitRequest { timestamp, staged: staging.into_staged() };
         let outcome = self.inner.backend.commit(request).await?;

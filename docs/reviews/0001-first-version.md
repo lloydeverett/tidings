@@ -561,3 +561,125 @@ Left as the coordinator asked: the `(Area, Prefix)` clump.
 Clippy (all targets, with default features and with `--all-features`) is clean. `cargo test`
 passes with default features, `--no-default-features` and `--all-features`: 32 behaviour tests
 and 5 path tests.
+
+---
+
+## Ticket 05: What the Change feed promises
+
+Reviewed: `git diff f852326...919e83d` (commit 919e83d). The Spec reviewer was also asked to look for races (lost wakeups, split batches, a feed that never ends), to check that the `commit_order` lock is safe to cancel, and to judge the recorded Resync design.
+
+### Standards
+
+**(a) Documented-standard violations**
+
+1. **`src/store.rs:128-138`, `inject_external_change` behind `testing`: possible hard violation.** The spec's Testing Decisions say tests "never look at internal state. The one exception is starting a failure point", and they list memory as "not applicable" for simulating outside changes. This hook writes straight into the Store layer's feed and bypasses the Backend, which makes it a second exception. The ticket's own notes (05, "The `testing` feature adds only…") endorse it, but the spec was not amended. Amend the spec's Testing Decisions, or accept the inconsistency.
+2. **`tests/store_layer.rs:26-27`, `mod external` gated on `#[cfg(feature = "testing")]`: judgement call.** Nothing enables `testing` (no `required-features`, no CI config), so a plain `cargo test` silently skips the only test of the rule that merged Changes are external if any part was. No documented standard covers this. It is flagged because that rule is a README promise (README.md:23-24).
+3. **Glossary (CONTEXT.md):** no word from an `_Avoid_` list is used for its concept.
+   - "Applied" (store.rs:40, 116) matches the Commit definition, "Applying a Staging".
+   - "entry" (change.rs:63) is a map entry, not a File.
+   - "area's directory" (README) is the real on-disk directory.
+
+   No `tracing` was added, Backends stay `pub(crate)`, and tests use only the public API apart from item 1.
+
+**(b) Smells (all judgement calls)**
+
+- **Possible Mysterious Name, `src/change.rs:106` `struct Pending`.** The spec already uses "Pending" for a planned error variant (ticket 10: "`Pending`: decided but not fully applied"), so the crate will soon have two meanings for one word. `Unread` or `Recorded` would avoid the clash. Separately, `fn next(&mut self) -> Option<Option<FeedItem>>` (change.rs:144) can only be understood with its doc comment.
+- **Possible Primitive Obsession / hidden coupling, change.rs:110, 133, 154 and area.rs:17.** `areas: [BTreeMap<Path, Merged>; 3]` is indexed by `area as usize` in one place and zipped with `Area::ALL` in another. This relies on the enum's order and `ALL` staying in step. Keeping a map per Area is justified by the planned Resync design (tickets 08 and 11), so it isn't speculative. A small `PerArea<T>` with `get_mut(Area)` and `iter()` would keep the indexing in one place.
+- **Possible Duplicated Code, `tests/store_layer.rs:87-99` and `:82-83`.** These copy `next_batch` and `assert_nothing_more` from `tests/behaviour/suite.rs:1139-1175` almost line for line. A shared `tests/common` module would remove the copy.
+- **Possible Duplicated Code, tests.** The shape `let seen: Vec<_> = batch.iter().map(|change| (change.area, change.path.as_str(), …)).collect();` appears four times: twice in suite.rs (new tests at about :951 and :1026) and twice in store_layer.rs (:60 and :79). A helper next to `changes()` that includes the Area would cover all four.
+- **No Middle Man, Feature Envy or Speculative Generality found.** `FeedSender::record` (change.rs:180) is a thin wrapper, but it adds the lock and the wake-up, so it isn't a Middle Man.
+
+Out of scope for this axis and not assessed: whether cancelling `commit` between `backend.commit` and `feed.record` (store.rs:119-121) can drop a Change.
+
+### Spec
+
+Every ticked box was checked against the code and holds. Tests pass with default features, `--all-features` and `--no-default-features`. No blocking defects.
+
+**(a) Missing or partial**
+- Nothing blocking.
+- "Changes stop being recorded" after the feed is dropped is implemented (src/change.rs:89, :130) but untested. The ticket note says the public API can't observe it, which is true.
+- "Memory grows with the number of distinct Paths" is only checked indirectly: 1000 Commits produce one Change. Acceptable.
+
+**(b) Scope creep**
+- Nothing of substance. `Area::ALL`, the README update and `inject_external_change` (store.rs:128-138, only with the `testing` feature) are all asked for: "the `testing` feature adds a way to inject one into the Store layer".
+- The per-Area maps in `Pending` (change.rs:110) are shaped for Resync, which isn't built yet. The cost is trivial.
+
+**(c) Implemented, possibly wrong**
+- **The concurrency is sound.**
+  - No lost wakeups. `next` (change.rs:75-81) checks `Pending` under the lock before it waits, and there is only one waiter, so a `notify_one` with nobody waiting is kept as a permit. That covers a record or an `end()` landing between the unlock and the `.await`.
+  - A stale permit costs at most one extra loop.
+  - `next` is cancel-safe, because `Pending` is only taken in the same step that returns it.
+  - "A Commit's Changes are never split across batches" holds: each Commit is recorded under one lock (change.rs:180-186).
+  - The feed ends: `Inner::drop` calls `end()` (store.rs:47). `Shared` holds no reference back to `Inner`, so there is no cycle. Whatever was pending still arrives, then `None` is returned for good.
+- **The `commit_order` lock is sound.**
+  - Locks are always taken in the order commit_order → Backend mutex → `pending`, and reads never take `commit_order`, so nothing can deadlock.
+  - A cancelled Commit releases the lock cleanly: tokio's lock future is cancel-safe, and the guard is dropped both on future-drop and on the `?` error path.
+  - The memory Backend's commit has no `.await` inside it, so today a Commit can't be cancelled after it is applied but before it is recorded (store.rs:120-121).
+  - **Watch in ticket 10** ("once started, a Commit continues in a background task"): the guard must move into that task, or a later Commit could be recorded first. The invariant written on `Inner` doesn't mention this.
+- **Minor overclaim:** "a Commit applied later never has an earlier timestamp" (store.rs:117-118). `Timestamp::now()` reads the wall clock, which can step backwards. The spec doesn't require this, so only the comment and the ticket note overclaim.
+
+**The recorded Resync decision is consistent with ADR 0003 and the spec.**
+- The spec says the feed "merges changes rather than dropping them, and says so explicitly (a Resync) if it cannot keep that promise", and CONTEXT.md's Resync entry says the app should "read everything it relies on in that Area again". Absorbing an Area's Changes into a pending Resync loses nothing, because the app's reread happens after `next` hands the Resync over, and anything recorded after that is pending as usual.
+- It also keeps ADR 0003's promise that memory stays bounded.
+- Two points to record for ticket 11:
+  - A debounced burst across Areas must be recorded with one `record` call per Area. Only a Commit is promised a single batch, so that's allowed.
+  - A pending Resync hides Origin. An app that skips its own Changes loses nothing, because the required reread covers them.
+
+### Summary
+
+Standards: 1 possible hard violation and 4 judgement calls. The violation is that `inject_external_change` is a second test-only door into internal state, which the spec's Testing Decisions don't allow for. Spec: nothing blocking, and the concurrency was judged sound. The most important note is for ticket 10: the `commit_order` guard must move into the background task that finishes a cancelled Commit.
+
+
+
+### Resolution
+
+1. **Standards (a)1, a second test-only door not in the spec:** fixed in the spec. Its Testing
+   Decisions now name two exceptions, both only with the `testing` feature: starting a failure
+   point, and injecting an external Change into the Store layer. The "memory: not applicable"
+   line now says that nothing outside tidings can reach memory, so `Store::inject_external_change`
+   records an external Change without changing any File. The Crate setup line for `testing`
+   mentions it too.
+2. **Standards (a)2, a plain `cargo test` skipped the external-Origin test:** fixed. tidings is
+   now its own dev-dependency, with `default-features = false, features = ["testing"]`, and the
+   `cfg` gate in tests/store_layer.rs is gone.
+   - Why this option: `required-features` would still skip the whole test target on a plain
+     `cargo test`, just more visibly, and the point was to make it run. Feature unification turns
+     `testing` on only in builds of tidings' own test targets. I checked with `cargo build -v`:
+     a normal build compiles tidings with only `default`, `fs` and `sqlite`. Crates that depend
+     on tidings never see dev-dependencies, and `cargo publish` drops a path-only dev-dependency.
+   - With `default-features = false`, `--no-default-features` test runs still leave out `fs`
+     and `sqlite`.
+   - Ticket 10's failure points get the same treatment, so its crash tests also run under a
+     plain `cargo test`. There is a comment in Cargo.toml saying so.
+3. **`Pending` and `Option<Option<FeedItem>>`:** fixed. The struct is now `Unread` and the field
+   `unread`, so the word is free for ticket 10's `Error::Pending`. `Unread::next` returns a small
+   private enum, `Next { Item(FeedItem), Ended, Wait }`, which `ChangeFeed::next` matches on.
+4. **`area as usize` and `Area::ALL`:** fixed. The crate-private `PerArea<T>` in src/area.rs
+   has `get`, `get_mut` and `iter_mut`, and is the only place that maps Areas to positions.
+   `Area::ALL` is gone. The feed keeps its maps in a `PerArea`, and so does the memory Backend
+   for its Files. There is no `iter`, because nothing needs it: the feed needs `iter_mut` to take
+   each Area's map.
+5. **Duplicated test helpers:** fixed. tests/common/mod.rs holds the feed helpers (`next_item`,
+   `next_batch`, `changes`, `assert_nothing_more`, `assert_ended`) and the new
+   `changes_in_full`, which gives `(area, path, kind, origin)` for each Change of a batch. The
+   behaviour suite includes it with `#[path]` and tests/store_layer.rs with `mod common`. It has
+   `#![allow(dead_code)]`, because each test crate uses only some of the helpers. The four
+   projections, and the older one in `a_commit_announces_one_batch_of_local_changes`, now use
+   `changes_in_full`. The merging test now also checks the Origin inline, instead of with a
+   separate `all(..)`.
+6. **Spec (c):** fixed.
+   - The overclaim: the comment now says the timestamp is taken under `commit_order`, so
+     Commits read the clock in the order they are applied. The wall clock can step backwards, so
+     their timestamps are in that order only while it doesn't. The ticket note says the same.
+   - The invariant on `Inner` and the ticket note now say that a Commit continued in the
+     background (ticket 10) must carry its `commit_order` guard into that task, as an owned
+     guard (`Arc<Mutex<()>>` with `lock_owned`), or a later Commit could be recorded before it.
+
+The review's two points for ticket 11 are recorded in the ticket 05 notes, next to the Resync
+decision: a debounced burst that spans Areas is recorded with one `record` call per Area, and a
+pending Resync hides Origin, which loses nothing.
+
+Clippy (all targets, with default features, `--all-features` and `--no-default-features`) is
+clean. `cargo test` passes with default features, `--no-default-features` and `--all-features`:
+38 behaviour tests, 5 path tests and 2 Store-layer tests. A plain `cargo test` now runs both
+Store-layer tests.

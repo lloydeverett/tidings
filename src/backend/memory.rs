@@ -4,16 +4,14 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use super::{AreaState, CommitOutcome, CommitRequest, RawChange};
+use crate::area::PerArea;
 use crate::staging::Action;
 use crate::{Area, ChangeKind, File, Path, Prefix, PrefixRevision, Result, Revision, Stat};
 
 #[derive(Debug, Default)]
 pub(crate) struct MemoryBackend {
-    areas: Mutex<Areas>,
+    areas: Mutex<PerArea<Files>>,
 }
-
-/// Each Area's Files, indexed by `Area as usize`.
-type Areas = [Files; 3];
 
 /// One Area's Files.
 type Files = BTreeMap<Path, Stored>;
@@ -28,24 +26,24 @@ struct Stored {
 impl MemoryBackend {
     pub(crate) fn read(&self, area: Area, path: &Path) -> Option<File> {
         let areas = self.areas.lock().unwrap();
-        let stored = areas[area as usize].get(path)?;
+        let stored = areas.get(area).get(path)?;
         Some(File::new(path.clone(), stored.contents.clone(), stored.stat))
     }
 
     pub(crate) fn stat(&self, area: Area, path: &Path) -> Option<Stat> {
         let areas = self.areas.lock().unwrap();
-        let stored = areas[area as usize].get(path)?;
+        let stored = areas.get(area).get(path)?;
         Some(stored.stat)
     }
 
     pub(crate) fn list(&self, area: Area, prefix: &Prefix) -> Vec<Path> {
         let areas = self.areas.lock().unwrap();
-        areas[area as usize].keys().filter(|path| prefix.covers(path)).cloned().collect()
+        areas.get(area).keys().filter(|path| prefix.covers(path)).cloned().collect()
     }
 
     pub(crate) fn stat_prefix(&self, area: Area, prefix: &Prefix) -> Result<PrefixRevision> {
         let areas = self.areas.lock().unwrap();
-        let files = areas[area as usize].revisions_under(prefix)?;
+        let files = areas.get(area).revisions_under(prefix)?;
         Ok(PrefixRevision::of(area, prefix.clone(), files))
     }
 
@@ -54,7 +52,7 @@ impl MemoryBackend {
     pub(crate) fn commit(&self, request: CommitRequest) -> Result<CommitOutcome> {
         let CommitRequest { timestamp, mut staged } = request;
         let mut areas = self.areas.lock().unwrap();
-        let files = &mut areas[staged.area as usize];
+        let files = areas.get_mut(staged.area);
         staged.check_preconditions(files)?;
         staged.expand_prefix_deletes(files.keys());
         staged.refuse_clashing_paths(files.keys())?;

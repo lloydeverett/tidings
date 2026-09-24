@@ -29,9 +29,10 @@ These are properties of the Store layer, tested on the memory Backend.
 **Notes:**
 
 - **How the feed holds Changes.** The mpsc channel is gone. The Store's end (`FeedSender`) and the
-  `ChangeFeed` share one `Pending` behind a mutex, plus a tokio `Notify`. `Pending` holds, for
+  `ChangeFeed` share one `Unread` behind a mutex, plus a tokio `Notify`. `Unread` holds, for
   each Area, a map from Path to the merged kind and Origin, so it has at most one entry per Area
-  and Path. `next` takes everything pending as one batch. A Commit's Changes are recorded under
+  and Path. The maps are kept in a crate-private `PerArea<T>` (in `src/area.rs`), which the memory
+  Backend uses for its Files too, so only it knows how Areas map to positions. `next` takes everything pending as one batch. A Commit's Changes are recorded under
   one lock, so they are always taken together. A batch is in order of Area, then Path. `next` is
   cancel-safe: a `next` dropped while waiting loses nothing, which matters because apps wrap it
   in timeouts.
@@ -41,8 +42,9 @@ These are properties of the Store layer, tested on the memory Backend.
   be stale (Changed when the File was last Removed). Now the Store layer holds an async
   `commit_order` lock from before the Commit is applied until its Changes are recorded. This
   costs no concurrency, because every Backend's Commit takes an exclusive lock anyway. It lives in
-  the Store layer, so the SQLite and filesystem Backends get it for free. The timestamp is chosen
-  under it too, so a Commit applied later never has an earlier timestamp.
+  the Store layer, so the SQLite and filesystem Backends get it for free. The timestamp is taken
+  under it too, so Commits read the clock in the order they are applied. The wall clock can step
+  backwards, so their timestamps are in that order only while it doesn't.
   `concurrent_commits_reach_the_feed_in_the_order_they_were_made` catches the bug: with the lock
   removed, it failed on every one of eight runs, within 17 to 370 of its 500 rounds.
 - **The feed ends when the Store's shared state is dropped, not when the last reference to the
@@ -59,13 +61,18 @@ These are properties of the Store layer, tested on the memory Backend.
     or a cancellation token, so they don't outlive the Store.
   - A task that finishes on its own, such as a cancelled Commit completing in the background
     (ticket 10), may hold an `Arc<Inner>`. It keeps the feed open only until its Changes are
-    recorded, which is what ticket 10's "its Changes still arrive on the feed" needs.
+    recorded, which is what ticket 10's "its Changes still arrive on the feed" needs. It must also
+    carry its `commit_order` guard into the task (an owned guard, so `commit_order` becomes an
+    `Arc<Mutex<()>>` locked with `lock_owned`), or a later Commit could be recorded before it.
 - **Where raw changes enter.** `FeedSender::record(area, raw_changes, origin)` is the one
   crate-internal entry point. The Store layer decides the Origin (ticket 08 from the change log's
   Store instance, ticket 11 by matching committed Revisions) and records the batch. Record each
   observed Commit's changes in one call, so they stay in one batch.
 - **The `testing` feature** adds only `Store::inject_external_change(area, path, kind)`. It
-  records one external Change without touching any File. It is used by
+  records one external Change without touching any File. The spec's Testing Decisions name it as
+  the second exception to "public API only", after failure points (added after the review).
+  tidings has itself as a dev-dependency with `testing` on, so a plain `cargo test` runs it. It is
+  used by
   `tests/store_layer.rs`, which holds the Store-layer tests that don't belong in the shared
   suite: the external-Origin rule, and compile-time checks that `Store` is
   `Clone + Send + Sync`, `ChangeFeed` is `Send + Sync`, and the futures from `read`, `stat`,
@@ -79,10 +86,13 @@ These are properties of the Store layer, tested on the memory Backend.
   nothing is lost. Changes recorded after it is handed over are pending as usual. A Commit or an
   external batch is always for one Area, so absorbing per Area never splits one. `next` gives
   pending Resyncs first, one Area at a time, then the batch of the other Areas' Changes. A second
-  Resync for an Area already waiting adds nothing. This is why `Pending` keeps a map per Area:
+  Resync for an Area already waiting adds nothing. This is why `Unread` keeps a map per Area:
   the Resync becomes per-Area state (such as a `resync: bool` beside each map, or an enum in its
   place), and replacing means clearing that Area's map. The memory stays bounded. It isn't built
-  because nothing sends a Resync yet, and the `testing` feature only injects Changes.
+  because nothing sends a Resync yet, and the `testing` feature only injects Changes. Two points
+  for ticket 11, from the review: a debounced burst that spans Areas is recorded with one
+  `record` call per Area (only a Commit is promised a single batch), and a pending Resync hides
+  Origin, which loses nothing, because the app has to read the Area again anyway.
 - **The shared suite now runs on tokio's multi-threaded runtime** (4 workers), so the concurrency
   tests really run Commits at once. It gained six tests:
   - `unread_changes_are_merged_per_path_and_the_latest_kind_wins`: 1000 Commits to one Path give

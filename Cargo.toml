@@ -29,4 +29,7 @@ unicode-normalization = "0.1.25"
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 
 [dev-dependencies]
+# tidings' own tests always build it with `testing`, so a plain `cargo test` runs the tests that
+# need it. Dev-dependencies don't reach normal builds, or crates that depend on tidings.
+tidings = { path = ".", default-features = false, features = ["testing"] }
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
