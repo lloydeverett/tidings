@@ -40,22 +40,28 @@ can wait for the Change feed on a plain thread.
   one worker, so the SQLite poller and the filesystem watcher run between calls
   (`tests/blocking.rs` checks both give their Changes with no call in progress, and fails with a
   current-thread runtime). Clones, blocking Snapshots and the blocking Change feed share the
-  `Arc`, and the last to go shuts the runtime down, waiting for its threads, or, dropped inside an
-  async runtime, where tokio forbids waiting, in the background.
+  `Arc`, and the last to go shuts the runtime down, waiting for its threads, or, dropped in a
+  runtime's context, where tokio may forbid waiting, in the background.
 - In flight Commits: the blocking API can't cancel a Commit, since `commit` waits in `block_on`,
   and the call holds its handle, so the runtime can't stop before the Commit is finished and
   reported. `a_commit_in_progress_finishes_and_is_reported_when_every_other_handle_is_dropped`
   pauses one on the filesystem, drops every other handle, and checks it.
 - The Change feed is an `Iterator` (waits for each item, ends as the async one does) with
   `next_timeout(Duration) -> Result<Option<FeedItem>, TimedOut>` for waiting a while only.
-- Every method panics inside a tokio runtime with one message, `#[track_caller]`, including
-  `supports_snapshots` and `inject_external_change`, which don't wait: one simple rule.
+- Every method that waits panics, with one message, at the caller (`#[track_caller]`), where
+  blocking would stall a runtime: in an async task, or in a current-thread runtime's `block_on`.
+  In `spawn_blocking` and `block_in_place` it works, as tokio's own `block_on` does. Only tokio
+  can tell those apart, and its public API tells only by refusing to block, so the Store first
+  blocks its runtime on a future that does nothing, under `catch_unwind`: only tokio's refusal can
+  make that panic. (Changed after review: at first every method panicked wherever
+  `Handle::try_current()` found a runtime, which shut off `spawn_blocking`.) The methods that
+  don't wait (`open_memory`, `supports_snapshots`, `inject_external_change`) work anywhere.
 - **Running the shared suite through it.** The suite's tests were written against
   `tidings::Store`. They now use `tests/behaviour/api.rs`'s `Store`, `Snapshot` and `ChangeFeed`,
   enums with the async API's methods that call either the async API or the blocking one. Through
-  the blocking one, each call, and dropping, is made on a plain scoped thread (under
-  `block_in_place` on a multi-threaded test runtime), since the blocking API panics inside a
-  runtime. The feed helpers in `tests/common` wait through a `Feed::next_within(timeout)`, which
+  the blocking one, each call is made in `block_in_place`, as async code calls blocking code, or,
+  on the current-thread runtimes of the two tests that read a feed on a thread of their own, on a
+  plain scoped thread. Handles are dropped where the test drops them. The feed helpers in `tests/common` wait through a `Feed::next_within(timeout)`, which
   the blocking feed does with `next_timeout`: a blocking wait can't be cancelled, so wrapping it in
   `tokio::time::timeout` would leave a thread that takes the next item and loses it. Each
   Backend's module in `tests/behaviour/main.rs` has a `blocking` module that opens through the
@@ -67,10 +73,11 @@ can wait for the Change feed on a plain thread.
   `a_cancelled_commit_finishes_or_never_happens_and_is_reported_if_it_finishes` finishes each
   Commit in its first poll, since a blocking Commit can't be cancelled, so it only checks that each
   is reported, as on memory.
-- Seen once, not reproduced: in one full `cargo test` run,
+- Seen once, not reproduced: in the first full `cargo test` run,
   `fs::blocking::commits_from_both_stores_reach_each_feed_in_the_order_they_were_applied` failed
-  its assertion on what a feed last said of the raced Path. It then passed 5 runs out of 5 alone,
-  12 with six copies of it and its async twin running at once, and 8 full runs of the suite. That
-  test relies on the watcher's timing (another Store's Commits can be split, as the README says),
-  and the blocking Store's watcher runs on a one-worker runtime, so heavy load may reach that
-  limit there more easily.
+  its assertion on what a feed last said of the raced Path, before its marker. It hasn't failed
+  since: 30 more full runs of the behaviour suite, up to four at once, and 24,000 rounds of the
+  test (160 runs' worth, eight copies at once, async and blocking, beside four CPU hogs). Reading
+  the debouncer and the watcher found no way for another Store's Commit to reach the feed after a
+  later one: see the Resolution of ticket 12's review. The test now prints every batch the feed
+  gave that round when it fails, so another failure will show which Change came late.

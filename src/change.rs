@@ -71,7 +71,7 @@ impl ChangeFeed {
     /// Waits for the next item: every Change recorded since the last one, merged per Area and
     /// Path, in one batch. The Changes of a Commit through this Store are never split across
     /// batches, and neither are another Store's on SQLite (on the filesystem, see
-    /// [`Store::open_fs`](crate::Store::open_fs)). A batch may hold several Commits' Changes.
+    /// `Store::open_fs`, with the `fs` feature). A batch may hold several Commits' Changes.
     ///
     /// Gives `None` once every handle to the Store has been dropped and everything recorded
     /// before has been read.

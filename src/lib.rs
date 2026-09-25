@@ -2,7 +2,7 @@
 //! filesystem, SQLite or memory. Writes happen only through all-or-nothing Commits of a
 //! [`Staging`], and every Change is announced on the Store's [`ChangeFeed`].
 //!
-//! The [`Store`] is async, on tokio. With the `blocking` feature, [`blocking::Store`] offers the
+//! The [`Store`] is async, on tokio. With the `blocking` feature, `blocking::Store` offers the
 //! same for synchronous code.
 //!
 //! The terms used throughout (Store, Area, Path, Staging, Commit, Change...) are defined in the

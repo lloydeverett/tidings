@@ -8,10 +8,12 @@
 //! filesystem) keeps reaching the Change feed while the app isn't calling it. The runtime stops
 //! once the Store, every Snapshot taken from it and its Change feed have all been dropped.
 //!
-//! Every method here panics if it is called from within a tokio runtime, where blocking the
-//! thread could stall the runtime or deadlock it. Use the async [`crate::Store`] there.
-//! Dropping is allowed anywhere.
+//! Every method that waits panics if it is called where blocking would stall a tokio runtime or
+//! deadlock it: in an async task, or in a runtime's own `block_on`. Use the async
+//! [`crate::Store`] there. Where tokio allows blocking, it works: on a plain thread, and in a
+//! runtime's `spawn_blocking` or `block_in_place`. Dropping is allowed anywhere.
 
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,7 +41,7 @@ use crate::{
 pub struct Store {
     store: crate::Store,
     /// Dropped after the Store, so that the Store's tasks are stopped before the runtime is.
-    runtime: Arc<Runtime>,
+    runtime: Arc<SharedRuntime>,
 }
 
 /// A view of one Area as it stood when it was taken, from [`Store::snapshot`]: the async
@@ -51,7 +53,7 @@ pub struct Store {
 #[derive(Debug)]
 pub struct Snapshot {
     snapshot: crate::Snapshot,
-    runtime: Arc<Runtime>,
+    runtime: Arc<SharedRuntime>,
 }
 
 /// The single receiver of a Store's Changes, handed over when the Store is opened, for a plain
@@ -64,7 +66,7 @@ pub struct Snapshot {
 #[derive(Debug)]
 pub struct ChangeFeed {
     feed: crate::ChangeFeed,
-    runtime: Arc<Runtime>,
+    runtime: Arc<SharedRuntime>,
 }
 
 /// Nothing arrived on the Change feed within the time given to
@@ -79,10 +81,9 @@ impl Store {
     ///
     /// # Panics
     ///
-    /// If it is called from within a tokio runtime, or the internal runtime can't be started.
-    #[track_caller]
+    /// If the internal runtime can't be started.
     pub fn open_memory() -> (Store, ChangeFeed) {
-        let runtime = Runtime::start();
+        let runtime = SharedRuntime::start();
         Store::opened(crate::Store::open_memory(), runtime)
     }
 
@@ -92,11 +93,11 @@ impl Store {
     ///
     /// # Panics
     ///
-    /// If it is called from within a tokio runtime, or the internal runtime can't be started.
+    /// If it is called in an async task, or the internal runtime can't be started.
     #[cfg(feature = "fs")]
     #[track_caller]
     pub fn open_fs(app: &AppIdentity, options: FsOptions) -> Result<(Store, ChangeFeed)> {
-        let runtime = Runtime::start();
+        let runtime = SharedRuntime::start();
         let opened = runtime.block_on(crate::Store::open_fs(app, options))?;
         Ok(Store::opened(opened, runtime))
     }
@@ -107,11 +108,11 @@ impl Store {
     ///
     /// # Panics
     ///
-    /// If it is called from within a tokio runtime, or the internal runtime can't be started.
+    /// If it is called in an async task, or the internal runtime can't be started.
     #[cfg(feature = "sqlite")]
     #[track_caller]
     pub fn open_sqlite(app: &AppIdentity, options: SqliteOptions) -> Result<(Store, ChangeFeed)> {
-        let runtime = Runtime::start();
+        let runtime = SharedRuntime::start();
         let opened = runtime.block_on(crate::Store::open_sqlite(app, options))?;
         Ok(Store::opened(opened, runtime))
     }
@@ -119,7 +120,7 @@ impl Store {
     /// The blocking Store and Change feed for an async Store and its feed, opened on `runtime`.
     fn opened(
         (store, feed): (crate::Store, crate::ChangeFeed),
-        runtime: Arc<Runtime>,
+        runtime: Arc<SharedRuntime>,
     ) -> (Store, ChangeFeed) {
         let feed = ChangeFeed { feed, runtime: Arc::clone(&runtime) };
         (Store { store, runtime }, feed)
@@ -129,7 +130,7 @@ impl Store {
     ///
     /// # Panics
     ///
-    /// If it is called from within a tokio runtime.
+    /// If it is called in an async task.
     #[track_caller]
     pub fn read(&self, area: Area, path: impl IntoPath) -> Result<Option<File>> {
         self.runtime.block_on(self.store.read(area, path))
@@ -140,7 +141,7 @@ impl Store {
     ///
     /// # Panics
     ///
-    /// If it is called from within a tokio runtime.
+    /// If it is called in an async task.
     #[track_caller]
     pub fn stat(&self, area: Area, path: impl IntoPath) -> Result<Option<Stat>> {
         self.runtime.block_on(self.store.stat(area, path))
@@ -150,7 +151,7 @@ impl Store {
     ///
     /// # Panics
     ///
-    /// If it is called from within a tokio runtime.
+    /// If it is called in an async task.
     #[track_caller]
     pub fn list(&self, area: Area, prefix: impl IntoPrefix) -> Result<Vec<Path>> {
         self.runtime.block_on(self.store.list(area, prefix))
@@ -161,21 +162,15 @@ impl Store {
     ///
     /// # Panics
     ///
-    /// If it is called from within a tokio runtime.
+    /// If it is called in an async task.
     #[track_caller]
     pub fn stat_prefix(&self, area: Area, prefix: impl IntoPrefix) -> Result<PrefixRevision> {
         self.runtime.block_on(self.store.stat_prefix(area, prefix))
     }
 
     /// Whether this Store's Backend provides Snapshots, as
-    /// [`crate::Store::supports_snapshots`] says.
-    ///
-    /// # Panics
-    ///
-    /// If it is called from within a tokio runtime, as every method here does.
-    #[track_caller]
+    /// [`crate::Store::supports_snapshots`] says. It doesn't wait, so it can be called anywhere.
     pub fn supports_snapshots(&self) -> bool {
-        not_in_a_runtime();
         self.store.supports_snapshots()
     }
 
@@ -183,7 +178,7 @@ impl Store {
     ///
     /// # Panics
     ///
-    /// If it is called from within a tokio runtime.
+    /// If it is called in an async task.
     #[track_caller]
     pub fn snapshot(&self, area: Area) -> Result<Snapshot> {
         let snapshot = self.runtime.block_on(self.store.snapshot(area))?;
@@ -195,27 +190,22 @@ impl Store {
     ///
     /// # Panics
     ///
-    /// If it is called from within a tokio runtime.
+    /// If it is called in an async task.
     #[track_caller]
     pub fn commit(&self, staging: Staging) -> Result<Committed> {
         self.runtime.block_on(self.store.commit(staging))
     }
 
     /// Records an external Change on the Change feed, as
-    /// [`crate::Store::inject_external_change`] does. For tidings' own tests.
-    ///
-    /// # Panics
-    ///
-    /// If it is called from within a tokio runtime, as every method here does.
+    /// [`crate::Store::inject_external_change`] does. For tidings' own tests. It doesn't wait, so
+    /// it can be called anywhere.
     #[cfg(feature = "testing")]
-    #[track_caller]
     pub fn inject_external_change(
         &self,
         area: Area,
         path: impl IntoPath,
         kind: ChangeKind,
     ) -> Result<()> {
-        not_in_a_runtime();
         self.store.inject_external_change(area, path, kind)
     }
 }
@@ -225,7 +215,7 @@ impl Snapshot {
     ///
     /// # Panics
     ///
-    /// If it is called from within a tokio runtime.
+    /// If it is called in an async task.
     #[track_caller]
     pub fn read(&self, path: impl IntoPath) -> Result<Option<File>> {
         self.runtime.block_on(self.snapshot.read(path))
@@ -236,7 +226,7 @@ impl Snapshot {
     ///
     /// # Panics
     ///
-    /// If it is called from within a tokio runtime.
+    /// If it is called in an async task.
     #[track_caller]
     pub fn stat(&self, path: impl IntoPath) -> Result<Option<Stat>> {
         self.runtime.block_on(self.snapshot.stat(path))
@@ -247,7 +237,7 @@ impl Snapshot {
     ///
     /// # Panics
     ///
-    /// If it is called from within a tokio runtime.
+    /// If it is called in an async task.
     #[track_caller]
     pub fn list(&self, prefix: impl IntoPrefix) -> Result<Vec<Path>> {
         self.runtime.block_on(self.snapshot.list(prefix))
@@ -260,7 +250,7 @@ impl ChangeFeed {
     ///
     /// # Panics
     ///
-    /// If it is called from within a tokio runtime.
+    /// If it is called in an async task.
     #[track_caller]
     pub fn next_timeout(&mut self, timeout: Duration) -> Result<Option<FeedItem>, TimedOut> {
         // Made on the runtime, since a timer needs one.
@@ -278,7 +268,7 @@ impl Iterator for ChangeFeed {
     ///
     /// # Panics
     ///
-    /// If it is called from within a tokio runtime.
+    /// If it is called in an async task.
     #[track_caller]
     fn next(&mut self) -> Option<FeedItem> {
         self.runtime.block_on(self.feed.next())
@@ -289,54 +279,71 @@ impl Iterator for ChangeFeed {
 /// Change feed. It is multi-threaded, with one worker, so that the Store's tasks run between
 /// calls, not only while a call is waiting. The last handle to go shuts it down.
 #[derive(Debug)]
-struct Runtime {
+struct SharedRuntime {
     /// Only taken when it is shut down.
-    runtime: Option<tokio::runtime::Runtime>,
+    tokio: Option<tokio::runtime::Runtime>,
 }
 
-impl Runtime {
-    #[track_caller]
-    fn start() -> Arc<Runtime> {
-        not_in_a_runtime();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+impl SharedRuntime {
+    fn start() -> Arc<SharedRuntime> {
+        let tokio = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .thread_name("tidings")
             .enable_all()
             .build()
             .expect("tidings should be able to start the runtime of a blocking Store");
-        Arc::new(Runtime { runtime: Some(runtime) })
+        Arc::new(SharedRuntime { tokio: Some(tokio) })
     }
 
     /// Runs `future` on the runtime, blocking this thread until it finishes.
+    ///
+    /// # Panics
+    ///
+    /// If this thread mustn't block: see [`refuse_if_blocking_would_stall`].
     #[track_caller]
     fn block_on<F: Future>(&self, future: F) -> F::Output {
-        not_in_a_runtime();
-        self.runtime.as_ref().expect("the runtime runs until it is dropped").block_on(future)
+        let tokio = self.tokio.as_ref().expect("the runtime runs until it is dropped");
+        refuse_if_blocking_would_stall(tokio);
+        tokio.block_on(future)
     }
 }
 
-impl Drop for Runtime {
-    /// Shuts the runtime down, waiting for its threads, unless this is in an async context, where
-    /// waiting would block the runtime there, and tokio panics. There it lets them finish on their
-    /// own. The Store's tasks have been stopped already, and no call is in progress, since each
-    /// holds a handle.
+impl Drop for SharedRuntime {
+    /// Shuts the runtime down, waiting for its threads, unless this is in a runtime's context,
+    /// where waiting could block that runtime, and tokio would panic. There it lets them finish
+    /// on their own. The Store's tasks have been stopped already, and no call is in progress,
+    /// since each holds a handle.
+    ///
+    /// Unlike [`refuse_if_blocking_would_stall`], it doesn't ask tokio whether it may wait, since
+    /// asking prints a panic where no mistake was made.
     fn drop(&mut self) {
-        let runtime = self.runtime.take().expect("the runtime is shut down only once");
+        let tokio = self.tokio.take().expect("the runtime is shut down only once");
         if Handle::try_current().is_ok() {
-            runtime.shutdown_background();
+            tokio.shutdown_background();
         } else {
-            drop(runtime);
+            drop(tokio);
         }
     }
 }
 
-/// Panics if this is called from within a tokio runtime: see the module's doc.
+/// Panics, saying why, if this thread mustn't block, because it runs a tokio runtime's async
+/// tasks or its `block_on`, where blocking would stall that runtime or deadlock it.
+///
+/// A thread with no runtime's context may block. One in a runtime's context may too, in
+/// `spawn_blocking` or `block_in_place`, and only tokio can tell those apart: its public API
+/// tells only by refusing to block. So this asks it, blocking on `tokio` with a future that does
+/// nothing and can't panic itself. If tokio refuses, its own panic is printed first, then this
+/// one, which names the call that made the mistake.
 #[track_caller]
-fn not_in_a_runtime() {
-    if Handle::try_current().is_ok() {
+fn refuse_if_blocking_would_stall(tokio: &tokio::runtime::Runtime) {
+    if Handle::try_current().is_err() {
+        return;
+    }
+    if panic::catch_unwind(AssertUnwindSafe(|| tokio.block_on(async {}))).is_err() {
         panic!(
-            "tidings' blocking API was called from within an async runtime, where blocking could \
-             stall or deadlock it: use the async `tidings::Store` there instead"
+            "tidings' blocking API was called in an async task, where blocking would stall the \
+             runtime or deadlock it: use the async `tidings::Store` there, or call it through \
+             `spawn_blocking`"
         );
     }
 }

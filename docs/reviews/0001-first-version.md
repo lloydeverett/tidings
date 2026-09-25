@@ -1901,3 +1901,177 @@ Clippy (`--all-targets` and without) is clean with default features, `--all-feat
 rustdoc. `cargo test` passes with default features, `--no-default-features` and
 `--all-features`: 185 behaviour tests. The watching and two-Store tests passed 20 runs out of 20
 alone, and 10 out of 10 with three copies of the filesystem suite running alongside.
+
+---
+
+## Ticket 12: Blocking API
+
+Reviewed: `git diff 64924f3...c566fb1` (commit c566fb1). The Spec reviewer was also asked to check the runtime's lifetime, the choice of a one-worker runtime, the flaky ordering test, how complete the panic check is, whether the suite really runs through the blocking API, and whether the `next_timeout`/`TimedOut` API is the right shape.
+
+### Standards
+
+**Hard violations of documented standards:** none.
+
+- **Structure:** Backends stay private. The only new public module is `blocking`, behind its feature (src/lib.rs:15). No `tracing` is added, and the features match the spec.
+- **Tests:** they use only the public API. Two apparent exceptions are both allowed by the spec's Testing Decisions:
+  - `edits_in_an_area_arrive…` (tests/blocking.rs:144) writes into the Area directory, which the spec lists as a way to simulate outside changes.
+  - `a_commit_in_progress…` (tests/blocking.rs:163-166) uses a Pause failure point, which is a named exception.
+- **Glossary:** no word from a CONTEXT.md `_Avoid_` list is used in its avoided sense. "directory" means the on-disk Area root, not a Prefix, and "batch" means a feed batch, as the spec uses it.
+
+**Standards notes (judgement calls):**
+
+- **Second public error type.** src/blocking.rs:70-74 adds a second public error type, `pub struct TimedOut` (a `thiserror::Error`). The spec says "one `#[non_exhaustive]` error type" (docs/specs/0001-first-version.md, Errors). The same diff amends the spec to name `TimedOut` (the "Settled while building it (ticket 12)" block, around line 313), so the repo now permits it. But the exception was granted by the change that needed it. Confirm that a separate timeout type is really intended, rather than an `Error` variant.
+
+**Baseline smells (all judgement calls):**
+
+- **Duplicated Code:**
+  - `TimedOut` is defined twice: `tidings::blocking::TimedOut` (src/blocking.rs:74) and a test copy, `common::TimedOut` (tests/common/mod.rs:21-23). The test copy is needed for the async feed, so this is minor.
+  - `fn app()` appears three times: tests/behaviour/main.rs:95 and :247, and tests/blocking.rs:221.
+  - `batch.iter().map(|change| (change.path.as_str(), change.origin)).collect::<Vec<_>>()` appears three times, at tests/blocking.rs:128, :150 and :186. It could be a helper in `tests/common`, which tests/blocking.rs doesn't include.
+- **Mysterious Name:** tests/blocking.rs:213 defines `fn changes(item: FeedItem) -> Vec<Change>`. That is a different function from `common::changes(&[Change]) -> Vec<(&str, ChangeKind)>` (tests/common/mod.rs:50), so one name means two things across the test crates. `batch_of` or `expect_batch` would be clearer.
+- **Mysterious Name (weak):** src/blocking.rs:292-295 defines `struct Runtime { runtime: Option<tokio::runtime::Runtime> }`. It shadows tokio's type name and leads to `self.runtime.runtime`. `SharedRuntime` would avoid that.
+- **Repeated Switches (suppressed by the repo):** tests/behaviour/api.rs:40-142 repeats the same `Async(..) => ….await, Blocking(..) => off_runtime(|| …)` match in every method of three enums. The spec's Testing Decisions ask for exactly this test-only stand-in, so the repo overrides the smell. Noted only in case a trait would read better.
+- **Middle Man (suppressed by the spec):** src/blocking.rs:128-285 is almost entirely one-line delegation. The spec asks for this ("mirroring every operation", like `reqwest::blocking`).
+
+Nothing else stood out. The drop order (`store` before `runtime`, src/blocking.rs:40-42) and the checks for being called inside a runtime match the spec. Clippy was not run.
+
+### Spec
+
+**(a) Missing or partial:** none found.
+- `blocking::Store` mirrors every public method of the async Store, Snapshot and ChangeFeed.
+- It builds with `blocking` alone, `blocking,fs`, `blocking,sqlite` and `blocking,testing`.
+- `cargo test` passes: 329 behaviour tests.
+
+**(b) Scope creep:** nothing of note. `next_timeout` and `TimedOut` (src/blocking.rs:70-74, 265-269) go slightly beyond "a blocking way to wait for the next item", but the suite needs them, because a blocking wait can't be cancelled.
+- They follow the `recv_timeout` pattern, and the spec now names them (line 312).
+- They add a second public error type, against "**Errors**: one `#[non_exhaustive]` error type". Acceptable, since `TimedOut` isn't an operation error, but the spec should say so explicitly.
+- The Iterator ends correctly and keeps returning `None` (probed).
+
+**(c) Implemented but looks wrong:**
+
+1. **The panic check is broader than the spec intends.** Story 62: "a clear panic if I call the blocking API from inside an async runtime, so that I find the mistake immediately rather than as a deadlock."
+   - `not_in_a_runtime` (src/blocking.rs:335-341) uses `Handle::try_current()`, so it also panics inside `spawn_blocking` and `block_in_place`, where blocking is allowed. tokio's own `block_on` works in `spawn_blocking`: in the probe, tidings panicked there while tokio's `block_on` returned 42.
+   - This closes off the normal bridge from async code to sync code, and the panic message ("could stall or deadlock it") is false in those places.
+   - The suite had to work around it with a scoped thread inside `block_in_place` (tests/behaviour/api.rs:204-212).
+   - Coverage is otherwise complete: every public method, the feed's `next` and `next_timeout`, and Snapshot methods. Drops are exempt, as documented.
+
+**Runtime lifetime: correct.**
+- Field order drops the Store before the runtime `Arc`.
+- A probe on SQLite showed the feed ends while a Snapshot and the feed are still held, and the Snapshot still reads after both the Store and the feed are gone.
+- If the last handle is dropped inside `spawn_blocking`, `block_in_place` or another runtime's task, it takes the `shutdown_background` branch. That's fine, and no public path puts a handle on the internal runtime's own threads.
+- A Commit can't be in flight at shutdown: `commit` holds `&self` through `block_on`, and `Started` is never dropped partway. That checkbox is met and tested (tests/blocking.rs:159).
+
+**One worker thread is sound.** `block_on` runs each caller's future on the caller's own thread, and blocking I/O goes through `spawn_blocking`. So the single worker only runs the watcher, poller and supervisor tasks, and callers can't starve it.
+
+**The flaky ordering test was not reproduced.**
+- 48 runs (24 blocking, 24 async, 12 at a time, alongside 6 CPU hogs), plus 6 more full behaviour-suite runs (3 at a time), gave no failure.
+- The one failure the implementer saw was an assertion, not a timeout: the marker reached a feed before the raced Path's final state.
+- The README only concedes that another Store's Commit can be split, or can arrive after this Store's own next Commit. It doesn't concede that Commits from two other Stores can be reordered relative to each other.
+- So "only test timing" isn't established. If the failure is real, it most likely lives in the async filesystem watcher (ticket 11), because the blocking layer only changes scheduling. It should stay tracked.
+
+**The suite through the blocking API is genuine.**
+- The Fixtures open through `blocking::Store`, and handles are dropped on plain threads.
+- Multi-thread runtimes with `block_in_place` keep the concurrency.
+- `next_within` maps faithfully to `next_timeout`.
+- Only the cancellation test is weaker, which is disclosed and unavoidable.
+
+**Docs:** README.md:7 says "the first version is complete". That's accurate: all 12 tickets are done, with no unticked boxes.
+
+### Summary
+
+Standards: 0 hard violations. 1 judgement call: `TimedOut` is a second public error type, and the same diff amended the spec to allow it. There are also 4 small smells. Spec: nothing missing, and the runtime's lifetime was verified correct. 1 thing is wrong: the check that panics inside an async runtime also panics inside `spawn_blocking` and `block_in_place`, where blocking is legitimate. The flaky ordering test is unresolved and may be a real ordering gap in the filesystem watcher.
+
+
+### Resolution
+
+1. **Spec c1, the panic check:** fixed. It now panics only where blocking would stall a runtime.
+   - How tokio tells: its worker threads and its `block_on` mark the thread as running the
+     runtime, `block_in_place` clears that mark, and blocking-pool threads never set it.
+     `block_on` panics ("Cannot start a runtime from within a runtime") on a marked thread. The
+     mark isn't public, and no public API reads it without blocking. `Handle::try_current()` sees
+     only the handle, which `spawn_blocking` and `block_in_place` have too.
+   - So `refuse_if_blocking_would_stall` (src/blocking.rs) lets a thread with no handle block. On
+     one with a handle, it blocks the Store's own runtime on a future that does nothing, under
+     `catch_unwind`. Only tokio refusing can make that panic. If it does, the Store panics with its
+     own message at the caller's call (`#[track_caller]`). tokio's panic is printed first, by the
+     panic hook. Built with `panic = "abort"`, tokio's panic ends the process, with its own message.
+   - Letting tokio's `block_on` panic on its own was rejected. The multi-threaded `block_on`
+     isn't `#[track_caller]`, so its panic would point inside tokio, and its message is about
+     starting a runtime.
+   - The methods that don't wait (`open_memory`, `supports_snapshots`, `inject_external_change`)
+     now work anywhere.
+   - Dropping still uses `Handle::try_current()` to choose `shutdown_background`. Asking tokio
+     there would print a panic whenever a handle is dropped in an async task, which is allowed.
+   - New tests in tests/blocking.rs:
+     - `waiting_in_an_async_task_panics_on_a_multi_threaded_runtime`: a task spawned onto a
+       worker thread.
+     - `…_on_a_current_thread_runtime`: in its `block_on`.
+     - Each of those two checks every method that waits, and that the others don't panic.
+     - `the_blocking_api_works_in_spawn_blocking` and `…_in_block_in_place`: each uses every
+       method that waits, on memory, SQLite and the filesystem. Both fail with the old check.
+   - tests/behaviour/api.rs no longer needs the workaround:
+     - Each blocking call is made in `block_in_place`.
+     - A plain scoped thread is used only on the current-thread runtimes of the two tests that
+       read a feed on a thread of their own, where `block_in_place` isn't available.
+     - The `OffRuntime` wrapper, which dropped handles on a plain thread, is gone.
+   - The README, the spec, the module doc and the ticket say where it panics and where it works.
+2. **The flaky ordering test:** not reproduced, and no mechanism found. So no limitation is
+   documented, the test still asserts what it did, and it now shows what went wrong if it fails
+   again.
+   - **Stress.** Since the one failure, none in:
+     - 30 full runs of the behaviour suite, up to four at once;
+     - 24,000 rounds of the test: `race_then_mark` raised to 3,000 rounds, eight copies (four
+       async, four blocking) at once, beside four CPU hogs, about 15 minutes each;
+     - 40 runs of the two filesystem variants with this commit, eight at once.
+   - **The suspicion that the debouncer settles each path on its own timer, so emits Commits
+     out of order.** Reading notify-debouncer-full 0.7 says otherwise:
+     - It does expire each event on its own age.
+     - `debounced_events` then passes each tick's expired events through `sort_events`, a merge
+       by event time across paths. So an event of a later Commit can't be emitted before an
+       earlier Commit's.
+     - A rename keeps the events of the temporary file it moves, with their times (the
+       temporary file's creation). A tidings Commit makes all of its events (temporary files,
+       journal, renames, deletes) holding the Area's lock, so every event of a later Commit, from
+       any Store, is later than every event of an earlier one.
+     - A Remove that cancels a Create within the window drops both. The watcher's `Removals`
+       picks those up by their removal time, and takes each one that has settled at the end of
+       every burst. Any burst holding a later Commit's events ends after an earlier removal has
+       settled.
+     - The watcher reads the disk as it is when it reads, not the events' contents. So a burst
+       naming both Paths sees both final.
+   - **The other ways I checked a Change could come late:**
+     - the Store's own Commit recorded late, after another Store's Commit landed;
+     - the watcher reading between a Commit's renames and its `committed()`;
+     - a slow Commit's journal making its Files readable before its renames;
+     - four-window cuts in a burst.
+     In each, the noting under the Commit turn and the reads of the disk as it stands keep the
+     order. So if the failure was real, its cause is outside what I could trigger or see.
+   - **What changed.** The test's `kind_until` now also gives every batch it read. The assertion
+     prints them with the feed's index, so the next failure shows which Change came late, and
+     from which Store.
+3. **`TimedOut`:** kept as its own type. The spec's Errors section now says that it isn't an
+   operation's error: nothing went wrong, and the app chose how long to wait, as with
+   `recv_timeout` or tokio's `timeout`. As an `Error` variant, every `match` on the errors of
+   reads and Commits would need a case none of them can give.
+   - Name collisions: tidings has no other `TimedOut`, and it is only reached as
+     `tidings::blocking::TimedOut`. Nearby names are `std::io::ErrorKind::TimedOut` (a variant,
+     rarely imported bare), `std::sync::mpsc::RecvTimeoutError::Timeout` and tokio's `Elapsed`.
+     None clash with a normal import.
+   - The test copy, `common::TimedOut`, is gone. tidings' own tests always build with `blocking`,
+     so the helpers use the public type.
+4. **Smells:** done.
+   - `app()` is in tests/common, used by both test crates and store_layer.rs.
+   - The `(path, origin)` projection is `common::paths_and_origins`.
+   - tests/blocking.rs's `changes()` is now `batch_of()`.
+   - `struct Runtime` is now `SharedRuntime`, and its field `tokio`, so there is no
+     `runtime.runtime`.
+5. **Doc links:** fixed. The two `open_fs` links, and a `blocking::Store` link that ticket 12
+   added to the crate doc, which broke the same way without `blocking`, are now code spans. `cargo
+   doc --no-deps` with `-D warnings` is clean on 10 feature sets: default, `--all-features`,
+   `--no-default-features`, `blocking`, `fs`, `sqlite`, `testing`, `blocking,fs`,
+   `blocking,sqlite` and default plus `blocking`.
+
+Clippy (`--all-targets` and without) is clean with default features, `--all-features`,
+`--no-default-features`, `blocking`, `blocking,fs`, `blocking,sqlite`, `fs`, `sqlite` and default
+plus `blocking`. So is rustfmt. `cargo test` passes with default features, `--no-default-features`
+and `--all-features`: 329 behaviour tests and 11 blocking tests (8 without `fs` and `sqlite`).

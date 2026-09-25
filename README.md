@@ -69,8 +69,9 @@ See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
   which keeps running between calls: other processes' commits and edits in the area directories
   reach its change feed while the app isn't calling it. The change feed is an iterator that waits
   for each item, and `next_timeout` waits for a while only. The runtime stops once the store, its
-  snapshots and its change feed have all been dropped. Every blocking method panics if it is
-  called from within a tokio runtime: use the async store there.
+  snapshots and its change feed have all been dropped. A method that waits panics if it is called
+  in an async task, where blocking would stall the runtime: use the async store there, or call it
+  through tokio's `spawn_blocking` or `block_in_place`, where it works.
 - Changes say which path changed, not what it now contains.
 - A read always returns a whole file, never a partly written one.
 - On the filesystem, a commit that a crash interrupts is finished when a store next opens the area

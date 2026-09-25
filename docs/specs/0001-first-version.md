@@ -296,7 +296,11 @@ SQLite database per Area, or in memory.
   - If the feed is dropped, the Store stops recording Changes.
 - **Errors**: one `#[non_exhaustive]` error type with `InvalidPath`, `NotText { path }`,
   `Conflict { paths }`, `Pending`, `Unsupported` and `Backend` (wrapping the underlying error). A
-  missing File is `Ok(None)`, not an error.
+  missing File is `Ok(None)`, not an error. The blocking Change feed's `next_timeout` gives a type
+  of its own, `blocking::TimedOut`, when nothing arrived in time (ticket 12). That isn't an
+  operation's error: nothing went wrong, and the app chose how long to wait, as with `std`'s
+  `recv_timeout` or tokio's `timeout`. As a variant of `Error`, every `match` on the errors of
+  reads and Commits would have to handle a case none of them can give.
 - **Blocking**: behind the `blocking` feature, a `blocking::Store` that runs its own internal tokio
   runtime (as `reqwest::blocking` does), mirroring every operation. It comes with a blocking way to
   wait for the next item on the Change feed. It panics if used inside an async runtime.
@@ -311,10 +315,15 @@ SQLite database per Area, or in memory.
     Commit has finished and been reported.
   - The blocking Change feed is an `Iterator` that waits for each item and ends as the async one
     does, and `next_timeout` waits for a while only, giving `TimedOut` if nothing arrived.
-  - Every method panics inside a tokio runtime, including those that don't wait
-    (`supports_snapshots`), so the rule is simple. Dropping is allowed anywhere: dropped inside
-    one, the last handle lets the runtime's threads finish in the background, since tokio doesn't
-    allow waiting for them there.
+  - Every method that waits panics where blocking would stall a tokio runtime or deadlock it: in
+    an async task, or in a runtime's `block_on`. Where tokio allows blocking, it works: in
+    `spawn_blocking` or `block_in_place`, which is how async code calls blocking code. Only tokio
+    can tell those apart, and its public API tells only by refusing to block, so the Store asks it
+    first, blocking on a future that does nothing, and panics with its own message, naming the
+    call, if tokio refuses. The methods that don't wait (`open_memory`, `supports_snapshots`) work
+    anywhere. Dropping is allowed anywhere: dropped in a runtime's context, the last handle lets
+    the runtime's threads finish in the background, since tokio may not allow waiting for them
+    there.
 
 ### What every Backend must provide (internal)
 

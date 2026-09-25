@@ -25,14 +25,14 @@ mod memory {
     behaviour_suite!(Memory);
 
     mod blocking {
-        use crate::api::off_runtime;
+        use crate::api::call_blocking;
         use crate::suite::{Fixture, Opened};
 
         struct BlockingMemory;
 
         impl Fixture for BlockingMemory {
             async fn open(&self) -> Opened {
-                off_runtime(tidings::blocking::Store::open_memory).into()
+                call_blocking(tidings::blocking::Store::open_memory).into()
             }
         }
 
@@ -53,10 +53,10 @@ mod sqlite {
     use std::time::Duration;
 
     use tempfile::TempDir;
-    use tidings::{AppIdentity, Area, ChangeKind, FeedItem, Origin, SqliteOptions, Staging};
+    use tidings::{Area, ChangeKind, FeedItem, Origin, SqliteOptions, Staging};
 
     use crate::api::Store;
-    use crate::common::{assert_nothing_more, changes_in_full, next_batch, next_item};
+    use crate::common::{app, assert_nothing_more, changes_in_full, next_batch, next_item};
     use crate::suite::{Fixture, Opened};
 
     /// Opens each test's Store under a temporary Root override of its own, removed when the test
@@ -92,16 +92,13 @@ mod sqlite {
         }
     }
 
-    fn app() -> AppIdentity {
-        AppIdentity::new("tidings tests", "tidings", "org")
-    }
-
     behaviour_suite!(Sqlite::new());
     two_stores_suite!(Sqlite::new());
 
     mod blocking {
-        use super::{Sqlite, app};
-        use crate::api::off_runtime;
+        use super::Sqlite;
+        use crate::api::call_blocking;
+        use crate::common::app;
         use crate::suite::{Fixture, Opened};
 
         /// Opens each Store through the blocking API, as [`Sqlite`] does through the async one.
@@ -110,7 +107,7 @@ mod sqlite {
         impl Fixture for BlockingSqlite {
             async fn open(&self) -> Opened {
                 let options = self.0.usual_options();
-                off_runtime(|| tidings::blocking::Store::open_sqlite(&app(), options))
+                call_blocking(|| tidings::blocking::Store::open_sqlite(&app(), options))
                     .unwrap()
                     .into()
             }
@@ -186,12 +183,14 @@ mod fs {
 
     use tempfile::TempDir;
     use tidings::{
-        AppIdentity, Area, ChangeKind, Error, FailurePoint, FeedItem, FsOptions, InvalidPathReason,
-        Origin, Pause, PrefixRevision, Revision, Staging,
+        Area, ChangeKind, Error, FailurePoint, FeedItem, FsOptions, InvalidPathReason, Origin,
+        Pause, PrefixRevision, Revision, Staging,
     };
 
     use crate::api::Store;
-    use crate::common::{assert_nothing_more, changes, changes_in_full, next_batch, next_item};
+    use crate::common::{
+        app, assert_nothing_more, changes, changes_in_full, next_batch, next_item,
+    };
     use crate::suite::{Fixture, Opened};
 
     /// Opens each test's Store under a temporary Root override of its own, removed when the test
@@ -244,18 +243,15 @@ mod fs {
         }
     }
 
-    fn app() -> AppIdentity {
-        AppIdentity::new("tidings tests", "tidings", "org")
-    }
-
     behaviour_suite!(Fs::new());
     // Not `in_step:`: see the README's Consistency section.
     two_stores_suite!(committing: Fs::new());
     two_stores_suite!(seeing_each_other: Fs::new());
 
     mod blocking {
-        use super::{Fs, app};
-        use crate::api::off_runtime;
+        use super::Fs;
+        use crate::api::call_blocking;
+        use crate::common::app;
         use crate::suite::{Fixture, Opened};
 
         /// Opens each Store through the blocking API, as [`Fs`] does through the async one.
@@ -264,7 +260,7 @@ mod fs {
         impl Fixture for BlockingFs {
             async fn open(&self) -> Opened {
                 let options = self.0.usual_options();
-                off_runtime(|| tidings::blocking::Store::open_fs(&app(), options)).unwrap().into()
+                call_blocking(|| tidings::blocking::Store::open_fs(&app(), options)).unwrap().into()
             }
         }
 

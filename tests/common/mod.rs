@@ -4,10 +4,12 @@
 
 use std::time::Duration;
 
+use tidings::blocking::TimedOut;
 use tidings::{Area, Change, ChangeFeed, ChangeKind, FeedItem, Origin};
 
 /// A Change feed the helpers can wait on: the async one, or the behaviour suite's stand-in, which
-/// can also be the blocking one.
+/// can also be the blocking one. tidings' own tests always have the `blocking` feature, so the
+/// async one gives the blocking one's [`TimedOut`] too.
 pub trait Feed {
     /// Waits up to `timeout` for the next item, giving what `next` would, or [`TimedOut`] if
     /// nothing arrived in time.
@@ -16,10 +18,6 @@ pub trait Feed {
         timeout: Duration,
     ) -> impl Future<Output = Result<Option<FeedItem>, TimedOut>>;
 }
-
-/// Nothing arrived on the Change feed in time.
-#[derive(Debug)]
-pub struct TimedOut;
 
 impl Feed for ChangeFeed {
     async fn next_within(&mut self, timeout: Duration) -> Result<Option<FeedItem>, TimedOut> {
@@ -51,12 +49,23 @@ pub fn changes(batch: &[Change]) -> Vec<(&str, ChangeKind)> {
     batch.iter().map(|change| (change.path.as_str(), change.kind)).collect()
 }
 
+/// Each Change's Path and Origin, for comparing, where the Area and kind go without saying.
+pub fn paths_and_origins(batch: &[Change]) -> Vec<(&str, Origin)> {
+    batch.iter().map(|change| (change.path.as_str(), change.origin)).collect()
+}
+
 /// Everything about each Change, for comparing.
 pub fn changes_in_full(batch: &[Change]) -> Vec<(Area, &str, ChangeKind, Origin)> {
     batch
         .iter()
         .map(|change| (change.area, change.path.as_str(), change.kind, change.origin))
         .collect()
+}
+
+/// The App identity every test opens its Stores for, each on a Root override of its own.
+#[cfg(any(feature = "fs", feature = "sqlite"))]
+pub fn app() -> tidings::AppIdentity {
+    tidings::AppIdentity::new("tidings tests", "tidings", "org")
 }
 
 /// Checks that nothing more arrives on the Change feed for a short while.

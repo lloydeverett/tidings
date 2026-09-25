@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use tidings::{Area, ChangeKind, Error, FeedItem, Origin, Staging};
+use tidings::{Area, Change, ChangeKind, Error, FeedItem, Origin, Staging};
 
 use crate::api::{ChangeFeed, Store};
 use crate::common::{assert_nothing_more, changes_in_full, next_batch, next_item};
@@ -261,9 +261,9 @@ async fn race_then_mark(fixture: &impl Fixture, marked_by: Marker) {
         if marked_by == Marker::BySecondStore {
             feeds.push(&mut third_feed);
         }
-        for feed in feeds {
-            let said = kind_until(feed, "raced.txt", &marker).await;
-            assert_eq!(said, Some(expected), "round {round}");
+        for (index, feed) in feeds.into_iter().enumerate() {
+            let (said, read) = kind_until(feed, "raced.txt", &marker).await;
+            assert_eq!(said, Some(expected), "round {round}, feed {index}, which gave {read:#?}");
         }
     }
 }
@@ -318,20 +318,26 @@ async fn add_one(store: &Store) -> bool {
 }
 
 /// Reads the Change feed until a Change to `marker` arrives, and gives the kind of the last Change
-/// to `path` before it, or in the same batch.
-async fn kind_until(feed: &mut ChangeFeed, path: &str, marker: &str) -> Option<ChangeKind> {
+/// to `path` before it, or in the same batch, with every batch it read, to show if it is wrong.
+async fn kind_until(
+    feed: &mut ChangeFeed,
+    path: &str,
+    marker: &str,
+) -> (Option<ChangeKind>, Vec<Vec<Change>>) {
     let mut kind = None;
+    let mut read = Vec::new();
     loop {
         let batch = next_batch(feed).await;
         let mut marked = false;
-        for change in batch {
+        for change in &batch {
             if change.path.as_str() == path {
                 kind = Some(change.kind);
             }
             marked |= change.path.as_str() == marker;
         }
+        read.push(batch);
         if marked {
-            return kind;
+            return (kind, read);
         }
     }
 }

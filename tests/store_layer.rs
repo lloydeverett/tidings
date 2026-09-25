@@ -27,13 +27,11 @@ fn a_store_and_its_futures_can_be_shared_between_threads() {
     send(feed.next());
     #[cfg(feature = "fs")]
     {
-        let app = tidings::AppIdentity::new("tidings tests", "tidings", "org");
-        send(Store::open_fs(&app, tidings::FsOptions::default()));
+        send(Store::open_fs(&common::app(), tidings::FsOptions::default()));
     }
     #[cfg(feature = "sqlite")]
     {
-        let app = tidings::AppIdentity::new("tidings tests", "tidings", "org");
-        send(Store::open_sqlite(&app, tidings::SqliteOptions::default()));
+        send(Store::open_sqlite(&common::app(), tidings::SqliteOptions::default()));
     }
 }
 

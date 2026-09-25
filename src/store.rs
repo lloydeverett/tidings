@@ -259,7 +259,7 @@ impl Store {
     /// that changes nothing sends none. This Store's Commits reach the feed in the order they were
     /// made. On SQLite, other Stores' Commits do too, in order with this Store's. On the
     /// filesystem, they arrive once their events have settled, so this Store's own next Commit
-    /// can reach the feed first (see [`open_fs`](Self::open_fs)).
+    /// can reach the feed first (see `open_fs`, with the `fs` feature).
     /// On success, gives the timestamp and the new Revisions.
     ///
     /// Nothing is written if the Commit fails:
