@@ -70,8 +70,10 @@ See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
   reach its change feed while the app isn't calling it. The change feed is an iterator that waits
   for each item, and `next_timeout` waits for a while only. The runtime stops once the store, its
   snapshots and its change feed have all been dropped. A method that waits panics if it is called
-  in an async task, where blocking would stall the runtime: use the async store there, or call it
-  through tokio's `spawn_blocking` or `block_in_place`, where it works.
+  in an async task, or a runtime's `block_on`, where blocking would stall the runtime: use the
+  async store there, or call it through tokio's `spawn_blocking` or `block_in_place`, where it
+  works. The panic names your call; built with `panic = "abort"`, the process ends with tokio's
+  own panic instead, which names a line in tokio.
 - Changes say which path changed, not what it now contains.
 - A read always returns a whole file, never a partly written one.
 - On the filesystem, a commit that a crash interrupts is finished when a store next opens the area

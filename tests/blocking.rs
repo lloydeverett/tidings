@@ -4,7 +4,6 @@
 
 mod common;
 
-use std::panic::{self, AssertUnwindSafe};
 use std::thread;
 use std::time::Duration;
 
@@ -28,7 +27,7 @@ fn a_blocking_store_and_what_it_gives_can_be_shared_between_threads() {
 #[test]
 fn waiting_in_an_async_task_panics_on_a_multi_threaded_runtime() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let opened = Opened::new();
+    let opened = Handles::new();
     runtime.block_on(runtime.spawn(async move { every_wait_panics(opened) })).unwrap();
 }
 
@@ -36,7 +35,7 @@ fn waiting_in_an_async_task_panics_on_a_multi_threaded_runtime() {
 #[test]
 fn waiting_in_an_async_task_panics_on_a_current_thread_runtime() {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    let opened = Opened::new();
+    let opened = Handles::new();
     runtime.block_on(async move { every_wait_panics(opened) });
 }
 
@@ -108,11 +107,7 @@ fn an_injected_external_change_reaches_the_change_feed() {
 #[test]
 fn another_stores_commits_arrive_while_the_app_is_not_calling_the_store() {
     let root = tempfile::tempdir().unwrap();
-    let options = || {
-        tidings::SqliteOptions::default()
-            .root_override(root.path())
-            .poll_interval(Duration::from_millis(10))
-    };
+    let options = || sqlite_options(root.path()).poll_interval(Duration::from_millis(10));
     let (_store, mut feed) = Store::open_sqlite(&app(), options()).unwrap();
     let (other, _other_feed) = Store::open_sqlite(&app(), options()).unwrap();
 
@@ -132,9 +127,7 @@ fn another_stores_commits_arrive_while_the_app_is_not_calling_the_store() {
 #[test]
 fn edits_in_an_area_arrive_while_the_app_is_not_calling_the_store() {
     let root = tempfile::tempdir().unwrap();
-    let options = tidings::FsOptions::default()
-        .root_override(root.path())
-        .debounce_window(Duration::from_millis(20));
+    let options = fs_options(root.path()).debounce_window(Duration::from_millis(20));
     let (_store, mut feed) = Store::open_fs(&app(), options).unwrap();
 
     std::fs::write(root.path().join("config").join("settings.toml"), "a = 1\n").unwrap();
@@ -154,9 +147,7 @@ fn a_commit_in_progress_finishes_and_is_reported_when_every_other_handle_is_drop
 
     let root = tempfile::tempdir().unwrap();
     let pause = Pause::new();
-    let options = tidings::FsOptions::default()
-        .root_override(root.path())
-        .pause_at(FailurePoint::AfterCommittedJournal, &pause);
+    let options = fs_options(root.path()).pause_at(FailurePoint::AfterCommittedJournal, &pause);
     let (store, mut feed) = Store::open_fs(&app(), options).unwrap();
 
     let committing = {
@@ -177,16 +168,27 @@ fn a_commit_in_progress_finishes_and_is_reported_when_every_other_handle_is_drop
     let batch = batch_of(item);
     assert_eq!(paths_and_origins(&batch), [("in-progress.txt", Origin::Local)],);
     assert_eq!(feed.next_timeout(Duration::from_secs(5)), Ok(None));
-    let (store, _feed) =
-        Store::open_fs(&app(), tidings::FsOptions::default().root_override(root.path())).unwrap();
+    let (store, _feed) = Store::open_fs(&app(), fs_options(root.path())).unwrap();
     assert_eq!(store.read(Area::Data, "in-progress.txt").unwrap().unwrap().contents(), "x");
 }
 
 // Helpers shared by the tests above.
 
+/// Options that open a filesystem Store on `root`.
+#[cfg(feature = "fs")]
+fn fs_options(root: &std::path::Path) -> tidings::FsOptions {
+    tidings::FsOptions::default().root_override(root)
+}
+
+/// Options that open a SQLite Store on `root`.
+#[cfg(feature = "sqlite")]
+fn sqlite_options(root: &std::path::Path) -> tidings::SqliteOptions {
+    tidings::SqliteOptions::default().root_override(root)
+}
+
 /// A Store opened through the blocking API, with a Snapshot and its Change feed, to call in
 /// places where blocking isn't allowed.
-struct Opened {
+struct Handles {
     #[cfg(any(feature = "fs", feature = "sqlite"))]
     root: tempfile::TempDir,
     store: Store,
@@ -194,11 +196,11 @@ struct Opened {
     feed: ChangeFeed,
 }
 
-impl Opened {
-    fn new() -> Opened {
+impl Handles {
+    fn new() -> Handles {
         let (store, feed) = Store::open_memory();
         let snapshot = store.snapshot(Area::Data).unwrap();
-        Opened {
+        Handles {
             #[cfg(any(feature = "fs", feature = "sqlite"))]
             root: tempfile::tempdir().unwrap(),
             store,
@@ -209,17 +211,14 @@ impl Opened {
 }
 
 /// Checks that every method that waits panics where it is called. Those that don't wait needn't.
-fn every_wait_panics(opened: Opened) {
-    let Opened { store, snapshot, mut feed, .. } = opened;
+fn every_wait_panics(handles: Handles) {
+    let Handles { store, snapshot, mut feed, .. } = handles;
     #[cfg(feature = "fs")]
-    assert_panics_here("open_fs", || {
-        Store::open_fs(&app(), tidings::FsOptions::default().root_override(opened.root.path()))
-    });
+    assert_panics_here("open_fs", || Store::open_fs(&app(), fs_options(handles.root.path())));
     #[cfg(feature = "sqlite")]
-    assert_panics_here("open_sqlite", || {
-        let options = tidings::SqliteOptions::default().root_override(opened.root.path());
-        Store::open_sqlite(&app(), options)
-    });
+    let sqlite_options = sqlite_options(handles.root.path());
+    #[cfg(feature = "sqlite")]
+    assert_panics_here("open_sqlite", || Store::open_sqlite(&app(), sqlite_options));
     assert_panics_here("read", || store.read(Area::Data, "a.txt"));
     assert_panics_here("stat", || store.stat(Area::Data, "a.txt"));
     assert_panics_here("list", || store.list(Area::Data, ""));
@@ -244,18 +243,9 @@ fn every_wait_works() {
     let mut opened = Vec::new();
     opened.push(Store::open_memory());
     #[cfg(feature = "fs")]
-    opened.push(
-        Store::open_fs(&app(), tidings::FsOptions::default().root_override(root.path().join("fs")))
-            .unwrap(),
-    );
+    opened.push(Store::open_fs(&app(), fs_options(&root.path().join("fs"))).unwrap());
     #[cfg(feature = "sqlite")]
-    opened.push(
-        Store::open_sqlite(
-            &app(),
-            tidings::SqliteOptions::default().root_override(root.path().join("sqlite")),
-        )
-        .unwrap(),
-    );
+    opened.push(Store::open_sqlite(&app(), sqlite_options(&root.path().join("sqlite"))).unwrap());
 
     for (store, mut feed) in opened {
         let mut staging = Staging::new(Area::Data);
@@ -279,19 +269,65 @@ fn every_wait_works() {
     }
 }
 
-/// Checks that `call` panics where it is made, saying it was called in an async task.
+/// Checks that `call` panics, saying it was called in an async task, and naming where it was
+/// called: the line calling this, where `call` must be written.
 #[track_caller]
 fn assert_panics_here<T>(doing: &str, call: impl FnOnce() -> T) {
-    let panicked = match panic::catch_unwind(AssertUnwindSafe(call)) {
+    let here = std::panic::Location::caller();
+    let panicked = match panic_location::catch(call) {
         Ok(_) => panic!("{doing} should panic in an async task"),
         Err(panicked) => panicked,
     };
-    let message = match (panicked.downcast_ref::<&str>(), panicked.downcast_ref::<String>()) {
+    let message = match (
+        panicked.payload.downcast_ref::<&str>(),
+        panicked.payload.downcast_ref::<String>(),
+    ) {
         (Some(message), _) => message.to_string(),
         (_, Some(message)) => message.clone(),
         _ => panic!("{doing} should panic with a message"),
     };
     assert!(message.contains("called in an async task"), "{doing}: {message}");
+    assert_eq!(panicked.at, (here.file().to_owned(), here.line()), "{doing}: where it panicked");
+}
+
+/// Catching a panic together with where it happened, which its payload doesn't say.
+mod panic_location {
+    use std::any::Any;
+    use std::cell::RefCell;
+    use std::panic::{self, AssertUnwindSafe};
+    use std::sync::Once;
+
+    /// A panic that was caught.
+    pub struct Caught {
+        pub payload: Box<dyn Any + Send>,
+        /// The file and line it happened at.
+        pub at: (String, u32),
+    }
+
+    thread_local! {
+        /// Where the last panic on this thread happened. Each thread has its own, so tests
+        /// running at once don't mix theirs up.
+        static LAST: RefCell<Option<(String, u32)>> = const { RefCell::new(None) };
+    }
+
+    /// Makes `call`, and gives what it gave, or its panic and where that happened. The last
+    /// panic on the thread is the one caught: tokio's refusal to block comes first, then the
+    /// Store's.
+    pub fn catch<T>(call: impl FnOnce() -> T) -> Result<T, Caught> {
+        static HOOK: Once = Once::new();
+        HOOK.call_once(|| {
+            let printing = panic::take_hook();
+            panic::set_hook(Box::new(move |info| {
+                let at = info.location().map(|at| (at.file().to_owned(), at.line()));
+                LAST.with(|last| *last.borrow_mut() = at);
+                printing(info);
+            }));
+        });
+        panic::catch_unwind(AssertUnwindSafe(call)).map_err(|payload| Caught {
+            payload,
+            at: LAST.with(|last| last.borrow_mut().take()).unwrap_or_default(),
+        })
+    }
 }
 
 /// The Changes in `item`, which must be a batch.

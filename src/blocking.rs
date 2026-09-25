@@ -11,7 +11,8 @@
 //! Every method that waits panics if it is called where blocking would stall a tokio runtime or
 //! deadlock it: in an async task, or in a runtime's own `block_on`. Use the async
 //! [`crate::Store`] there. Where tokio allows blocking, it works: on a plain thread, and in a
-//! runtime's `spawn_blocking` or `block_in_place`. Dropping is allowed anywhere.
+//! runtime's `spawn_blocking` or `block_in_place`. Dropping is allowed anywhere. (Built with
+//! `panic = "abort"`, the process ends with tokio's own message instead, located in tokio.)
 
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
@@ -93,7 +94,8 @@ impl Store {
     ///
     /// # Panics
     ///
-    /// If it is called in an async task, or the internal runtime can't be started.
+    /// If it is called in an async task, or a runtime's `block_on`, or the internal runtime
+    /// can't be started.
     #[cfg(feature = "fs")]
     #[track_caller]
     pub fn open_fs(app: &AppIdentity, options: FsOptions) -> Result<(Store, ChangeFeed)> {
@@ -108,7 +110,8 @@ impl Store {
     ///
     /// # Panics
     ///
-    /// If it is called in an async task, or the internal runtime can't be started.
+    /// If it is called in an async task, or a runtime's `block_on`, or the internal runtime
+    /// can't be started.
     #[cfg(feature = "sqlite")]
     #[track_caller]
     pub fn open_sqlite(app: &AppIdentity, options: SqliteOptions) -> Result<(Store, ChangeFeed)> {
@@ -130,7 +133,7 @@ impl Store {
     ///
     /// # Panics
     ///
-    /// If it is called in an async task.
+    /// If it is called in an async task, or a runtime's `block_on`.
     #[track_caller]
     pub fn read(&self, area: Area, path: impl IntoPath) -> Result<Option<File>> {
         self.runtime.block_on(self.store.read(area, path))
@@ -141,7 +144,7 @@ impl Store {
     ///
     /// # Panics
     ///
-    /// If it is called in an async task.
+    /// If it is called in an async task, or a runtime's `block_on`.
     #[track_caller]
     pub fn stat(&self, area: Area, path: impl IntoPath) -> Result<Option<Stat>> {
         self.runtime.block_on(self.store.stat(area, path))
@@ -151,7 +154,7 @@ impl Store {
     ///
     /// # Panics
     ///
-    /// If it is called in an async task.
+    /// If it is called in an async task, or a runtime's `block_on`.
     #[track_caller]
     pub fn list(&self, area: Area, prefix: impl IntoPrefix) -> Result<Vec<Path>> {
         self.runtime.block_on(self.store.list(area, prefix))
@@ -162,7 +165,7 @@ impl Store {
     ///
     /// # Panics
     ///
-    /// If it is called in an async task.
+    /// If it is called in an async task, or a runtime's `block_on`.
     #[track_caller]
     pub fn stat_prefix(&self, area: Area, prefix: impl IntoPrefix) -> Result<PrefixRevision> {
         self.runtime.block_on(self.store.stat_prefix(area, prefix))
@@ -178,7 +181,7 @@ impl Store {
     ///
     /// # Panics
     ///
-    /// If it is called in an async task.
+    /// If it is called in an async task, or a runtime's `block_on`.
     #[track_caller]
     pub fn snapshot(&self, area: Area) -> Result<Snapshot> {
         let snapshot = self.runtime.block_on(self.store.snapshot(area))?;
@@ -190,7 +193,7 @@ impl Store {
     ///
     /// # Panics
     ///
-    /// If it is called in an async task.
+    /// If it is called in an async task, or a runtime's `block_on`.
     #[track_caller]
     pub fn commit(&self, staging: Staging) -> Result<Committed> {
         self.runtime.block_on(self.store.commit(staging))
@@ -215,7 +218,7 @@ impl Snapshot {
     ///
     /// # Panics
     ///
-    /// If it is called in an async task.
+    /// If it is called in an async task, or a runtime's `block_on`.
     #[track_caller]
     pub fn read(&self, path: impl IntoPath) -> Result<Option<File>> {
         self.runtime.block_on(self.snapshot.read(path))
@@ -226,7 +229,7 @@ impl Snapshot {
     ///
     /// # Panics
     ///
-    /// If it is called in an async task.
+    /// If it is called in an async task, or a runtime's `block_on`.
     #[track_caller]
     pub fn stat(&self, path: impl IntoPath) -> Result<Option<Stat>> {
         self.runtime.block_on(self.snapshot.stat(path))
@@ -237,7 +240,7 @@ impl Snapshot {
     ///
     /// # Panics
     ///
-    /// If it is called in an async task.
+    /// If it is called in an async task, or a runtime's `block_on`.
     #[track_caller]
     pub fn list(&self, prefix: impl IntoPrefix) -> Result<Vec<Path>> {
         self.runtime.block_on(self.snapshot.list(prefix))
@@ -250,7 +253,7 @@ impl ChangeFeed {
     ///
     /// # Panics
     ///
-    /// If it is called in an async task.
+    /// If it is called in an async task, or a runtime's `block_on`.
     #[track_caller]
     pub fn next_timeout(&mut self, timeout: Duration) -> Result<Option<FeedItem>, TimedOut> {
         // Made on the runtime, since a timer needs one.
@@ -268,7 +271,7 @@ impl Iterator for ChangeFeed {
     ///
     /// # Panics
     ///
-    /// If it is called in an async task.
+    /// If it is called in an async task, or a runtime's `block_on`.
     #[track_caller]
     fn next(&mut self) -> Option<FeedItem> {
         self.runtime.block_on(self.feed.next())
@@ -341,9 +344,9 @@ fn refuse_if_blocking_would_stall(tokio: &tokio::runtime::Runtime) {
     }
     if panic::catch_unwind(AssertUnwindSafe(|| tokio.block_on(async {}))).is_err() {
         panic!(
-            "tidings' blocking API was called in an async task, where blocking would stall the \
-             runtime or deadlock it: use the async `tidings::Store` there, or call it through \
-             `spawn_blocking`"
+            "tidings' blocking API was called in an async task, or a runtime's `block_on`, where \
+             blocking would stall the runtime or deadlock it: use the async `tidings::Store` \
+             there, or call it through `spawn_blocking` or `block_in_place`"
         );
     }
 }

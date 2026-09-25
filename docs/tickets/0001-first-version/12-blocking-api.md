@@ -49,7 +49,7 @@ can wait for the Change feed on a plain thread.
 - The Change feed is an `Iterator` (waits for each item, ends as the async one does) with
   `next_timeout(Duration) -> Result<Option<FeedItem>, TimedOut>` for waiting a while only.
 - Every method that waits panics, with one message, at the caller (`#[track_caller]`), where
-  blocking would stall a runtime: in an async task, or in a current-thread runtime's `block_on`.
+  blocking would stall a runtime: in an async task, or in a runtime's `block_on`.
   In `spawn_blocking` and `block_in_place` it works, as tokio's own `block_on` does. Only tokio
   can tell those apart, and its public API tells only by refusing to block, so the Store first
   blocks its runtime on a future that does nothing, under `catch_unwind`: only tokio's refusal can

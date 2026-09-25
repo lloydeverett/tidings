@@ -303,7 +303,8 @@ SQLite database per Area, or in memory.
   reads and Commits would have to handle a case none of them can give.
 - **Blocking**: behind the `blocking` feature, a `blocking::Store` that runs its own internal tokio
   runtime (as `reqwest::blocking` does), mirroring every operation. It comes with a blocking way to
-  wait for the next item on the Change feed. It panics if used inside an async runtime.
+  wait for the next item on the Change feed. It panics if it would block where that stalls an
+  async runtime (see below).
 
   Settled while building it (ticket 12):
   - The runtime is multi-threaded with one worker, so the tasks that follow other Stores' Commits
@@ -320,8 +321,9 @@ SQLite database per Area, or in memory.
     `spawn_blocking` or `block_in_place`, which is how async code calls blocking code. Only tokio
     can tell those apart, and its public API tells only by refusing to block, so the Store asks it
     first, blocking on a future that does nothing, and panics with its own message, naming the
-    call, if tokio refuses. The methods that don't wait (`open_memory`, `supports_snapshots`) work
-    anywhere. Dropping is allowed anywhere: dropped in a runtime's context, the last handle lets
+    call, if tokio refuses. Built with `panic = "abort"`, tokio's refusal ends the process first,
+    with tokio's message, located in tokio. The methods that don't wait (`open_memory`,
+    `supports_snapshots`, `inject_external_change`) work anywhere. Dropping is allowed anywhere: dropped in a runtime's context, the last handle lets
     the runtime's threads finish in the background, since tokio may not allow waiting for them
     there.
 
@@ -473,7 +475,9 @@ other difference is *external*.
   the same approach as OpenDAL's behaviour tests, which run one suite against every service.
   - The suite's tests are async, and use a test-only Store, Snapshot and Change feed with the async
     API's methods, which call either API. Each Backend runs the suite through both: through the
-    blocking one, each call, dropping included, is made on a plain thread and waited for.
+    blocking one, each call is made in `block_in_place`, as async code calls blocking code (on a
+    plain thread only on a current-thread runtime, which can't), and handles are dropped where the
+    test drops them.
   - Each test opens a Store on its own temporary Root override.
   - Tests use a short debounce window, and wait on the Change feed with timeouts.
 - **Simulating changes from outside tidings:**

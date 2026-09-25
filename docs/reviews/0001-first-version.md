@@ -2075,3 +2075,129 @@ Clippy (`--all-targets` and without) is clean with default features, `--all-feat
 `--no-default-features`, `blocking`, `blocking,fs`, `blocking,sqlite`, `fs`, `sqlite` and default
 plus `blocking`. So is rustfmt. `cargo test` passes with default features, `--no-default-features`
 and `--all-features`: 329 behaviour tests and 11 blocking tests (8 without `fs` and `sqlite`).
+
+### Re-review (after the fix commit 8eef80c)
+
+The fix added a new way of detecting whether a blocking call would stall a runtime, and investigated the flaky ordering test. The detection mechanism is new, so `git diff c566fb1...8eef80c` was reviewed again on both axes.
+
+#### Standards
+
+**Claimed fixes:** all present.
+- **Panic check (c1):** `refuse_if_blocking_would_stall` (src/blocking.rs:338-348). The methods that don't wait no longer call it or carry `#[track_caller]`.
+- **`TimedOut`:** the spec now explains why it is a separate type (spec lines 299-303), and the test copy is gone. That settles the earlier judgement call.
+- **Smells:** all four fixed.
+  - `app()` is shared at tests/common/mod.rs:66.
+  - `paths_and_origins` is at tests/common/mod.rs:53.
+  - `batch_of` is at tests/blocking.rs:298.
+  - `SharedRuntime`, with a `tokio` field, is at src/blocking.rs:282.
+- **Doc links:** now plain code spans (src/lib.rs:5, src/change.rs:74, src/store.rs:262).
+
+**(a) Breaches of documented standards**
+
+1. **Hard: the spec's Testing Decisions now describe the old approach.** docs/specs/0001-first-version.md:474-476 still says "through the blocking one, each call, dropping included, is made on a plain thread and waited for".
+   - The fix replaced that approach. `OffRuntime` is gone, calls go through `block_in_place`, and handles drop where the test drops them (tests/behaviour/api.rs:165-176).
+   - The ticket was updated but this spec line wasn't. Either amend it or keep the old approach.
+2. **Soft: the spec contradicts itself.**
+   - Spec :307 still says "It panics if used inside an async runtime", while the sub-bullet at :319-327 now narrows that rule.
+   - The same sub-bullet lists only `open_memory` and `supports_snapshots` as working anywhere, but the ticket and src/blocking.rs:200-203 also include `inject_external_change`.
+3. **Glossary: nothing new.** The new text uses "watcher", "events" and "batch" for the notify watcher, filesystem events and feed batches. None of these is the meaning CONTEXT.md's `_Avoid_` lists guard against, and earlier reviews accepted them.
+
+**(b) Baseline smells (all judgement calls)**
+
+- **Mysterious Name:** tests/blocking.rs:189 `struct Opened` has the same name as `suite::Opened` (tests/behaviour/suite.rs:25) but is a different thing. It's the same pattern as the `changes()` name that was just fixed. `Handles` or `OpenedMemory` would be clearer.
+- **Duplicated Code:** the code that opens a filesystem or SQLite Store on a Root override appears four times in tests/blocking.rs. The filesystem form, `Store::open_fs(&app(), tidings::FsOptions::default().root_override(...))`, is at :181, :216 and :248, and the SQLite form at :220 and :255. Minor.
+- **Misleading wording (not a baseline smell):**
+  - Every `# Panics` line says "If it is called in an async task" (src/blocking.rs:96-271), but the module doc and the check also cover a runtime's `block_on` itself.
+  - The panic message (:344-346) suggests only `spawn_blocking`, while the README and the module doc also name `block_in_place`. Adding "or block_in_place" would make them match.
+- **Coupling (judgement call):** tests/common/mod.rs:7 imports `tidings::blocking::TimedOut` for the async helpers too, so the async tests depend on the `blocking` feature. The dev-dependency always enables it (Cargo.toml dev-deps), and the doc at :11-12 says so. Acceptable.
+- **Repeated Switches / Middle Man:** still present, and still overridden by the spec, as before.
+
+**Nothing new stood out in the fix itself.**
+- The `catch_unwind` probe under `AssertUnwindSafe` is sound, because the future does nothing.
+- The drop path deliberately keeps `Handle::try_current()`, and the documentation at :315-317 says why.
+- The tests still use only the public API, plus the documented `testing` exception.
+
+**Summary:** 1 hard point (the spec's Testing Decisions at :474-476 no longer match how the suite calls the blocking API), 1 soft point on the spec's wording, and 3 minor smells. Clippy was not run.
+
+#### Spec
+
+**Resolution item 1, the panic check: fixed, and correct.** A probe (scratchpad/probe12b) called `read` in each context, with a panic hook that counts panics.
+- **Panics, correctly:**
+  - a task on a multi-thread runtime's worker
+  - the body of a multi-thread `block_on` (`#[tokio::main]`)
+  - a current-thread `block_on`, and a task spawned inside it
+  - `LocalSet`: both `spawn_local` and its `block_on` body
+  - `Handle::block_on` inside `spawn_blocking`
+- **Works:**
+  - a plain thread
+  - `spawn_blocking`, on both runtime flavours
+  - `block_in_place`, from a task or from a `block_on` body
+  - a plain thread after `Handle::enter()`, on both flavours
+- **No spurious panic.** The hook fired 0 times in every allowed context. Each refusal fires it twice: tokio's panic, then tidings'. A crash reporter would log two events, but only when the call really is a mistake.
+- **Location:** tidings' panic points at the caller's line.
+- **After a refusal:** the worker keeps running, and a following `block_in_place` succeeds.
+- **Unwind safety is sound.** tokio 1.53.1 `context/runtime.rs:39-65` checks `is_entered()` before changing any state. The only other state is `Runtime::block_on`'s guard for the current handle, which unwinds in order.
+- **Cost:** about 35 ns per call when a runtime handle exists, against about 1.1 µs for a memory read. On a plain thread it's just a thread-local lookup.
+- **No cleaner public API exists.**
+  - `Handle::try_current` also sees a handle inside `spawn_blocking` and `block_in_place`.
+  - `task::try_id()` is `Some` in `spawn_blocking` and `block_in_place`, and `None` in a `block_on` body (probed), so it can't separate the cases either.
+  - The Resolution is right that `MultiThread::block_on` (`scheduler/multi_thread/mod.rs:87`) lacks `#[track_caller]`.
+
+**New findings (minor):**
+1. **`panic = "abort"`** (probed): the process aborts with tokio's message, located at `tokio-1.53.1/.../multi_thread/mod.rs:91` rather than at the caller. That is clear enough for story 62 ("a clear panic … rather than as a deadlock"). Only the Resolution and the comment at src/blocking.rs:334-336 say so. The README (around line 72) and the module doc (src/blocking.rs:11-14) don't.
+2. **The ticket note is narrower than the code.** docs/tickets/0001-first-version/12-blocking-api.md:52 says "in a current-thread runtime's `block_on`". The check also panics in a multi-thread runtime's `block_on`, which is correct and matches spec line 318 ("in a runtime's `block_on`"). Only the ticket note's wording needs fixing.
+3. **The panic's location is untested.** Spec:322 promises the panic "naming the call", but `assert_panics_here` (tests/blocking.rs:284) checks only the message, not the location. The probe shows the location is correct today, but losing `#[track_caller]` would go unnoticed.
+4. **The suite no longer reaches the waiting shutdown.** Handles are now dropped in async test code, so the suite only reaches `shutdown_background`. The waiting shutdown (src/blocking.rs:319-326) is covered only by tests/blocking.rs. This isn't a spec gap.
+
+**Resolution item 2, the flaky ordering test: the reasoning holds.**
+- notify-debouncer-full 0.7 `lib.rs:215-263` expires each event by its own age, and `sort_events` (lib.rs:733) merges each tick's events in time order.
+- An event's time is when each Store's watcher received it, which follows the kernel's order.
+- A rename carries over the temporary file's queue of events, times included.
+- One wrinkle: an overwrite can leave a queue out of time order (`[Remove@rename_time, Create@create_time…]`). Because the newest event is at the front, this only delays that queue's events. It can never put them ahead of a later Commit.
+- When a remove cancels a create, the debouncer drops the path's events. But `push_remove_event` first calls `remove_path`, which records the removal in `Removals`, and `take_settled` at the end of each burst (watch.rs:543) runs after the marker's events have settled.
+- **Could not reproduce.** The test ran for 15 minutes as 12 concurrent copies (6 async, 6 blocking), alongside 4 CPU hogs, a disk hog writing with fsync, and a full behaviour suite running in a loop. That was 240 runs (36,000 rounds) plus 8 full suites (329 tests passed each time), with no failures, at a load average of about 26.
+
+Nothing else wrong in the Resolution's other items.
+
+#### Summary
+
+Standards: every claimed fix is present. 1 hard point: the spec's Testing Decisions still describe the old plain-thread approach. 1 soft point on the spec's wording, and 3 minor smells. Spec: the new panic check is verified correct in every context probed, with no cleaner public API available. There are 4 minor findings; the worst is that under `panic = "abort"` the message and location are tokio's, and the README doesn't say so. The flaky ordering test's analysis holds, and 240 stress runs didn't reproduce it.
+
+
+#### Resolution
+
+1. **Standards (hard): the spec's Testing Decisions.** They now say how the suite calls the
+   blocking API:
+   - each call is made in `block_in_place`, as async code calls blocking code;
+   - a plain thread is used only on a current-thread runtime, which has no `block_in_place`;
+   - handles are dropped where the test drops them.
+2. **Spec wording:**
+   - The Blocking bullet now says it panics where blocking would stall an async runtime, and
+     points to the rule below it.
+   - That rule's list of methods that work anywhere now includes `inject_external_change`.
+   - The ticket note says "a runtime's `block_on`".
+3. **`panic = "abort"`:** the README and the module doc now say that such a build ends the
+   process with tokio's own panic, which names a line in tokio. The spec's rule says so too.
+4. **Panic wording:**
+   - Every `# Panics` line now says "in an async task, or a runtime's `block_on`".
+   - The message now names that too, and suggests `block_in_place` as well as `spawn_blocking`.
+5. **Location tested:**
+   - `assert_panics_here` now also checks that the panic names the file and line of the call.
+   - The location comes from a panic hook installed once, which records each thread's last panic
+     location in a thread-local, so tests running at once don't mix theirs up. It then chains to
+     the hook that prints.
+   - To check the test: with `#[track_caller]` removed from `read`, both panic tests fail with
+     `("src/blocking.rs", 138)` against `("tests/blocking.rs", 222)`.
+   - The two constructors' checks became one-liners, so each call is on the line the check
+     names.
+6. **Smells:**
+   - tests/blocking.rs's `Opened` is now `Handles`.
+   - The code that opens a Store on a Root override is now `fs_options(root)` and
+     `sqlite_options(root)`, used by every test in the file.
+
+The waiting shutdown stays covered by tests/blocking.rs, as asked.
+
+Clippy (`--all-targets` and without) is clean on the 9 feature sets used before. So is rustfmt,
+and so is `cargo doc --no-deps` with `-D warnings` on the 10 feature sets used before.
+`cargo test` passes with default features, `--no-default-features` and `--all-features`: 329
+behaviour tests, and 11 blocking tests (8 without `fs` and `sqlite`).
