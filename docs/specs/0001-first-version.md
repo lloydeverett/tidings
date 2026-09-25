@@ -301,6 +301,21 @@ SQLite database per Area, or in memory.
   runtime (as `reqwest::blocking` does), mirroring every operation. It comes with a blocking way to
   wait for the next item on the Change feed. It panics if used inside an async runtime.
 
+  Settled while building it (ticket 12):
+  - The runtime is multi-threaded with one worker, so the tasks that follow other Stores' Commits
+    and watch the Areas keep running between calls, not only while a call waits.
+  - The Store's clones, its blocking Snapshots and its blocking Change feed share the runtime (an
+    `Arc`), and the last of them to go shuts it down. A Snapshot holds the runtime, not the Store,
+    so the feed still ends once every Store handle has gone. A Commit can't be cancelled through
+    the blocking API, and a call in progress holds its handle, so the runtime runs until every
+    Commit has finished and been reported.
+  - The blocking Change feed is an `Iterator` that waits for each item and ends as the async one
+    does, and `next_timeout` waits for a while only, giving `TimedOut` if nothing arrived.
+  - Every method panics inside a tokio runtime, including those that don't wait
+    (`supports_snapshots`), so the rule is simple. Dropping is allowed anywhere: dropped inside
+    one, the last handle lets the runtime's threads finish in the background, since tokio doesn't
+    allow waiting for them there.
+
 ### What every Backend must provide (internal)
 
 Backends are private to the crate (not a public trait). Each Backend provides:
@@ -447,6 +462,9 @@ other difference is *external*.
 - **Main seam: the public Store API, run on every Backend.** One behaviour suite, written once, is
   instantiated for the filesystem, SQLite and memory Backends and for the blocking Store. This is
   the same approach as OpenDAL's behaviour tests, which run one suite against every service.
+  - The suite's tests are async, and use a test-only Store, Snapshot and Change feed with the async
+    API's methods, which call either API. Each Backend runs the suite through both: through the
+    blocking one, each call, dropping included, is made on a plain thread and waited for.
   - Each test opens a Store on its own temporary Root override.
   - Tests use a short debounce window, and wait on the Change feed with timeouts.
 - **Simulating changes from outside tidings:**

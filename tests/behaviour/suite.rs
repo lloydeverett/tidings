@@ -7,14 +7,16 @@ use std::time::Duration;
 
 use jiff::Timestamp;
 use tidings::{
-    Area, ChangeFeed, ChangeKind, Committed, Error, FeedItem, File, InvalidPathReason, Origin,
-    Path, Precondition, Snapshot, Staging, Store,
+    Area, ChangeKind, Committed, Error, FeedItem, File, InvalidPathReason, Origin, Path,
+    Precondition, Staging,
 };
 
+use crate::api::{ChangeFeed, Snapshot, Store};
 use crate::common::{assert_ended, assert_nothing_more, changes, changes_in_full, next_batch};
 
-/// How a Backend opens a fresh, empty Store for one test. Each test makes its own Fixture, so a
-/// Backend that keeps Files on disk holds the test's temporary Root override in it.
+/// How a Backend opens a fresh, empty Store for one test, through the async API or the blocking
+/// one. Each test makes its own Fixture, so a Backend that keeps Files on disk holds the test's
+/// temporary Root override in it.
 pub trait Fixture {
     async fn open(&self) -> Opened;
 }
@@ -23,6 +25,13 @@ pub trait Fixture {
 pub struct Opened {
     pub store: Store,
     pub feed: ChangeFeed,
+}
+
+/// A Store and its Change feed as an `open` function gives them, from either API.
+impl<S: Into<Store>, F: Into<ChangeFeed>> From<(S, F)> for Opened {
+    fn from((store, feed): (S, F)) -> Opened {
+        Opened { store: store.into(), feed: feed.into() }
+    }
 }
 
 /// Instantiates every test in the suite for one Backend's [`Fixture`].

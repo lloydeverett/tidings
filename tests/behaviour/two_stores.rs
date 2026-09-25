@@ -5,8 +5,9 @@
 
 use std::collections::BTreeMap;
 
-use tidings::{Area, ChangeFeed, ChangeKind, Error, FeedItem, Origin, Staging, Store};
+use tidings::{Area, ChangeKind, Error, FeedItem, Origin, Staging};
 
+use crate::api::{ChangeFeed, Store};
 use crate::common::{assert_nothing_more, changes_in_full, next_batch, next_item};
 use crate::suite::{Fixture, Opened};
 

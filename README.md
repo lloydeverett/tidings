@@ -4,13 +4,14 @@ Text files for an application, in three areas (config, data, cache), stored on t
 SQLite or in memory. Writes happen only through staged commits. Every change is reported on a
 change feed.
 
-Status: early. Stores in memory, on SQLite and on the filesystem exist so far: reading, stat and
-listing, commits of writes and deletes with preconditions, checked paths, the change feed,
-snapshots (not on the filesystem), and seeing other processes' commits to the same store. On the
-filesystem, commits are journaled, recovery is tested at every step, a commit whose rename keeps
-failing gives `Pending`, and the area directories are watched, so that people's edits and other
-processes' commits reach the change feed. Still to come: the blocking API. See
-[CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
+Status: the first version is complete, and early. Stores in memory, on SQLite and on the
+filesystem: reading, stat and listing, commits of writes and deletes with preconditions, checked
+paths, the change feed, snapshots (not on the filesystem), and seeing other processes' commits to
+the same store. On the filesystem, commits are journaled, recovery is tested at every step, a
+commit whose rename keeps failing gives `Pending`, and the area directories are watched, so that
+people's edits and other processes' commits reach the change feed. The API is async, on tokio,
+and with the `blocking` feature, `tidings::blocking::Store` offers the same for synchronous code.
+See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
 
 ## Consistency
 
@@ -20,6 +21,7 @@ processes' commits reach the change feed. Still to come: the blocking API. See
   was still waiting for earlier commits, or finishes in the background and is reported on the
   change feed as usual. `commit` must be called from within a tokio runtime. If that runtime shuts
   down while a cancelled commit is finishing, the commit can be applied without being reported.
+  A blocking commit can't be cancelled: it returns once the commit is finished and reported.
 - Every file a commit writes gets the same last-modified time. A write that wouldn't change a
   file's contents is left out: the file keeps its time, and no change is reported.
 - Reads are one file at a time. Reading several files can mix states from different commits.
@@ -63,6 +65,12 @@ processes' commits reach the change feed. Still to come: the blocking API. See
 - The store can be cloned and shared between tasks. The change feed ends once every clone has
   been dropped, even if a snapshot is still held. Dropping the change feed leaves the store
   working.
+- The blocking store behaves as the async one does, and runs it on a tokio runtime of its own,
+  which keeps running between calls: other processes' commits and edits in the area directories
+  reach its change feed while the app isn't calling it. The change feed is an iterator that waits
+  for each item, and `next_timeout` waits for a while only. The runtime stops once the store, its
+  snapshots and its change feed have all been dropped. Every blocking method panics if it is
+  called from within a tokio runtime: use the async store there.
 - Changes say which path changed, not what it now contains.
 - A read always returns a whole file, never a partly written one.
 - On the filesystem, a commit that a crash interrupts is finished when a store next opens the area
@@ -97,6 +105,9 @@ processes' commits reach the change feed. Still to come: the blocking API. See
 - No moving a store's data from one backend to another.
 - No size limit or eviction for the cache area.
 - Backends are defined in this crate. You cannot plug in your own.
+- Each blocking store opened starts a tokio runtime of its own, with one worker thread, so a
+  process that opens many has as many runtimes. An app that has a runtime of its own should use
+  the async store.
 - On the filesystem, other programs can see a commit half-applied. Readers going through tidings
   can't, with one exception: until a commit that gave `Pending`, or that a crash interrupted, is
   finished, another path that is the same file as one it writes or deletes, through a symlink, is

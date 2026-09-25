@@ -21,7 +21,7 @@ fs = [
 # The SQLite Backend.
 sqlite = ["dep:etcetera", "dep:rusqlite", "tokio/time"]
 # `blocking::Store`, for synchronous code.
-blocking = []
+blocking = ["tokio/rt-multi-thread", "tokio/time"]
 # Failure points and helpers for tidings' own tests.
 testing = []
 
@@ -43,7 +43,8 @@ xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 
 [dev-dependencies]
 # tidings' own tests always build it with `testing`, so a plain `cargo test` runs the tests that
-# need it. Dev-dependencies don't reach normal builds, or crates that depend on tidings.
-tidings = { path = ".", default-features = false, features = ["testing"] }
+# need it, and with `blocking`, so that it runs the behaviour suite through the blocking Store too.
+# Dev-dependencies don't reach normal builds, or crates that depend on tidings.
+tidings = { path = ".", default-features = false, features = ["testing", "blocking"] }
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }

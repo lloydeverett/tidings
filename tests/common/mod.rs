@@ -6,16 +6,37 @@ use std::time::Duration;
 
 use tidings::{Area, Change, ChangeFeed, ChangeKind, FeedItem, Origin};
 
+/// A Change feed the helpers can wait on: the async one, or the behaviour suite's stand-in, which
+/// can also be the blocking one.
+pub trait Feed {
+    /// Waits up to `timeout` for the next item, giving what `next` would, or [`TimedOut`] if
+    /// nothing arrived in time.
+    fn next_within(
+        &mut self,
+        timeout: Duration,
+    ) -> impl Future<Output = Result<Option<FeedItem>, TimedOut>>;
+}
+
+/// Nothing arrived on the Change feed in time.
+#[derive(Debug)]
+pub struct TimedOut;
+
+impl Feed for ChangeFeed {
+    async fn next_within(&mut self, timeout: Duration) -> Result<Option<FeedItem>, TimedOut> {
+        tokio::time::timeout(timeout, self.next()).await.map_err(|_| TimedOut)
+    }
+}
+
 /// Waits for the next item on the Change feed, failing the test if none arrives in time.
-pub async fn next_item(feed: &mut ChangeFeed) -> FeedItem {
-    tokio::time::timeout(Duration::from_secs(5), feed.next())
+pub async fn next_item(feed: &mut impl Feed) -> FeedItem {
+    feed.next_within(Duration::from_secs(5))
         .await
         .expect("the Change feed should have sent something by now")
         .expect("the Change feed should not have ended")
 }
 
 /// Waits for the next batch of Changes, sorted by Area and Path so it can be compared.
-pub async fn next_batch(feed: &mut ChangeFeed) -> Vec<Change> {
+pub async fn next_batch(feed: &mut impl Feed) -> Vec<Change> {
     match next_item(feed).await {
         FeedItem::Changes(mut batch) => {
             batch.sort_by(|a, b| (a.area, &a.path).cmp(&(b.area, &b.path)));
@@ -39,16 +60,17 @@ pub fn changes_in_full(batch: &[Change]) -> Vec<(Area, &str, ChangeKind, Origin)
 }
 
 /// Checks that nothing more arrives on the Change feed for a short while.
-pub async fn assert_nothing_more(feed: &mut ChangeFeed) {
-    if let Ok(item) = tokio::time::timeout(Duration::from_millis(200), feed.next()).await {
+pub async fn assert_nothing_more(feed: &mut impl Feed) {
+    if let Ok(item) = feed.next_within(Duration::from_millis(200)).await {
         panic!("expected nothing more on the Change feed, got {item:?}");
     }
 }
 
 /// Checks that the Change feed has ended, and stays ended.
-pub async fn assert_ended(feed: &mut ChangeFeed) {
+pub async fn assert_ended(feed: &mut impl Feed) {
     for _ in 0..2 {
-        let item = tokio::time::timeout(Duration::from_secs(5), feed.next())
+        let item = feed
+            .next_within(Duration::from_secs(5))
             .await
             .expect("the Change feed should have ended by now");
         assert_eq!(item, None);

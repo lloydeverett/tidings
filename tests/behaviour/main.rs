@@ -1,6 +1,8 @@
 //! The behaviour suite: one set of tests, written once against the public API, that every Backend
-//! must pass. Each Backend instantiates the whole suite in its own module below.
+//! must pass. Each Backend instantiates the whole suite in its own module below, once through the
+//! async API and once, in a `blocking` module of its own, through the blocking API.
 
+mod api;
 #[path = "../common/mod.rs"]
 mod common;
 #[macro_use]
@@ -16,12 +18,26 @@ mod memory {
 
     impl Fixture for Memory {
         async fn open(&self) -> Opened {
-            let (store, feed) = tidings::Store::open_memory();
-            Opened { store, feed }
+            tidings::Store::open_memory().into()
         }
     }
 
     behaviour_suite!(Memory);
+
+    mod blocking {
+        use crate::api::off_runtime;
+        use crate::suite::{Fixture, Opened};
+
+        struct BlockingMemory;
+
+        impl Fixture for BlockingMemory {
+            async fn open(&self) -> Opened {
+                off_runtime(tidings::blocking::Store::open_memory).into()
+            }
+        }
+
+        behaviour_suite!(BlockingMemory);
+    }
 
     /// The suite's Snapshot tests run only where Snapshots are supported, so this makes sure they
     /// run on memory.
@@ -37,8 +53,9 @@ mod sqlite {
     use std::time::Duration;
 
     use tempfile::TempDir;
-    use tidings::{AppIdentity, Area, ChangeKind, FeedItem, Origin, SqliteOptions, Staging, Store};
+    use tidings::{AppIdentity, Area, ChangeKind, FeedItem, Origin, SqliteOptions, Staging};
 
+    use crate::api::Store;
     use crate::common::{assert_nothing_more, changes_in_full, next_batch, next_item};
     use crate::suite::{Fixture, Opened};
 
@@ -54,15 +71,18 @@ mod sqlite {
             Sqlite { root: tempfile::tempdir().unwrap() }
         }
 
+        /// The options each Store is opened with: on the Root override, checking often.
+        fn usual_options(&self) -> SqliteOptions {
+            SqliteOptions::default()
+                .root_override(self.root.path())
+                .poll_interval(Duration::from_millis(10))
+        }
+
         /// Opens a Store on the Root override with the options `options` makes of the usual
         /// ones.
         async fn open_with(&self, options: impl FnOnce(SqliteOptions) -> SqliteOptions) -> Opened {
-            let app = AppIdentity::new("tidings tests", "tidings", "org");
-            let usual = SqliteOptions::default()
-                .root_override(self.root.path())
-                .poll_interval(Duration::from_millis(10));
-            let (store, feed) = Store::open_sqlite(&app, options(usual)).await.unwrap();
-            Opened { store, feed }
+            let options = options(self.usual_options());
+            tidings::Store::open_sqlite(&app(), options).await.unwrap().into()
         }
     }
 
@@ -72,8 +92,33 @@ mod sqlite {
         }
     }
 
+    fn app() -> AppIdentity {
+        AppIdentity::new("tidings tests", "tidings", "org")
+    }
+
     behaviour_suite!(Sqlite::new());
     two_stores_suite!(Sqlite::new());
+
+    mod blocking {
+        use super::{Sqlite, app};
+        use crate::api::off_runtime;
+        use crate::suite::{Fixture, Opened};
+
+        /// Opens each Store through the blocking API, as [`Sqlite`] does through the async one.
+        struct BlockingSqlite(Sqlite);
+
+        impl Fixture for BlockingSqlite {
+            async fn open(&self) -> Opened {
+                let options = self.0.usual_options();
+                off_runtime(|| tidings::blocking::Store::open_sqlite(&app(), options))
+                    .unwrap()
+                    .into()
+            }
+        }
+
+        behaviour_suite!(BlockingSqlite(Sqlite::new()));
+        two_stores_suite!(BlockingSqlite(Sqlite::new()));
+    }
 
     /// The suite's Snapshot tests run only where Snapshots are supported, so this makes sure they
     /// run on SQLite.
@@ -142,9 +187,10 @@ mod fs {
     use tempfile::TempDir;
     use tidings::{
         AppIdentity, Area, ChangeKind, Error, FailurePoint, FeedItem, FsOptions, InvalidPathReason,
-        Origin, Pause, PrefixRevision, Revision, Staging, Store,
+        Origin, Pause, PrefixRevision, Revision, Staging,
     };
 
+    use crate::api::Store;
     use crate::common::{assert_nothing_more, changes, changes_in_full, next_batch, next_item};
     use crate::suite::{Fixture, Opened};
 
@@ -159,15 +205,19 @@ mod fs {
             Fs { root: tempfile::tempdir().unwrap() }
         }
 
+        /// The options each Store is opened with: on the Root override, with a short debounce
+        /// window.
+        fn usual_options(&self) -> FsOptions {
+            FsOptions::default()
+                .root_override(self.root.path())
+                .debounce_window(Duration::from_millis(20))
+        }
+
         /// Opens a Store on the Root override with the options `options` makes of the usual
         /// ones.
         async fn open_with(&self, options: impl FnOnce(FsOptions) -> FsOptions) -> Opened {
-            let app = AppIdentity::new("tidings tests", "tidings", "org");
-            let usual = FsOptions::default()
-                .root_override(self.root.path())
-                .debounce_window(Duration::from_millis(20));
-            let (store, feed) = Store::open_fs(&app, options(usual)).await.unwrap();
-            Opened { store, feed }
+            let options = options(self.usual_options());
+            tidings::Store::open_fs(&app(), options).await.unwrap().into()
         }
 
         /// Where `path` in `area` is on disk.
@@ -194,10 +244,34 @@ mod fs {
         }
     }
 
+    fn app() -> AppIdentity {
+        AppIdentity::new("tidings tests", "tidings", "org")
+    }
+
     behaviour_suite!(Fs::new());
     // Not `in_step:`: see the README's Consistency section.
     two_stores_suite!(committing: Fs::new());
     two_stores_suite!(seeing_each_other: Fs::new());
+
+    mod blocking {
+        use super::{Fs, app};
+        use crate::api::off_runtime;
+        use crate::suite::{Fixture, Opened};
+
+        /// Opens each Store through the blocking API, as [`Fs`] does through the async one.
+        struct BlockingFs(Fs);
+
+        impl Fixture for BlockingFs {
+            async fn open(&self) -> Opened {
+                let options = self.0.usual_options();
+                off_runtime(|| tidings::blocking::Store::open_fs(&app(), options)).unwrap().into()
+            }
+        }
+
+        behaviour_suite!(BlockingFs(Fs::new()));
+        two_stores_suite!(committing: BlockingFs(Fs::new()));
+        two_stores_suite!(seeing_each_other: BlockingFs(Fs::new()));
+    }
 
     /// The suite's Snapshot tests are skipped where Snapshots aren't supported, so this makes sure
     /// the filesystem is one of those, and that the suite's refusal test runs there.
