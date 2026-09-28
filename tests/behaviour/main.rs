@@ -337,8 +337,8 @@ mod fs {
     /// look like writes, so they are told apart by comparing Revisions. Only a File that has
     /// changed since the Store opened has a known Revision, so a File there before gets only the
     /// events that can't be writes: see the README's Consistency section. On macOS, FSEvents
-    /// reports them all as the File's creation, so a File there before gets a Change for the
-    /// first, and nothing after, since its Revision is then known.
+    /// reports changing a File's times or permissions as its creation, so a File there before
+    /// gets a Change for that, and nothing after, since its Revision is then known.
     #[tokio::test]
     async fn events_that_leave_a_files_contents_as_they_were_are_dropped() {
         let fixture = Fs::new();
@@ -357,22 +357,22 @@ mod fs {
         let both = std::fs::FileTimes::new()
             .set_accessed(SystemTime::UNIX_EPOCH)
             .set_modified(SystemTime::UNIX_EPOCH);
-        let leave_as_it_was = |path: &str| {
+        let touch_without_writing = |path: &str| {
             std::fs::read(fixture.on_disk(Area::Data, path)).unwrap();
             let file = std::fs::File::open(fixture.on_disk(Area::Data, path)).unwrap();
             file.set_times(both).unwrap();
             set_readonly(path, true);
             set_readonly(path, false);
         };
-        leave_as_it_was("before.txt");
-        leave_as_it_was("during.txt");
+        touch_without_writing("before.txt");
+        touch_without_writing("during.txt");
         #[cfg(target_os = "macos")]
         {
             assert_eq!(
                 changes(&next_batch(&mut feed).await),
                 [("before.txt", ChangeKind::Changed)]
             );
-            leave_as_it_was("before.txt");
+            touch_without_writing("before.txt");
         }
         // The modification time alone, which is also how a write shows, and the contents as
         // they were.

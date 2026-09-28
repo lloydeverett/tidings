@@ -286,13 +286,11 @@ impl Journal {
             if present_at(fs::symlink_metadata(temporary), temporary)?.is_none() {
                 continue;
             }
-            if let Target::AtPath = target
-                && under_link(path)?
-            {
-                fs::remove_file(temporary).map_err(|error| failed(temporary, error))?;
-                continue;
-            }
             if let Target::AtPath = target {
+                if under_link(path)? {
+                    fs::remove_file(temporary).map_err(|error| failed(temporary, error))?;
+                    continue;
+                }
                 area.make_directories(path, &mut changed)?;
             }
             let target = replace.on_disk(root);
