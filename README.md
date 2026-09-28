@@ -32,6 +32,10 @@ Ways you could lose data or see confusing behaviour, and why.
   unchanged" or a lock other programs must respect.
   - After a `Pending` commit, or one a crash interrupted, the window lasts until it's finished.
   - Outside programs can also see a commit half-applied.
+  - The reverse can happen too: if the edit swaps a directory for a symlink to one, the commit's
+    files under it are dropped, though reported as written, and read until the commit finishes.
+    *Why:* they're outside the area now, and finishing never writes through such a link, so a
+    commit left unfinished doesn't block every later one.
 - **The change feed doesn't give you every step.** It says which path changed, not the new
   contents, and merges unread changes to the same path. Re-read to see what's there.
 - **Other processes' changes arrive late,** so until then your reads and the feed disagree.
