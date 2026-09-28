@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 
 use jiff::Timestamp;
 
-#[cfg(feature = "fs")]
+#[cfg(any(feature = "fs", feature = "sqlite"))]
 use crate::Error;
 use crate::staging::{Action, PlannedRevisions, Staged};
 use crate::{Area, ChangeKind, File, Origin, Path, Prefix, PrefixRevision, Result, Revision, Stat};
@@ -29,13 +29,26 @@ pub enum BackendKind {
     Sqlite,
 }
 
+impl BackendKind {
+    /// Its name in lower case, as its Backend marker holds it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            BackendKind::Fs => "fs",
+            BackendKind::Sqlite => "sqlite",
+        }
+    }
+
+    /// The Backend whose [`name`](Self::name) is `name`, if any.
+    #[cfg(any(feature = "fs", feature = "sqlite"))]
+    pub(crate) fn named(name: &str) -> Option<BackendKind> {
+        [BackendKind::Fs, BackendKind::Sqlite].into_iter().find(|kind| kind.name() == name)
+    }
+}
+
 /// Its name in lower case, `fs` or `sqlite`.
 impl std::fmt::Display for BackendKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            BackendKind::Fs => "fs",
-            BackendKind::Sqlite => "sqlite",
-        })
+        f.write_str(self.name())
     }
 }
 
@@ -321,6 +334,32 @@ impl BackendSnapshot {
             BackendSnapshot::Sqlite(snapshot) => snapshot.list(prefix).await,
         }
     }
+}
+
+/// The Backend failed with `error`, doing something to `path`.
+#[cfg(any(feature = "fs", feature = "sqlite"))]
+pub(crate) fn failed(path: &std::path::Path, error: std::io::Error) -> Error {
+    let message = format!("{}: {error}", path.display());
+    Error::backend(std::io::Error::new(error.kind(), message))
+}
+
+/// Forces the entries of `directory` to disk, where the platform can, so that a rename, delete or
+/// new entry in it survives a power cut. A directory that is gone has nothing to force.
+#[cfg(any(feature = "fs", feature = "sqlite"))]
+pub(crate) fn sync_directory(directory: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    match std::fs::File::open(directory).and_then(|opened| opened.sync_all()) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) => {}
+        Err(error) => return Err(failed(directory, error)),
+    }
+    #[cfg(not(unix))]
+    let _ = directory;
+    Ok(())
 }
 
 /// Runs `call` on one of tokio's blocking threads, so that it doesn't hold up the async runtime.

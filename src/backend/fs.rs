@@ -106,7 +106,7 @@ use xxhash_rust::xxh3::xxh3_128;
 use self::journal::{AsFinished, Journal, Recovery, Remove, Replace, Target};
 pub(crate) use self::watch::FsWatcher;
 use self::watch::Reported;
-use super::{AreaState, CommitOutcome, CommitRequest, Planned, marker, off_runtime};
+use super::{AreaState, CommitOutcome, CommitRequest, Planned, failed, marker, off_runtime};
 use crate::app::AppIdentity;
 use crate::area::PerArea;
 use crate::path::{RESERVED, letter_case_fold, temporary_file_name};
@@ -317,9 +317,8 @@ pub(crate) struct FsBackend {
 impl FsBackend {
     /// Marks each Area for the filesystem ([`marker`]), adopting what an unmarked one holds, or
     /// fails if one is another Backend's. Makes each Area's root and its `.tidings/` directory if
-    /// they don't exist, finishes or
-    /// discards any Commit a crash left in its journal, and starts watching the Areas, giving the
-    /// watcher for the Store to run.
+    /// they don't exist, finishes or discards any Commit a crash left in its journal, and starts
+    /// watching the Areas, giving the watcher for the Store to run.
     pub(crate) async fn open(
         app: &AppIdentity,
         options: FsOptions,
@@ -1228,9 +1227,4 @@ fn present_at<T>(result: io::Result<T>, path: &FsPath) -> Result<Option<T>> {
 /// on the way would have to be.
 fn is_absent(error: &io::Error) -> bool {
     matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
-}
-
-/// The Backend failed with `error`, doing something to `path`.
-fn failed(path: &FsPath, error: io::Error) -> Error {
-    Error::backend(io::Error::new(error.kind(), format!("{}: {error}", path.display())))
 }

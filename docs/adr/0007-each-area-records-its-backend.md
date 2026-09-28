@@ -21,7 +21,8 @@ migration.
 - **Unmarked** Areas are those whose directory, `.tidings/` or marker doesn't exist. The first
   Store to open them adopts what they hold. The filesystem shows those files as Files. SQLite
   logs a warning, since it never shows them.
-- **Marking** creates the file only if it doesn't exist (`create_new`). A Store that finds one
+- **Marking** creates the file only if it doesn't exist (`create_new`), then forces it and
+  `.tidings/` to disk. A Store that finds one
   has appeared since it read the markers reads it, and fails if it names the other Backend. When
   Stores on both Backends open an unmarked location at once, the one that marks the config Area
   wins, and the other fails before it marks anything else, so the Areas never end up split.
@@ -32,8 +33,17 @@ migration.
   the other Areas' markers still keep out the other Backend.
 
 `Store::detect(app, root_override)` reads the markers without creating anything. It returns the
-one Backend they name, `None` if no Area is marked, and `WrongBackend` if they disagree. That lets
-a tool such as the CLI open a location without being told its Backend.
+one Backend they name, `None` if no Area is marked, and `Error::MixedBackends`, listing each marked
+Area and its Backend, if they disagree. It doesn't give `WrongBackend` then, since no Backend was
+expected. That lets a tool such as the CLI open a location without being told its Backend, and say
+why it can't.
+
+For the same tool, a Revision is written as 32 lowercase hexadecimal digits, and parses back, so
+it can be passed to a later command as a Precondition. A Prefix Revision is written the same way,
+from its hash, but doesn't parse back: it keeps each Path and Revision it covers, to name them in
+a Conflict, and those can't be recovered from the hash. So a Prefix Precondition can only be used
+by a program that holds the Prefix Revision, such as the CLI's shell, and not passed between
+separate commands.
 
 The memory Backend has no directories, and so no marker.
 
@@ -46,5 +56,7 @@ The memory Backend has no directories, and so no marker.
 - **The marker in each Area's root, beside the Files**: rejected. It would need a name no Path can
   have, and `.tidings/` already is one.
 - **Writing the marker to a temporary file and linking it into place**, so it never shows empty:
-  rejected. Some filesystems have no hard links. Reading an empty marker again for a moment covers
-  the short time between creating it and writing it.
+  rejected. Some filesystems have no hard links, so it would need a second way of marking as a
+  fallback. Reading an empty marker again for a moment covers the short time between creating it
+  and writing it. A crash in that moment leaves it empty for good, and the error then says to
+  remove it: that is rare enough, and plain enough to fix, not to be worth the second way.

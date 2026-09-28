@@ -23,6 +23,7 @@ use std::io::{self, Write};
 use std::path::{Path as FsPath, PathBuf};
 use std::time::Duration;
 
+use super::{failed, sync_directory};
 use crate::area::PerArea;
 use crate::path::RESERVED;
 use crate::{Area, BackendKind, Error, Result};
@@ -40,17 +41,20 @@ const EMPTY_MARKER_DELAYS: [Duration; 4] = [
 ];
 
 /// Where the marker of the Area whose root is `root` is.
-fn marker(root: &FsPath) -> PathBuf {
+fn marker_path(root: &FsPath) -> PathBuf {
     root.join(RESERVED).join(MARKER)
 }
 
 /// The Backend each Area's marker names, or `None` where it has none, given each Area's
 /// directory. Changes nothing.
 fn read_all(directories: &PerArea<PathBuf>) -> Result<PerArea<Option<BackendKind>>> {
-    PerArea::try_from_fn(|area| read(&marker(directories.get(area))))
+    PerArea::try_from_fn(|area| read(&marker_path(directories.get(area))))
 }
 
 /// The Backend the marker at `path` names, or `None` if there is none.
+///
+/// It blocks, and sleeps while it waits for an empty marker to be written, so it runs only off
+/// the async runtime: on tokio's blocking threads, or in the blocking API.
 fn read(path: &FsPath) -> Result<Option<BackendKind>> {
     let mut delays = EMPTY_MARKER_DELAYS.into_iter();
     loop {
@@ -59,11 +63,10 @@ fn read(path: &FsPath) -> Result<Option<BackendKind>> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(failed(path, error)),
         };
-        let other = match text.trim_end() {
-            "fs" => return Ok(Some(BackendKind::Fs)),
-            "sqlite" => return Ok(Some(BackendKind::Sqlite)),
-            other => other,
-        };
+        let other = text.trim_end();
+        if let Some(kind) = BackendKind::named(other) {
+            return Ok(Some(kind));
+        }
         if other.is_empty() {
             // Another Store may have made it, and not yet written it.
             if let Some(delay) = delays.next() {
@@ -83,21 +86,17 @@ fn read(path: &FsPath) -> Result<Option<BackendKind>> {
 }
 
 /// The one Backend the Areas in `directories` are marked for, or `None` if none is marked. Gives
-/// [`Error::WrongBackend`] for the first Area marked for another Backend than an Area before it.
-/// Changes nothing.
+/// [`Error::MixedBackends`] if they are marked for different Backends. Changes nothing.
 pub(crate) fn detect(directories: &PerArea<PathBuf>) -> Result<Option<BackendKind>> {
-    let markers = read_all(directories)?;
-    let mut found = None;
-    for (area, marked) in markers.iter() {
-        match (found, *marked) {
-            (None, marked) => found = marked,
-            (Some(first), Some(marked)) if marked != first => {
-                return Err(Error::WrongBackend { area, found: marked });
-            }
-            _ => {}
-        }
+    let marked: Vec<(Area, BackendKind)> = read_all(directories)?
+        .iter()
+        .filter_map(|(area, marked)| marked.map(|kind| (area, kind)))
+        .collect();
+    match marked.first() {
+        None => Ok(None),
+        Some(&(_, first)) if marked.iter().all(|&(_, kind)| kind == first) => Ok(Some(first)),
+        Some(_) => Err(Error::MixedBackends { marked }),
     }
-    Ok(found)
 }
 
 /// Marks every Area in `directories` for `kind`, as the module's doc describes, making each
@@ -142,10 +141,7 @@ fn mark(area: Area, root: &FsPath, kind: BackendKind) -> Result<bool> {
     };
     let written = file.write_all(format!("{kind}\n").as_bytes());
     written.and_then(|()| file.sync_all()).map_err(|error| failed(&path, error))?;
+    // So that the marker itself survives a power cut, not only what it holds.
+    sync_directory(&directory)?;
     Ok(true)
-}
-
-/// `error`, from doing something to `path`, as a Backend error naming it.
-fn failed(path: &FsPath, error: io::Error) -> Error {
-    Error::backend(io::Error::new(error.kind(), format!("{}: {error}", path.display())))
 }

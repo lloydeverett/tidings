@@ -47,7 +47,7 @@ use super::{
     AreaRoot, LeftOut, failed, on_disk, present, present_at, read_file, remove_empty_directories,
     revisions,
 };
-use crate::backend::AreaState;
+use crate::backend::{AreaState, sync_directory};
 use crate::{Error, Path, Prefix, Result, Revision};
 
 /// The first line of every journal, which names its format.
@@ -411,16 +411,6 @@ fn remove_emptied_directories(root: &FsPath, file: &FsPath, changed: &mut BTreeS
         }
         directory = emptied.parent();
     }
-}
-
-/// Forces the entries of `directory` to disk, where the platform can, so that a rename, delete or
-/// new directory in it survives a power cut. A directory that is gone has nothing to force.
-fn sync_directory(directory: &FsPath) -> Result<()> {
-    #[cfg(unix)]
-    present_at(fs::File::open(directory).and_then(|opened| opened.sync_all()), directory)?;
-    #[cfg(not(unix))]
-    let _ = directory;
-    Ok(())
 }
 
 /// `revision` in hexadecimal.

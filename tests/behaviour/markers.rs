@@ -139,7 +139,7 @@ async fn every_area_is_checked_before_any_is_marked() {
 }
 
 #[tokio::test]
-async fn areas_marked_by_different_backends_are_refused_by_both_and_by_detect() {
+async fn areas_marked_by_different_backends_are_refused_by_both_and_named_by_detect() {
     let fs = tempfile::tempdir().unwrap();
     let sqlite = tempfile::tempdir().unwrap();
     drop(open(BackendKind::Fs, fs.path()).await.unwrap());
@@ -148,7 +148,17 @@ async fn areas_marked_by_different_backends_are_refused_by_both_and_by_detect() 
     std::fs::remove_dir_all(sqlite.path().join("data")).unwrap();
     std::fs::rename(fs.path().join("data"), sqlite.path().join("data")).unwrap();
 
-    assert_wrong_backend(detect(sqlite.path()).await, Area::Data, BackendKind::Fs);
+    match detect(sqlite.path()).await {
+        Err(Error::MixedBackends { marked }) => assert_eq!(
+            marked,
+            [
+                (Area::Config, BackendKind::Sqlite),
+                (Area::Data, BackendKind::Fs),
+                (Area::Cache, BackendKind::Sqlite),
+            ],
+        ),
+        other => panic!("expected MixedBackends, got {other:?}"),
+    }
     assert_wrong_backend(
         open(BackendKind::Sqlite, sqlite.path()).await,
         Area::Data,

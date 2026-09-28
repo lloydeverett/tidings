@@ -39,14 +39,21 @@ pub enum Error {
     Pending,
     /// The Area belongs to another Backend: its Backend marker names `found`. Opening a Store on
     /// the filesystem or SQLite gives it, without changing anything, for the first Area marked
-    /// for the other Backend. So does [`Store::detect`](crate::Store::detect), for the first Area
-    /// marked for another Backend than the Areas before it.
+    /// for the other Backend.
     #[error("the {area:?} Area belongs to the {found} Backend")]
     WrongBackend {
         /// The Area.
         area: Area,
         /// The Backend its marker names.
         found: BackendKind,
+    },
+    /// The Areas are marked for different Backends, so no Store can open them all.
+    /// [`Store::detect`](crate::Store::detect) gives it. It can happen when an Area's directory
+    /// is replaced by one another Backend made.
+    #[error("the Areas are marked for different Backends: {marked:?}")]
+    MixedBackends {
+        /// Each marked Area, in order of Area, with the Backend its marker names.
+        marked: Vec<(Area, BackendKind)>,
     },
     /// The Store's Backend can't do this. A Snapshot on the filesystem gives it: check
     /// [`Store::supports_snapshots`](crate::Store::supports_snapshots) first.

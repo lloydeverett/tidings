@@ -207,10 +207,9 @@ impl Store {
     /// `None` if no Area is marked, as where no Store has been opened. It creates and changes
     /// nothing.
     ///
-    /// Gives [`Error::WrongBackend`](crate::Error::WrongBackend) if the Areas are marked for
-    /// different Backends, naming the first Area marked for another Backend than the Areas before
-    /// it, and [`Error::Backend`](crate::Error::Backend) if a marker names no Backend or can't be
-    /// read.
+    /// Gives [`Error::MixedBackends`](crate::Error::MixedBackends) if the Areas are marked for
+    /// different Backends, and [`Error::Backend`](crate::Error::Backend) if a marker names no
+    /// Backend or can't be read.
     ///
     /// # Panics
     ///
