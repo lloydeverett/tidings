@@ -88,7 +88,7 @@ fn main() -> ExitCode {
 /// Opens the Store `store` chooses, and runs `command` on it.
 async fn one_shot(store: &StoreArgs, json: bool, command: OneShot) -> Result<(), Failure> {
     let opened = store.open(false).await?;
-    let output = Output { json, shell: false };
+    let output = Output { json, at_prompt: false };
     match command {
         OneShot::Store(command) => {
             let report = Session::new(opened.store, false).run(command).await?;

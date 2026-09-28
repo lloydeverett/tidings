@@ -46,8 +46,9 @@ memory Backend (`--backend memory`) can be used. It takes the same commands (not
 | `feed on\|off` | Print Changes as they arrive. |
 | `help`, `exit` | |
 
-On a terminal, Changes are printed above the prompt, and a failed command doesn't end the shell.
-With stdin from a file or pipe, it runs the lines as a script (`#` starts a comment), stops at
+On a terminal, Changes are printed above the prompt, a failed command doesn't end the shell, and
+`read` adds a newline to contents that don't end with one, so the prompt doesn't overwrite their
+last line. With stdin from a file or pipe, it runs the lines as a script (`#` starts a comment), stops at
 the first failure with its exit code, and prints Changes on stderr only after `feed on`. In the
 shell, `--contents` turns `\n`, `\t` and `\\` into a newline, a tab and a backslash.
 

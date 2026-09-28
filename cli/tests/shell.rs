@@ -119,6 +119,13 @@ fn a_prefix_is_required_unchanged_since_its_last_stat_prefix() {
 }
 
 #[test]
+fn read_prints_the_contents_exactly_as_stored() {
+    let run = in_memory("write data a.txt --contents x\nread data a.txt\nlist data\n");
+    let run = run.expect_success();
+    assert!(run.stdout.ends_with("  a.txt\nxa.txt\n"), "{run:?}");
+}
+
+#[test]
 fn contents_in_the_shell_take_escapes() {
     let run = in_memory(
         r#"write data a.txt --contents 'a\nb\tc\\n'
@@ -126,7 +133,7 @@ read data a.txt
 "#,
     );
     let run = run.expect_success();
-    assert!(run.stdout.ends_with("a\nb\tc\\n\n"), "{run:?}");
+    assert!(run.stdout.ends_with("a\nb\tc\\n"), "{run:?}");
     in_memory("write data a.txt\n").expect_code(1);
 }
 

@@ -86,10 +86,11 @@ pub fn run(runtime: &Runtime, args: &StoreArgs, json: bool) -> Result<(), Failur
     let opened = runtime.block_on(args.open(true))?;
     let mut shell = Shell {
         session: Session::new(opened.store, true),
-        output: Output { json, shell: true },
+        output: Output { json, at_prompt: false },
         backend: opened.backend,
     };
     if io::stdin().is_terminal() {
+        shell.output.at_prompt = true;
         eprintln!(
             "tidings shell on {}: `help` lists the commands, `exit` or Ctrl-D leaves",
             opened.description,

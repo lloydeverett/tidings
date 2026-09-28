@@ -32,10 +32,10 @@ pub enum Report {
 /// How to print.
 #[derive(Debug, Clone, Copy)]
 pub struct Output {
+    /// `--json`.
     pub json: bool,
-    /// In the shell, where a File's contents are followed by a prompt, so they need to end with a
-    /// newline.
-    pub shell: bool,
+    /// Whether a prompt follows what is printed, in the interactive shell.
+    pub at_prompt: bool,
 }
 
 impl Output {
@@ -49,9 +49,11 @@ impl Output {
         }
         match report {
             Report::Nothing | Report::Staged { .. } => Ok(()),
+            // Exactly as stored, apart from at the prompt, where a last line without a newline
+            // would be overwritten by the prompt.
             Report::File(file) => {
                 let contents = file.contents();
-                if self.shell && !contents.is_empty() && !contents.ends_with('\n') {
+                if self.at_prompt && !contents.is_empty() && !contents.ends_with('\n') {
                     print_stdout(&format!("{contents}\n"))
                 } else {
                     print_stdout(contents)
