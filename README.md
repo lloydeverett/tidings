@@ -25,10 +25,13 @@ Ways you could lose data or see confusing behaviour, and why.
   (on Windows, another program has it open), the commit has still happened and is reported.
   - Until the file is released, *every* commit to that area fails, even ones not touching it.
     *Why:* this commit must be finished first to keep commits all-or-nothing.
-- **Programs outside tidings can have their edits overwritten.** One that writes a file while a
-  commit is applied loses its edit; preconditions only guard against tidings' own commits.
-  *Why:* there's no portable way to lock other programs out.
-  - They can also see a commit half-applied.
+- **An outside program's edit can be lost if it lands mid-commit.** A precondition is checked,
+  then the commit's files are prepared and forced to disk, then renamed into place. An edit
+  between the check and the rename is overwritten. Usually a window of milliseconds. *Why:* a
+  rename replaces whatever is there, and no filesystem offers a portable "replace only if
+  unchanged" or a lock other programs must respect.
+  - After a `Pending` commit, or one a crash interrupted, the window lasts until it's finished.
+  - Outside programs can also see a commit half-applied.
 - **The change feed doesn't give you every step.** It says which path changed, not the new
   contents, and merges unread changes to the same path. Re-read to see what's there.
 - **The feed can send a resync instead of changes.** You must re-read the whole area, or miss
