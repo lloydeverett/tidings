@@ -336,7 +336,9 @@ mod fs {
     /// or permissions changed, or its contents written again as they were. Some of those events
     /// look like writes, so they are told apart by comparing Revisions. Only a File that has
     /// changed since the Store opened has a known Revision, so a File there before gets only the
-    /// events that can't be writes: see the README's Consistency section.
+    /// events that can't be writes: see the README's Consistency section. On macOS, FSEvents
+    /// reports them all as the File's creation, so a File there before gets a Change for the
+    /// first, and nothing after, since its Revision is then known.
     #[tokio::test]
     async fn events_that_leave_a_files_contents_as_they_were_are_dropped() {
         let fixture = Fs::new();
@@ -355,12 +357,22 @@ mod fs {
         let both = std::fs::FileTimes::new()
             .set_accessed(SystemTime::UNIX_EPOCH)
             .set_modified(SystemTime::UNIX_EPOCH);
-        for path in ["before.txt", "during.txt"] {
+        let leave_as_it_was = |path: &str| {
             std::fs::read(fixture.on_disk(Area::Data, path)).unwrap();
             let file = std::fs::File::open(fixture.on_disk(Area::Data, path)).unwrap();
             file.set_times(both).unwrap();
             set_readonly(path, true);
             set_readonly(path, false);
+        };
+        leave_as_it_was("before.txt");
+        leave_as_it_was("during.txt");
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                changes(&next_batch(&mut feed).await),
+                [("before.txt", ChangeKind::Changed)]
+            );
+            leave_as_it_was("before.txt");
         }
         // The modification time alone, which is also how a write shows, and the contents as
         // they were.
@@ -529,8 +541,8 @@ mod fs {
             fixture.write_directly(Area::Data, "CON", "x");
             fixture.write_directly(Area::Data, "what?/a.txt", "x");
         }
-        // Not valid UTF-8.
-        #[cfg(unix)]
+        // Not valid UTF-8, which macOS's filesystems can't hold.
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
             use std::os::unix::ffi::OsStrExt;
             let name = std::ffi::OsStr::from_bytes(b"not \xff utf-8.txt");
