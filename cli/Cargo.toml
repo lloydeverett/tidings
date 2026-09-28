@@ -1,0 +1,25 @@
+[package]
+name = "tidings-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+description = "The `tidings` command: read, write and watch a tidings Store from the terminal."
+publish = false
+
+[[bin]]
+name = "tidings"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive", "env"] }
+rustyline = "18.0.1"
+serde_json = "1.0.151"
+shell-words = "1.1.1"
+tempfile = "3.27.0"
+tidings = { path = ".." }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal"] }
+
+[dev-dependencies]
+serde_json = "1.0.151"
+tempfile = "3.27.0"

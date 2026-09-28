@@ -48,3 +48,7 @@ xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 tidings = { path = ".", default-features = false, features = ["testing", "blocking"] }
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
+
+[workspace]
+# The `tidings` binary, for trying out and debugging Stores from the terminal.
+members = ["cli"]

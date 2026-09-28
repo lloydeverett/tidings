@@ -7,6 +7,50 @@ synchronous code.
 
 Status: first version, complete but early. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
 
+## The `tidings` command
+
+The `cli/` crate builds a `tidings` binary for trying out and debugging Stores from the terminal
+(`cargo install --path cli`). It uses only the library's public API.
+
+```sh
+export TIDINGS_ROOT=/tmp/scratch            # or --root, or --identity com.example.myapp
+tidings --backend fs --create list data     # a new Store needs --create and --backend
+echo 'a = 1' | tidings write config app.toml
+tidings read config app.toml                # the contents, exactly as stored
+tidings stat config app.toml                # its Revision and modified time
+tidings write data a.txt --contents x --if-revision <revision>
+tidings edit config app.toml                # in $VISUAL or $EDITOR; a Conflict keeps your edit
+tidings watch data                          # every Change to data, until Ctrl-C
+```
+
+- **Choosing a Store.** Give exactly one of `--root <dir>` or `--identity tld.author.app` (the
+  platform's directories for that App identity). The Backend is found from the Backend markers;
+  `--backend fs|sqlite` makes sure of it. A location with no Store is refused unless you pass
+  `--create` too, so a typo doesn't make a new, empty one. `TIDINGS_ROOT`, `TIDINGS_IDENTITY` and
+  `TIDINGS_BACKEND` stand in for the flags.
+- **Commands.** `read`, `stat`, `list`, `stat-prefix`, `write`, `delete`, `delete-prefix`, `edit`
+  and `watch`, each taking the Area then the Path or Prefix. `write` takes the contents from stdin,
+  `--contents` or `--from <file>`. `write` and `delete` take `--if-absent` or `--if-revision`.
+- **Output.** Text for a person, or JSON with `--json` (one line per Change for `watch`).
+- **Exit codes.** `0` success, `1` error, `2` no File (`read`, `stat`), `3` Conflict.
+
+`tidings shell` keeps one Store open, so a Commit can be built up over several commands, and the
+memory Backend (`--backend memory`) can be used. It takes the same commands (not `watch`), plus:
+
+| Command | |
+| --- | --- |
+| `stage <area>` | Open a Staging: `write`, `delete`, `delete-prefix` and `edit` add to it instead of committing. One at a time, shown in the prompt. |
+| `require <path> absent\|<revision>` | Add a Precondition to it. |
+| `require-prefix <prefix>` | Require the Prefix unchanged since its last `stat-prefix` in this shell. A Prefix Revision can't be typed in, so this works only in the shell. |
+| `commit`, `discard` | Commit the Staging, or drop it. Either way it is closed. |
+| `feed on\|off` | Print Changes as they arrive. |
+| `help`, `exit` | |
+
+On a terminal, Changes are printed above the prompt, and a failed command doesn't end the shell.
+With stdin from a file or pipe, it runs the lines as a script (`#` starts a comment), stops at
+the first failure with its exit code, and prints Changes on stderr only after `feed on`. In the
+shell, `--contents` turns `\n`, `\t` and `\\` into a newline, a tab and a backslash.
+
 ## Consistency
 
 Ways you could lose data or see confusing behaviour, and why.
