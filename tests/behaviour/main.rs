@@ -1092,6 +1092,38 @@ mod fs {
         );
     }
 
+    /// An Area root that is a symlink is resolved once, when the Store opens: re-pointing or
+    /// removing the link while it is open changes nothing until it opens again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_area_root_link_is_resolved_only_at_open() {
+        let fixture = Fs::new();
+        let [first, second] = ["first", "second"].map(|name| fixture.root.path().join(name));
+        for directory in [&first, &second] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let link = fixture.root.path().join("config");
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let Opened { store, mut feed } = fixture.open().await;
+
+        std::fs::remove_file(&link).unwrap();
+        let mut staging = Staging::new(Area::Config);
+        staging.write("a.toml", "a").unwrap();
+        store.commit(staging).await.unwrap();
+        assert_eq!(std::fs::read_to_string(first.join("a.toml")).unwrap(), "a");
+        next_batch(&mut feed).await;
+
+        std::os::unix::fs::symlink(&second, &link).unwrap();
+        std::fs::write(second.join("b.toml"), "b").unwrap();
+        assert_nothing_more(&mut feed).await;
+        assert_eq!(list(&store, Area::Config).await, ["a.toml"]);
+        drop(store);
+        drop(feed);
+
+        let Opened { store, feed: _feed } = fixture.open().await;
+        assert_eq!(list(&store, Area::Config).await, ["b.toml"]);
+    }
+
     /// Files with the same name in different directories are different files, even while their
     /// directories don't exist yet.
     #[tokio::test]
