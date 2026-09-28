@@ -121,3 +121,18 @@ An item on the Change feed saying that Changes to one Area may have been missed,
 failed, the Area itself disappeared, or the Store fell too far behind other processes' Commits.
 The app should read everything it relies on in that Area again.
 _Avoid_: lost, overflow, reset
+
+### Working copies
+
+**Working copy**:
+A folder holding one Area's Files as ordinary files, kept in step with the Store, where edits stay
+local until they are committed back. The Store is the authority; the folder is a copy of it.
+_Avoid_: mount, mirror, checkout, clone, replica
+
+**Base**:
+The Revision of a Path that a Working copy last took from, or committed to, the Store. A local
+edit is a change against its Base, and committing it requires the File to be unchanged since then.
+
+**Diverged**:
+Said of a Path in a Working copy that has changed both locally and in the Store since its Base. The
+Working copy leaves the local file alone, and committing it is a Conflict until it is resolved.
