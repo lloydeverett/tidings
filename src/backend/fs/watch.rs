@@ -31,7 +31,7 @@
 //!
 //! **Local and external, without holding up Commits.** The Store's own Commits are reported by the
 //! Store, as local, and each one updates [`Reported`] while it holds the Store's turn with Commits.
-//! The watcher readings at a burst in two steps. First, without the turn, it reads and hashes what
+//! The watcher looks at a burst in two steps. First, without the turn, it reads and hashes what
 //! the events name ([`ReadFiles`]), while [`Reported`] notes each Path the Store's Commits change
 //! meanwhile. Then, holding the turn, it reads those Paths again, compares everything with
 //! [`Reported`], and records the difference. So a Commit waits only for that second step, which
@@ -51,15 +51,15 @@
 //! the journal are known, so that finishing it later gives nothing.)
 //!
 //! **Removals the debouncer drops.** The debouncer drops the events of a name that was created and
-//! then removed within the window. But a File replaced by a rename readings created, so one replaced
+//! then removed within the window. But a File replaced by a rename looks created, so one replaced
 //! and then removed or renamed away within the window would give nothing. So the watcher also
 //! takes every name the debouncer saw removed or renamed away, through its file ID cache, and
-//! readings at it once it has settled.
+//! looks at it once it has settled.
 //!
 //! **Symlinks.** A symlinked File is read through its links, but an edit to the file at the end
 //! gives events for that file only, and so does retargeting a link on the way. So the watcher keeps
 //! each chain of links, watches the directory of each link and of the file at the end if it is
-//! outside the Areas, and readings at the linking Path whenever any of them has events, following the
+//! outside the Areas, and looks at the linking Path whenever any of them has events, following the
 //! chain again. It notices links made, changed or removed from their Paths' events. Symlinks to
 //! directories aren't followed by watching: they are left out of the Areas, with everything under
 //! them, so every directory that holds Files is watched under its own name. A directory replaced
@@ -114,7 +114,7 @@ pub(super) struct Reported {
     /// Each File's Path, and its Revision if it is known. Keyed by the Path's string, so that the
     /// Files under a Prefix are a range of keys ([`range_under`]).
     files: BTreeMap<String, Option<Revision>>,
-    /// While the watcher readings at a burst without the turn, each Path the Store's Commits changed
+    /// While the watcher looks at a burst without the turn, each Path the Store's Commits changed
     /// since it began.
     changed_while_reading: Option<BTreeSet<Path>>,
 }
@@ -152,7 +152,7 @@ impl Reported {
         self.changed_while_reading.take().unwrap_or_default()
     }
 
-    /// Compares what the watcher `read_files` at with what was reported, takes the difference as
+    /// Compares what the watcher looked at with what was reported, takes the difference as
     /// reported, and gives it.
     fn catch_up(&mut self, read_files: ReadFiles) -> Vec<RawChange> {
         let mut changes = BTreeMap::new();
@@ -229,7 +229,7 @@ impl ReadFiles {
             })
     }
 
-    /// Reads again each of `changed`, which the Store's Commits changed while the watcher read_files,
+    /// Reads again each of `changed`, which the Store's Commits changed while the watcher looked,
     /// that was among what was looked at.
     fn read_again(&mut self, root: &AreaRoot, changed: &BTreeSet<Path>) -> Result<()> {
         let changed: Vec<&Path> = changed.iter().filter(|path| self.covers(path)).collect();
@@ -364,7 +364,7 @@ impl FileIdCache for RemovalHook {
     }
 }
 
-/// What the watcher readings after, used from the blocking threads that read the Areas.
+/// What the watcher looks after, used from the blocking threads that read the Areas.
 #[derive(Debug)]
 struct Watched {
     watches: Watches,
@@ -623,8 +623,8 @@ async fn sleep_until(at: Option<Instant>) {
 }
 
 /// What the debouncer calls with what settled: it drops the events that can't change a File's
-/// contents, and sends the rest on to `sender`. With `first_events_fail`, the first events it would send are
-/// replaced by an error naming their paths.
+/// contents, and sends the rest on to `sender`. With `first_events_fail`, the first events it
+/// would send are replaced by an error naming their paths.
 fn handler(
     sender: mpsc::UnboundedSender<DebounceEventResult>,
     #[cfg(feature = "testing")] mut first_events_fail: bool,
@@ -657,8 +657,8 @@ fn handler(
     }
 }
 
-/// Whether an event of `kind` can mean that a File's contents changed. Opening, reading or closing a
-/// File can't, nor changing its permissions or times: writing to it or truncating it gives a
+/// Whether an event of `kind` can mean that a File's contents changed. Opening, reading or closing
+/// a File can't, nor changing its permissions or times: writing to it or truncating it gives a
 /// modify event of its own.
 fn may_change_contents(kind: &EventKind) -> bool {
     !matches!(kind, EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(_)))
