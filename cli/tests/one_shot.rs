@@ -2,7 +2,8 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Lines};
+use std::process::{Child, ChildStdout};
 use std::time::Duration;
 
 use common::{Location, is_revision, tidings};
@@ -30,7 +31,7 @@ fn a_location_with_no_store_is_refused_and_left_alone_unless_created() {
     // From now on the Backend is found from the location.
     location.write("data", "a.txt", "a");
     assert_eq!(location.read("data", "a.txt"), "a");
-    assert!(location.root().join("data/.tidings/data.sqlite3").exists());
+    location.run(&["--backend", "fs", "list", "data"]).expect_code(1);
 }
 
 #[test]
@@ -89,9 +90,9 @@ fn contents_are_written_and_read_back_exactly() {
         location.write("config", "b.toml", "b = 1\n");
         assert_eq!(location.read("config", "b.toml"), "b = 1\n");
 
-        let from = location.root().join("../from.txt");
-        std::fs::write(&from, "from a file").unwrap();
-        let from = from.to_str().unwrap();
+        let from = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(from.path(), "from a file").unwrap();
+        let from = from.path().to_str().unwrap();
         location.run(&["write", "cache", "c.txt", "--from", from]).expect_success();
         assert_eq!(location.read("cache", "c.txt"), "from a file");
     }
@@ -100,9 +101,11 @@ fn contents_are_written_and_read_back_exactly() {
 #[test]
 fn contents_come_from_one_place_only() {
     let location = Location::with_store("fs");
-    let from = location.root().join("data/.tidings/backend");
-    let args = ["write", "data", "a.txt", "--contents", "a", "--from", from.to_str().unwrap()];
+    let from = tempfile::NamedTempFile::new().unwrap();
+    let args =
+        ["write", "data", "a.txt", "--contents", "a", "--from", from.path().to_str().unwrap()];
     location.run(&args).expect_code(1);
+    location.run(&["read", "data", "a.txt"]).expect_code(2);
 }
 
 #[test]
@@ -224,40 +227,58 @@ fn shell_commands_are_refused_as_one_shot_commands() {
     }
 }
 
+/// `tidings watch` running, with its lines as they come.
+struct Watch {
+    process: Child,
+    lines: Lines<BufReader<ChildStdout>>,
+}
+
+impl Watch {
+    /// Starts `tidings <args>`, and waits until it says on stderr that it is watching: a Change
+    /// made before then could be missed.
+    fn start(location: &Location, args: &[&str]) -> Watch {
+        let mut process = common::spawn(&mut location.command(args));
+        let lines = BufReader::new(process.stdout.take().unwrap()).lines();
+        let mut stderr = BufReader::new(process.stderr.take().unwrap()).lines();
+        assert!(stderr.next().unwrap().unwrap().contains("watching"));
+        Watch { process, lines }
+    }
+
+    /// The next line it printed.
+    fn next_line(&mut self) -> String {
+        self.lines.next().unwrap().unwrap()
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+    }
+}
+
 #[test]
 fn watch_prints_the_changes_to_the_areas_named() {
     for backend in BACKENDS {
         let location = Location::with_store(backend);
-        let mut watch = common::spawn(&mut location.command(&["watch", "data"]));
-        let mut lines = BufReader::new(watch.stdout.take().unwrap()).lines();
-        // It says on stderr once it is watching, before which a Change could be missed.
-        let mut stderr = BufReader::new(watch.stderr.take().unwrap()).lines();
-        assert!(stderr.next().unwrap().unwrap().contains("watching"));
-
+        let mut watch = Watch::start(&location, &["watch", "data"]);
         location.write("config", "ignored.toml", "x");
         std::thread::sleep(Duration::from_millis(300));
         location.write("data", "a.txt", "a");
-        assert_eq!(lines.next().unwrap().unwrap(), "external changed data a.txt");
+        assert_eq!(watch.next_line(), "external changed data a.txt");
         location.run(&["delete", "data", "a.txt"]).expect_success();
-        assert_eq!(lines.next().unwrap().unwrap(), "external removed data a.txt");
-        watch.kill().unwrap();
-        watch.wait().unwrap();
+        assert_eq!(watch.next_line(), "external removed data a.txt");
     }
 }
 
 #[test]
 fn watch_prints_json_lines() {
     let location = Location::with_store("sqlite");
-    let mut watch = common::spawn(&mut location.command(&["--json", "watch"]));
-    let mut lines = BufReader::new(watch.stdout.take().unwrap()).lines();
-    let mut stderr = BufReader::new(watch.stderr.take().unwrap()).lines();
-    stderr.next().unwrap().unwrap();
+    let mut watch = Watch::start(&location, &["--json", "watch"]);
     location.write("cache", "a.txt", "a");
-    let line: serde_json::Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+    let line: serde_json::Value = serde_json::from_str(&watch.next_line()).unwrap();
     assert_eq!(
         line,
         serde_json::json!({"origin": "external", "kind": "changed", "area": "cache", "path": "a.txt"})
     );
-    watch.kill().unwrap();
-    watch.wait().unwrap();
 }

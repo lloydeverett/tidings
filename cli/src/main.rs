@@ -2,7 +2,6 @@
 //! in a shell that keeps the Store open.
 
 mod command;
-mod edit;
 mod failure;
 mod location;
 mod output;
@@ -34,19 +33,27 @@ struct Cli {
     json: bool,
 
     #[command(subcommand)]
-    command: OneShot,
+    command: Command,
 }
 
+/// A one-shot command, or the shell.
+#[derive(Debug, Subcommand)]
+enum Command {
+    #[command(flatten)]
+    OneShot(OneShot),
+    /// Keep the Store open and type commands, building up Stagings over several of them
+    ///
+    /// Reads a script from stdin when it isn't a terminal, stopping at the first failure.
+    Shell,
+}
+
+/// A command that opens the Store, does one thing, and exits.
 #[derive(Debug, Subcommand)]
 enum OneShot {
     #[command(flatten)]
     Store(StoreCommand),
     /// Print the Changes to the Areas named, or to every Area, until Ctrl-C
     Watch { areas: Vec<AreaName> },
-    /// Keep the Store open and type commands, building up Stagings over several of them
-    ///
-    /// Reads a script from stdin when it isn't a terminal, stopping at the first failure.
-    Shell,
 }
 
 fn main() -> ExitCode {
@@ -66,8 +73,8 @@ fn main() -> ExitCode {
         }
     };
     let result = match cli.command {
-        OneShot::Shell => shell::run(&runtime, &cli.store, cli.json),
-        command => runtime.block_on(one_shot(&cli.store, cli.json, command)),
+        Command::Shell => shell::run(&runtime, &cli.store, cli.json),
+        Command::OneShot(command) => runtime.block_on(one_shot(&cli.store, cli.json, command)),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -78,6 +85,7 @@ fn main() -> ExitCode {
     }
 }
 
+/// Opens the Store `store` chooses, and runs `command` on it.
 async fn one_shot(store: &StoreArgs, json: bool, command: OneShot) -> Result<(), Failure> {
     let opened = store.open(false).await?;
     let output = Output { json, shell: false };
@@ -87,7 +95,7 @@ async fn one_shot(store: &StoreArgs, json: bool, command: OneShot) -> Result<(),
             Ok(output.print(&report)?)
         }
         OneShot::Watch { areas } => {
-            eprintln!("watching {} ({})", opened.location, opened.backend);
+            eprintln!("watching {}", opened.description);
             let areas: Vec<Area> = areas.into_iter().map(Area::from).collect();
             let mut feed = opened.feed;
             let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
@@ -107,6 +115,5 @@ async fn one_shot(store: &StoreArgs, json: bool, command: OneShot) -> Result<(),
                 }
             }
         }
-        OneShot::Shell => unreachable!("run by main"),
     }
 }

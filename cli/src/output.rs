@@ -11,18 +11,22 @@ use tidings::{
 pub enum Report {
     /// Nothing to print.
     Nothing,
+    /// A File that was read.
     File(File),
+    /// What `stat` gave for the File at the Path.
     Stat(Path, Stat),
+    /// The Paths `list` gave.
     Paths(Vec<Path>),
+    /// What `stat-prefix` gave for the Prefix in the Area.
     PrefixRevision(Area, Prefix, PrefixRevision),
+    /// A successful Commit.
     Committed(Committed),
     /// Something was added to the open Staging, which now holds `count` things.
-    Staged {
-        area: Area,
-        count: usize,
-    },
+    Staged { area: Area, count: usize },
     /// `edit` changed nothing, so nothing was committed.
     Unchanged,
+    /// The editor `edit` ran quit with a failure, so the edit was dropped.
+    Cancelled,
 }
 
 /// How to print.
@@ -38,7 +42,7 @@ impl Output {
     /// Prints `report` on stdout, or a note about it on stderr.
     pub fn print(self, report: &Report) -> io::Result<()> {
         if self.json {
-            if let Some(value) = json_of(report) {
+            if let Some(value) = as_json(report) {
                 return print_stdout(&format!("{value}\n"));
             }
             return Ok(());
@@ -72,6 +76,10 @@ impl Output {
             }
             Report::Unchanged => {
                 eprintln!("unchanged: nothing was committed");
+                Ok(())
+            }
+            Report::Cancelled => {
+                eprintln!("cancelled: the editor quit with a failure, so the edit was dropped");
                 Ok(())
             }
         }
@@ -115,7 +123,7 @@ impl Output {
 }
 
 /// `report` as JSON, or `None` if it has nothing to show.
-fn json_of(report: &Report) -> Option<Value> {
+fn as_json(report: &Report) -> Option<Value> {
     Some(match report {
         Report::Nothing => return None,
         Report::File(file) => json!({
@@ -147,6 +155,7 @@ fn json_of(report: &Report) -> Option<Value> {
             json!({"staged": {"area": area_name(*area), "count": count}})
         }
         Report::Unchanged => json!({"unchanged": true}),
+        Report::Cancelled => json!({"cancelled": true}),
     })
 }
 

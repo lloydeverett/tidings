@@ -23,6 +23,7 @@ impl Run {
         self
     }
 
+    /// Fails the test unless the run succeeded, exiting with 0.
     #[track_caller]
     pub fn expect_success(self) -> Run {
         self.expect_code(0)
@@ -47,6 +48,7 @@ impl Location {
         location
     }
 
+    /// The directory the Store's Areas are in.
     pub fn root(&self) -> &Path {
         self.directory.path()
     }
@@ -88,6 +90,7 @@ pub fn tidings() -> Command {
     command
 }
 
+/// The `tidings` binary Cargo built for these tests.
 pub fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_tidings"))
 }

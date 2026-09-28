@@ -1,14 +1,16 @@
 //! The commands that work on a Store, both as one-shot commands and in the shell, and the
 //! session that runs them.
 
+mod edit;
+
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand, ValueEnum};
+use tempfile::TempPath;
 use tidings::{Area, Precondition, Prefix, PrefixRevision, Revision, Staging, Store};
 
-use crate::edit;
 use crate::failure::Failure;
 use crate::output::{Report, area_name};
 
@@ -59,8 +61,9 @@ pub enum StoreCommand {
     },
     /// Edit a File in $VISUAL or $EDITOR, and write it back unless it changed meanwhile
     ///
-    /// A missing File starts empty, and is written only if it is still missing. On a Conflict,
-    /// the edited text is kept in a temporary file, which is named.
+    /// A missing File starts empty, and is written only if it is still missing. Quitting the
+    /// editor with a failure, as with `:cq` in vim, cancels the edit. On a Conflict, the edited
+    /// text is kept in a temporary file, which is named.
     Edit { area: AreaName, path: String },
 }
 
@@ -130,13 +133,33 @@ pub struct Session {
 }
 
 /// The shell's open Staging.
-pub struct OpenStaging {
+struct OpenStaging {
     staging: Staging,
     /// How many things were staged, for the prompt.
     count: usize,
+    /// The temporary files holding the text of each `edit` staged, so that it can be kept if the
+    /// Commit fails. Dropping them removes them.
+    edits: Vec<TempPath>,
+}
+
+impl OpenStaging {
+    fn new(area: Area) -> OpenStaging {
+        OpenStaging { staging: Staging::new(area), count: 0, edits: Vec::new() }
+    }
+
+    /// Stages what `stage` does, and counts it.
+    fn add(
+        &mut self,
+        stage: impl FnOnce(&mut Staging) -> tidings::Result<()>,
+    ) -> Result<Report, Failure> {
+        stage(&mut self.staging)?;
+        self.count += 1;
+        Ok(Report::Staged { area: self.staging.area(), count: self.count })
+    }
 }
 
 impl Session {
+    /// A session on `store`, in the shell if `shell`.
     pub fn new(store: Store, shell: bool) -> Session {
         Session { store, shell, staging: None, prefix_revisions: HashMap::new() }
     }
@@ -146,6 +169,7 @@ impl Session {
         self.staging.as_ref().map(|open| (open.staging.area(), open.count))
     }
 
+    /// Runs `command`.
     pub async fn run(&mut self, command: StoreCommand) -> Result<Report, Failure> {
         match command {
             StoreCommand::Read { area, path } => {
@@ -190,17 +214,13 @@ impl Session {
                 self.stage_or_commit(area.into(), |staging| staging.delete_prefix(prefix).map(drop))
                     .await
             }
-            StoreCommand::Edit { area, path } => edit::edit(self, area.into(), &path).await,
+            StoreCommand::Edit { area, path } => self.edit(area.into(), &path).await,
         }
-    }
-
-    pub fn store(&self) -> &Store {
-        &self.store
     }
 
     /// Adds what `stage` stages to the open Staging, which must be for `area`, or, with none
     /// open, commits it straight away.
-    pub async fn stage_or_commit(
+    async fn stage_or_commit(
         &mut self,
         area: Area,
         stage: impl FnOnce(&mut Staging) -> tidings::Result<()>,
@@ -208,9 +228,7 @@ impl Session {
         match &mut self.staging {
             Some(open) => {
                 check_area(&open.staging, area)?;
-                stage(&mut open.staging)?;
-                open.count += 1;
-                Ok(Report::Staged { area, count: open.count })
+                open.add(stage)
             }
             None => {
                 let mut staging = Staging::new(area);
@@ -228,16 +246,13 @@ impl Session {
                 area_name(open)
             )));
         }
-        self.staging = Some(OpenStaging { staging: Staging::new(area), count: 0 });
+        self.staging = Some(OpenStaging::new(area));
         Ok(Report::Nothing)
     }
 
     /// `require`: requires `precondition` of the File at `path` in the open Staging.
     pub fn require(&mut self, path: &str, precondition: Precondition) -> Result<Report, Failure> {
-        let open = self.open()?;
-        open.staging.require(path, precondition)?;
-        open.count += 1;
-        Ok(Report::Staged { area: open.staging.area(), count: open.count })
+        self.open()?.add(|staging| staging.require(path, precondition).map(drop))
     }
 
     /// `require-prefix`: requires everything under `prefix` to be unchanged since the last
@@ -255,17 +270,21 @@ impl Session {
             )));
         };
         let revision = revision.clone();
-        let open = self.open()?;
-        open.staging.require_prefix(prefix, revision)?;
-        open.count += 1;
-        Ok(Report::Staged { area, count: open.count })
+        self.open()?.add(|staging| staging.require_prefix(prefix, revision).map(drop))
     }
 
     /// `commit`: commits the open Staging, which is closed whether or not the Commit succeeds.
+    /// If it fails, the text of each `edit` staged is kept.
     pub async fn commit(&mut self) -> Result<Report, Failure> {
         self.open()?;
         let open = self.staging.take().expect("checked above");
-        Ok(Report::Committed(self.store.commit(open.staging).await?))
+        match self.store.commit(open.staging).await {
+            Ok(committed) => Ok(Report::Committed(committed)),
+            Err(error) => {
+                let failure = Failure::from(error);
+                Err(open.edits.into_iter().fold(failure, keep_edit))
+            }
+        }
     }
 
     /// `discard`: closes the open Staging without committing it.
@@ -300,6 +319,15 @@ impl Session {
                 Ok(contents)
             }
         }
+    }
+}
+
+/// `failure` with a note of where the edited text in `edit` is kept, now that it won't be
+/// written.
+fn keep_edit(failure: Failure, edit: TempPath) -> Failure {
+    match edit.keep() {
+        Ok(kept) => failure.with_note(format!("your edit is kept in {}", kept.display())),
+        Err(error) => failure.with_note(format!("your edit couldn't be kept: {error}")),
     }
 }
 

@@ -37,9 +37,9 @@ impl Failure {
         Failure { kind: FailureKind::Missing, message }
     }
 
-    /// Adds `more` to the end of the message.
-    pub fn and(mut self, more: impl fmt::Display) -> Failure {
-        self.message = format!("{}: {more}", self.message);
+    /// Adds `note` to the end of the message.
+    pub fn with_note(mut self, note: impl fmt::Display) -> Failure {
+        self.message = format!("{}: {note}", self.message);
         self
     }
 
@@ -49,6 +49,7 @@ impl Failure {
         self
     }
 
+    /// The exit code: 1, 2 or 3, as [`FailureKind`] says.
     pub fn exit_code(&self) -> ExitCode {
         ExitCode::from(match self.kind {
             FailureKind::Error => 1,
@@ -69,7 +70,8 @@ impl From<tidings::Error> for Failure {
         match error {
             tidings::Error::Conflict { paths } => {
                 let paths: Vec<&str> = paths.iter().map(|path| path.as_str()).collect();
-                let message = format!("conflict: a Precondition failed for {}", paths.join(", "));
+                let message =
+                    format!("Conflict: a Precondition did not hold for {}", paths.join(", "));
                 Failure { kind: FailureKind::Conflict, message }
             }
             error => Failure::error(error.to_string()),

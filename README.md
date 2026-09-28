@@ -19,7 +19,7 @@ echo 'a = 1' | tidings write config app.toml
 tidings read config app.toml                # the contents, exactly as stored
 tidings stat config app.toml                # its Revision and modified time
 tidings write data a.txt --contents x --if-revision <revision>
-tidings edit config app.toml                # in $VISUAL or $EDITOR; a Conflict keeps your edit
+tidings edit config app.toml                # in $VISUAL or $EDITOR; :cq cancels, a Conflict keeps your edit
 tidings watch data                          # every Change to data, until Ctrl-C
 ```
 

@@ -66,6 +66,7 @@ struct Identity {
 }
 
 impl Identity {
+    /// Parses `tld.author.app`: exactly three parts, none of them empty.
     fn parse(text: &str) -> Result<Identity, String> {
         let parts: Vec<&str> = text.split('.').collect();
         match parts[..] {
@@ -80,10 +81,12 @@ impl Identity {
 /// A Store the CLI opened, with its Change feed.
 pub struct Opened {
     pub store: Store,
+    /// The Store's one Change feed.
     pub feed: ChangeFeed,
+    /// The Backend it was opened on, which may have been found from its location.
     pub backend: BackendName,
-    /// Where the Store is, for a person to read.
-    pub location: String,
+    /// Where the Store is and its Backend, for a person to read.
+    pub description: String,
 }
 
 /// Where a Store on the filesystem or SQLite is.
@@ -135,9 +138,11 @@ impl StoreArgs {
             }
             BackendName::Memory => unreachable!("opened above"),
         };
-        Ok(Opened { store, feed, backend, location: location.description })
+        let description = format!("{} ({backend})", location.description);
+        Ok(Opened { store, feed, backend, description })
     }
 
+    /// Opens a Store on the memory Backend, if `in_shell`, and nothing says where it is.
     fn open_memory(&self, in_shell: bool) -> Result<Opened, Failure> {
         if !in_shell {
             return Err(Failure::error(
@@ -145,15 +150,19 @@ impl StoreArgs {
                  can use it",
             ));
         }
-        if self.root.is_some() || self.identity.is_some() {
+        if self.root.is_some() || self.identity.is_some() || self.create {
             return Err(Failure::error(
-                "the memory Backend has no location: leave out --root and --identity",
+                "the memory Backend has no location, and is always new: leave out --root, \
+                 --identity and --create",
             ));
         }
         let (store, feed) = Store::open_memory();
-        Ok(Opened { store, feed, backend: BackendName::Memory, location: "memory".to_owned() })
+        let description = "a new Store in memory".to_owned();
+        Ok(Opened { store, feed, backend: BackendName::Memory, description })
     }
 
+    /// Where the Store on the filesystem or SQLite is, from exactly one of `--root` and
+    /// `--identity`.
     fn location(&self) -> Result<Location, Failure> {
         match (&self.root, &self.identity) {
             (Some(root), None) => Ok(Location {

@@ -25,11 +25,12 @@ use crate::output::{Output, Report, area_name};
     disable_version_flag = true,
     help_template = "{all-args}"
 )]
-struct Line {
+struct ShellLine {
     #[command(subcommand)]
     command: ShellCommand,
 }
 
+/// The commands the shell takes: those one-shot mode takes, apart from `watch`, and its own.
 #[derive(Debug, Subcommand)]
 enum ShellCommand {
     #[command(flatten)]
@@ -63,12 +64,14 @@ enum ShellCommand {
     Exit,
 }
 
+/// `on` or `off`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Switch {
     On,
     Off,
 }
 
+/// Parses what `require` requires: `absent`, or a Revision.
 fn parse_required(text: &str) -> Result<Precondition, String> {
     if text == "absent" {
         return Ok(Precondition::Absent);
@@ -85,26 +88,30 @@ pub fn run(runtime: &Runtime, args: &StoreArgs, json: bool) -> Result<(), Failur
         session: Session::new(opened.store, true),
         output: Output { json, shell: true },
         backend: opened.backend,
-        location: opened.location,
     };
     if io::stdin().is_terminal() {
+        eprintln!(
+            "tidings shell on {}: `help` lists the commands, `exit` or Ctrl-D leaves",
+            opened.description,
+        );
         shell.interactive(runtime, opened.feed)
     } else {
         shell.script(runtime, opened.feed)
     }
 }
 
+/// The shell's state, and how it prints.
 struct Shell {
     session: Session,
     output: Output,
+    /// For the prompt.
     backend: BackendName,
-    /// Where the Store is, for a person to read.
-    location: String,
 }
 
-/// Whether to go on reading commands.
+/// Whether to go on reading commands after one.
 enum Flow {
     Continue,
+    /// `exit`.
     Exit,
 }
 
@@ -116,19 +123,16 @@ impl Shell {
             DefaultEditor::new().map_err(|error| Failure::error(format!("{error}")))?;
         let printer =
             editor.create_external_printer().map_err(|error| Failure::error(format!("{error}")))?;
-        let live = Arc::new(Mutex::new(Live { on: true, at_prompt: false, held: Vec::new() }));
-        runtime.spawn(print_feed(feed, self.output, Arc::clone(&live), printer));
+        let feed_lines =
+            Arc::new(Mutex::new(FeedLines { on: true, at_prompt: false, held: Vec::new() }));
+        runtime.spawn(print_feed(feed, self.output, Arc::clone(&feed_lines), printer));
         // Ctrl-C while a command or the editor runs leaves the shell open. At the prompt, the
         // line editor reads it as a key instead.
         runtime.spawn(async { while tokio::signal::ctrl_c().await.is_ok() {} });
-        eprintln!(
-            "tidings shell on {} ({}): `help` lists the commands, `exit` or Ctrl-D leaves",
-            self.location, self.backend,
-        );
         loop {
-            live.lock().unwrap().release_held();
+            feed_lines.lock().unwrap().release_held();
             let line = editor.readline(&self.prompt());
-            live.lock().unwrap().at_prompt = false;
+            feed_lines.lock().unwrap().at_prompt = false;
             let line = match line {
                 Ok(line) => line,
                 Err(ReadlineError::Interrupted) => continue,
@@ -136,7 +140,7 @@ impl Shell {
                 Err(error) => return Err(Failure::error(format!("can't read a line: {error}"))),
             };
             let _ = editor.add_history_entry(line.as_str());
-            match self.execute(runtime, &line, |on| live.lock().unwrap().switch(on)) {
+            match self.execute(runtime, &line, |on| feed_lines.lock().unwrap().switch(on)) {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Exit) => break,
                 Err(failure) => eprintln!("error: {failure}"),
@@ -155,7 +159,7 @@ impl Shell {
             let line =
                 line.map_err(|error| Failure::error(format!("can't read stdin: {error}")))?;
             let flow = self.execute(runtime, &line, |switch| on = switch);
-            for item in std::iter::from_fn(|| ready(&mut feed)) {
+            for item in std::iter::from_fn(|| next_ready(&mut feed)) {
                 if on {
                     self.output.feed_lines(&item, &[]).iter().for_each(|line| eprintln!("{line}"));
                 }
@@ -186,7 +190,7 @@ impl Shell {
         }
         let words = shell_words::split(line)
             .map_err(|error| Failure::error(format!("can't split the line into words: {error}")))?;
-        let command = match Line::try_parse_from(words) {
+        let command = match ShellLine::try_parse_from(words) {
             Ok(line) => line.command,
             Err(error) if !error.use_stderr() => {
                 // Help, which clap prints on stdout, in colour on a terminal.
@@ -239,15 +243,16 @@ impl Shell {
 /// The Change feed's lines while the shell is interactive. They are printed straight away at the
 /// prompt, and otherwise held until it is back, so they don't land in a command's output or
 /// in the editor `edit` runs.
-struct Live {
+struct FeedLines {
     /// `feed on`.
     on: bool,
     /// Whether the shell is waiting at the prompt.
     at_prompt: bool,
+    /// The lines that arrived while a command ran.
     held: Vec<String>,
 }
 
-impl Live {
+impl FeedLines {
     /// Prints the lines held while a command ran, now that the prompt is back.
     fn release_held(&mut self) {
         for line in self.held.drain(..) {
@@ -256,6 +261,7 @@ impl Live {
         self.at_prompt = true;
     }
 
+    /// `feed on` or `feed off`. Lines held while it was on are dropped when it goes off.
     fn switch(&mut self, on: bool) {
         self.on = on;
         if !on {
@@ -264,30 +270,30 @@ impl Live {
     }
 }
 
-/// Prints each item on `feed`, as [`Live`] says, until the feed ends.
+/// Prints each item on `feed`, as [`FeedLines`] says, until the feed ends.
 async fn print_feed(
     mut feed: ChangeFeed,
     output: Output,
-    live: Arc<Mutex<Live>>,
+    feed_lines: Arc<Mutex<FeedLines>>,
     mut printer: impl ExternalPrinter + Send + 'static,
 ) {
     while let Some(item) = feed.next().await {
-        let mut live = live.lock().unwrap();
-        if !live.on {
+        let mut lines = feed_lines.lock().unwrap();
+        if !lines.on {
             continue;
         }
         for line in output.feed_lines(&item, &[]) {
-            if live.at_prompt {
+            if lines.at_prompt {
                 let _ = printer.print(format!("{line}\n"));
             } else {
-                live.held.push(line);
+                lines.held.push(line);
             }
         }
     }
 }
 
 /// The next item on `feed` if one is there already, without waiting.
-fn ready(feed: &mut ChangeFeed) -> Option<FeedItem> {
+fn next_ready(feed: &mut ChangeFeed) -> Option<FeedItem> {
     let next = pin!(feed.next());
     match next.poll(&mut Context::from_waker(Waker::noop())) {
         Poll::Ready(item) => item,

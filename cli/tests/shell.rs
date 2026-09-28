@@ -178,6 +178,10 @@ fn the_shell_opens_stores_as_one_shot_commands_do() {
     location.run_with_stdin(&["shell"], "list data\n").expect_code(1);
     let run = location.run_with_stdin(&["--backend", "fs", "--create", "shell"], "list data\n");
     run.expect_success();
+    // The memory Backend has no location, and is always new.
     let run = location.run_with_stdin(&["--backend", "memory", "shell"], "list data\n");
     run.expect_code(1);
+    let mut command = tidings();
+    command.args(["--backend", "memory", "--create", "shell"]);
+    common::run(command, "list data\n").expect_code(1);
 }

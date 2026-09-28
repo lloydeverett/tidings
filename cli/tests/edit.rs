@@ -16,6 +16,24 @@ fn editing(location: &Location, args: &[&str], script: &str, stdin: &str) -> Run
     run(command, stdin)
 }
 
+/// An editor script that saves `text`, then has someone else write `theirs` to data `a.txt`
+/// before the edit is written back.
+fn saving_while_someone_writes(text: &str) -> String {
+    format!(
+        r#"printf {text} > "$0" && "$TIDINGS" --root "$ROOT" write data a.txt --contents theirs"#
+    )
+}
+
+/// The file a failure's message says the edited text is kept in, which is the last word of it.
+/// Removes the file, and gives what it held.
+#[track_caller]
+fn kept_text(run: &Run) -> String {
+    let kept = run.stderr.trim_end().rsplit(' ').next().unwrap();
+    let text = std::fs::read_to_string(kept).unwrap_or_else(|error| panic!("{error}: {run:?}"));
+    std::fs::remove_file(kept).unwrap();
+    text
+}
+
 #[test]
 fn an_edited_file_is_written_back() {
     let location = Location::with_store("fs");
@@ -45,32 +63,32 @@ fn an_unchanged_buffer_commits_nothing() {
 fn a_file_changed_while_it_was_edited_is_a_conflict_that_keeps_the_edit() {
     let location = Location::with_store("fs");
     location.write("data", "a.txt", "original");
-    // The editor saves, and meanwhile someone else writes the File.
-    let script =
-        r#"printf mine > "$0" && "$TIDINGS" --root "$ROOT" write data a.txt --contents theirs"#;
-    let run = editing(&location, &["edit", "data", "a.txt"], script, "").expect_code(3);
+    let script = saving_while_someone_writes("mine");
+    let run = editing(&location, &["edit", "data", "a.txt"], &script, "").expect_code(3);
     assert_eq!(location.read("data", "a.txt"), "theirs");
-    let kept = run.stderr.trim_end().rsplit(' ').next().unwrap();
-    assert_eq!(std::fs::read_to_string(kept).unwrap(), "mine", "{run:?}");
-    std::fs::remove_file(kept).unwrap();
+    assert_eq!(kept_text(&run), "mine");
 }
 
 #[test]
 fn a_file_created_while_it_was_edited_is_a_conflict() {
     let location = Location::with_store("sqlite");
-    let script =
-        r#"printf mine > "$0" && "$TIDINGS" --root "$ROOT" write data a.txt --contents theirs"#;
-    let run = editing(&location, &["edit", "data", "a.txt"], script, "").expect_code(3);
-    let kept = run.stderr.trim_end().rsplit(' ').next().unwrap();
-    std::fs::remove_file(kept).unwrap();
+    let script = saving_while_someone_writes("mine");
+    let run = editing(&location, &["edit", "data", "a.txt"], &script, "").expect_code(3);
+    assert_eq!(kept_text(&run), "mine");
 }
 
 #[test]
-fn an_editor_that_fails_commits_nothing() {
+fn quitting_the_editor_with_a_failure_cancels_the_edit() {
     let location = Location::with_store("fs");
     let script = r#"printf changed > "$0"; exit 1"#;
-    editing(&location, &["edit", "data", "a.txt"], script, "").expect_code(1);
+    let run = editing(&location, &["edit", "data", "a.txt"], script, "").expect_success();
+    assert!(run.stderr.contains("cancelled"), "{run:?}");
     location.run(&["read", "data", "a.txt"]).expect_code(2);
+
+    // In the shell, nothing is staged, and a script carries on.
+    let shell = "stage data\nedit data a.txt\ncommit\nlist data\n";
+    let run = editing(&location, &["shell"], script, shell).expect_success();
+    assert!(run.stdout.is_empty(), "{run:?}");
 }
 
 #[test]
@@ -84,15 +102,19 @@ fn with_no_editor_set_edit_fails() {
 fn in_a_staging_the_edit_is_staged_with_its_precondition() {
     let location = Location::with_store("fs");
     location.write("data", "a.txt", "original");
-    let script = r#"printf mine > "$0""#;
     let shell = "stage data\nedit data a.txt\nlist data\ncommit\n";
-    let run = editing(&location, &["shell"], script, shell).expect_success();
+    let run = editing(&location, &["shell"], r#"printf mine > "$0""#, shell).expect_success();
     assert!(run.stdout.starts_with("a.txt\n"), "{run:?}");
     assert_eq!(location.read("data", "a.txt"), "mine");
+}
 
-    // Changed by someone else before the commit.
-    let script =
-        r#"printf again > "$0" && "$TIDINGS" --root "$ROOT" write data a.txt --contents theirs"#;
-    editing(&location, &["shell"], script, shell).expect_code(3);
+#[test]
+fn a_staged_edit_that_conflicts_at_the_commit_is_kept() {
+    let location = Location::with_store("fs");
+    location.write("data", "a.txt", "original");
+    let script = saving_while_someone_writes("again");
+    let shell = "stage data\nedit data a.txt\ncommit\n";
+    let run = editing(&location, &["shell"], &script, shell).expect_code(3);
     assert_eq!(location.read("data", "a.txt"), "theirs");
+    assert_eq!(kept_text(&run), "again");
 }
