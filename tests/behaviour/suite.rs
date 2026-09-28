@@ -8,7 +8,7 @@ use std::time::Duration;
 use jiff::Timestamp;
 use tidings::{
     Area, ChangeKind, Committed, Error, FeedItem, File, InvalidPathReason, Origin, Path,
-    Precondition, Staging,
+    Precondition, Revision, Staging,
 };
 
 use crate::api::{ChangeFeed, Snapshot, Store};
@@ -52,6 +52,8 @@ macro_rules! behaviour_suite {
             a_commit_that_touches_nothing_announces_nothing,
             a_read_file_was_last_modified_by_its_commit,
             a_revision_is_decided_by_the_contents_alone,
+            a_revision_written_as_text_reads_back_as_itself,
+            a_prefix_revision_is_written_as_its_hash,
             a_commit_announces_one_batch_of_local_changes,
             a_staging_is_built_without_the_store,
             a_dropped_staging_writes_nothing,
@@ -362,6 +364,41 @@ pub async fn a_revision_is_decided_by_the_contents_alone(fixture: &impl Fixture)
     staging.write("a.txt", "different").unwrap();
     store.commit(staging).await.unwrap();
     assert_eq!(read(&store, Area::Cache, "a.txt").await.revision(), c.revision());
+}
+
+pub async fn a_revision_written_as_text_reads_back_as_itself(fixture: &impl Fixture) {
+    let Opened { store, feed: _feed } = fixture.open().await;
+
+    let mut staging = Staging::new(Area::Data);
+    staging.write("a.txt", "some text").unwrap();
+    store.commit(staging).await.unwrap();
+
+    let revision = read(&store, Area::Data, "a.txt").await.revision();
+    let text = revision.to_string();
+    assert_eq!(text.len(), 32);
+    assert!(text.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)), "{text}");
+    assert_eq!(text.parse::<Revision>().unwrap(), revision);
+    assert_eq!(text.to_uppercase().parse::<Revision>().unwrap(), revision);
+
+    for invalid in ["", "abc", &text[1..], &format!("{text}0"), &format!("+{}", &text[1..])] {
+        assert!(invalid.parse::<Revision>().is_err(), "{invalid:?} parsed");
+    }
+    assert!(format!("{}g", &text[1..]).parse::<Revision>().is_err());
+}
+
+pub async fn a_prefix_revision_is_written_as_its_hash(fixture: &impl Fixture) {
+    let Opened { store, feed: _feed } = fixture.open().await;
+
+    let empty = store.stat_prefix(Area::Data, "notes/").await.unwrap().to_string();
+    let mut staging = Staging::new(Area::Data);
+    staging.write("notes/a.txt", "a").unwrap();
+    store.commit(staging).await.unwrap();
+    let written = store.stat_prefix(Area::Data, "notes/").await.unwrap().to_string();
+
+    assert_eq!(written.len(), 32);
+    assert!(written.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    assert_ne!(empty, written);
+    assert_eq!(store.stat_prefix(Area::Data, "notes/").await.unwrap().to_string(), written);
 }
 
 pub async fn a_commit_announces_one_batch_of_local_changes(fixture: &impl Fixture) {

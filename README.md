@@ -102,5 +102,8 @@ Each with why, where it isn't obvious.
 - A SQLite store more than 10 minutes behind other processes' commits (a stopped process, say)
   gets a resync. *Why:* the log of commits is pruned, so it stays small without tracking which
   stores are open.
+- **Each area records which backend holds it,** in `.tidings/backend`, and a store on the other
+  backend refuses to open it (`Error::WrongBackend`). `Store::detect` finds which one a location
+  has. The first store to open an area marks it, taking over what is already there.
 - Not supported: binary files; moving data between backends; size limits or eviction for the
   cache; your own backends; other programs writing to tidings' SQLite databases.

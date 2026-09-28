@@ -29,6 +29,7 @@ mod store;
 #[cfg(any(feature = "fs", feature = "sqlite"))]
 pub use app::AppIdentity;
 pub use area::Area;
+pub use backend::BackendKind;
 #[cfg(feature = "fs")]
 pub use backend::fs::FsOptions;
 #[cfg(all(feature = "fs", feature = "testing"))]
@@ -42,7 +43,7 @@ pub use file::{File, Stat};
 pub use path::{IntoPath, InvalidPathReason, Path};
 pub use precondition::Precondition;
 pub use prefix::{IntoPrefix, Prefix};
-pub use revision::{PrefixRevision, Revision};
+pub use revision::{ParseRevisionError, PrefixRevision, Revision};
 pub use snapshot::Snapshot;
 pub use staging::Staging;
 pub use store::Store;

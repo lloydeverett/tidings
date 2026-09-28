@@ -10,6 +10,8 @@ use tokio::task::AbortHandle;
 
 #[cfg(any(feature = "fs", feature = "sqlite"))]
 use crate::AppIdentity;
+#[cfg(any(feature = "fs", feature = "sqlite"))]
+use crate::BackendKind;
 #[cfg(feature = "testing")]
 use crate::ChangeKind;
 #[cfg(feature = "fs")]
@@ -22,6 +24,8 @@ use crate::backend::RawChange;
 use crate::backend::fs::{FsBackend, FsWatcher};
 #[cfg(feature = "sqlite")]
 use crate::backend::sqlite::{SqliteBackend, SqlitePoller};
+#[cfg(any(feature = "fs", feature = "sqlite"))]
+use crate::backend::{self, marker};
 use crate::backend::{Backend, CommitRequest, Observed, memory::MemoryBackend};
 use crate::change::{self, FeedSender};
 use crate::{
@@ -142,8 +146,14 @@ impl Store {
     ///
     /// The filesystem has no Snapshots: see [`supports_snapshots`](Self::supports_snapshots).
     ///
-    /// Gives [`Error::Backend`](crate::Error::Backend) if a directory can't be made, or the
-    /// record of an interrupted Commit can't be read.
+    /// Each Area records that the filesystem holds it, in its Backend marker, which opening writes
+    /// if it has none, taking over whatever files are already there as its Files. Gives
+    /// [`Error::WrongBackend`](crate::Error::WrongBackend), without changing anything, if an Area
+    /// is marked for SQLite: see [`detect`](Self::detect).
+    ///
+    /// Gives [`Error::Backend`](crate::Error::Backend) if a directory can't be made, a Backend
+    /// marker names no Backend or can't be read, or the record of an interrupted Commit can't be
+    /// read.
     ///
     /// # Panics
     ///
@@ -160,16 +170,22 @@ impl Store {
         }))
     }
 
-    /// Opens a Store that keeps each Area in a SQLite database of its own, in the Area's standard
-    /// directory for `app`, or under the Root override in `options`. Opening creates the
-    /// databases and their directories if they don't exist. Returns the Store together with its
-    /// one Change feed.
+    /// Opens a Store that keeps each Area in a SQLite database of its own, in the `.tidings/`
+    /// directory in the Area's standard directory for `app`, or under the Root override in
+    /// `options`. Opening creates the databases and their directories if they don't exist.
+    /// Returns the Store together with its one Change feed.
+    ///
+    /// Each Area records that SQLite holds it, in its Backend marker, which opening writes if it
+    /// has none. Other files already in an Area's directory are left there, and aren't Files.
+    /// Gives [`Error::WrongBackend`](crate::Error::WrongBackend), without changing anything, if
+    /// an Area is marked for the filesystem: see [`detect`](Self::detect).
     ///
     /// Other processes can open the same databases, and commit to them safely: Commits are
     /// applied one at a time. Every poll interval in `options`, the Store checks for their
     /// Commits, which arrive on the Change feed as external Changes, each Commit's in one batch.
     ///
-    /// Gives [`Error::Backend`](crate::Error::Backend) if a database can't be opened or created.
+    /// Gives [`Error::Backend`](crate::Error::Backend) if a database can't be opened or created,
+    /// or a Backend marker names no Backend or can't be read.
     ///
     /// # Panics
     ///
@@ -184,6 +200,28 @@ impl Store {
             let following = follow_other_stores(poller, feed.clone(), Arc::clone(commit_order));
             Some(supervise("following other Stores' Commits", following, feed))
         }))
+    }
+
+    /// Finds which Backend holds the Store for `app`, or the one under `root_override`, from the
+    /// Backend marker each Area has once a Store on the filesystem or SQLite has opened it. Gives
+    /// `None` if no Area is marked, as where no Store has been opened. It creates and changes
+    /// nothing.
+    ///
+    /// Gives [`Error::WrongBackend`](crate::Error::WrongBackend) if the Areas are marked for
+    /// different Backends, naming the first Area marked for another Backend than the Areas before
+    /// it, and [`Error::Backend`](crate::Error::Backend) if a marker names no Backend or can't be
+    /// read.
+    ///
+    /// # Panics
+    ///
+    /// If it isn't called from within a tokio runtime.
+    #[cfg(any(feature = "fs", feature = "sqlite"))]
+    pub async fn detect(
+        app: &AppIdentity,
+        root_override: Option<&std::path::Path>,
+    ) -> Result<Option<BackendKind>> {
+        let directories = app.area_directories(root_override)?;
+        backend::off_runtime(move || marker::detect(&directories)).await
     }
 
     /// Opens a Store on `backend`, with its Change feed. `follow` starts the task that follows

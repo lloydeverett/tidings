@@ -1,4 +1,4 @@
-use crate::{InvalidPathReason, Path};
+use crate::{Area, BackendKind, InvalidPathReason, Path};
 
 /// Everything that can go wrong in tidings.
 ///
@@ -37,6 +37,17 @@ pub enum Error {
     /// if it still can't.
     #[error("the Commit happened, but isn't finished yet")]
     Pending,
+    /// The Area belongs to another Backend: its Backend marker names `found`. Opening a Store on
+    /// the filesystem or SQLite gives it, without changing anything, for the first Area marked
+    /// for the other Backend. So does [`Store::detect`](crate::Store::detect), for the first Area
+    /// marked for another Backend than the Areas before it.
+    #[error("the {area:?} Area belongs to the {found} Backend")]
+    WrongBackend {
+        /// The Area.
+        area: Area,
+        /// The Backend its marker names.
+        found: BackendKind,
+    },
     /// The Store's Backend can't do this. A Snapshot on the filesystem gives it: check
     /// [`Store::supports_snapshots`](crate::Store::supports_snapshots) first.
     #[error("not supported by this Store's Backend")]

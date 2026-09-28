@@ -5,6 +5,8 @@
 mod api;
 #[path = "../common/mod.rs"]
 mod common;
+#[cfg(all(feature = "fs", feature = "sqlite"))]
+mod markers;
 #[macro_use]
 mod suite;
 #[cfg(any(feature = "fs", feature = "sqlite"))]

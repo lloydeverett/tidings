@@ -3,6 +3,8 @@
 
 #[cfg(feature = "fs")]
 pub(crate) mod fs;
+#[cfg(any(feature = "fs", feature = "sqlite"))]
+pub(crate) mod marker;
 pub(crate) mod memory;
 #[cfg(feature = "sqlite")]
 pub(crate) mod sqlite;
@@ -15,6 +17,27 @@ use jiff::Timestamp;
 use crate::Error;
 use crate::staging::{Action, PlannedRevisions, Staged};
 use crate::{Area, ChangeKind, File, Origin, Path, Prefix, PrefixRevision, Result, Revision, Stat};
+
+/// A Backend that keeps its Areas on disk, as an Area's Backend marker names it. Opening a Store
+/// on one Backend refuses Areas marked for the other, and
+/// [`Store::detect`](crate::Store::detect) finds which one a location has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BackendKind {
+    /// The filesystem, as [`Store::open_fs`](crate::Store::open_fs) opens it.
+    Fs,
+    /// SQLite, as [`Store::open_sqlite`](crate::Store::open_sqlite) opens it.
+    Sqlite,
+}
+
+/// Its name in lower case, `fs` or `sqlite`.
+impl std::fmt::Display for BackendKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            BackendKind::Fs => "fs",
+            BackendKind::Sqlite => "sqlite",
+        })
+    }
+}
 
 /// The Backend a Store was opened on.
 #[derive(Debug)]
@@ -302,7 +325,7 @@ impl BackendSnapshot {
 
 /// Runs `call` on one of tokio's blocking threads, so that it doesn't hold up the async runtime.
 #[cfg(any(feature = "fs", feature = "sqlite"))]
-async fn off_runtime<T: Send + 'static>(
+pub(crate) async fn off_runtime<T: Send + 'static>(
     call: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
     match tokio::task::spawn_blocking(call).await {

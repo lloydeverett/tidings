@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use xxhash_rust::xxh3::{Xxh3, xxh3_128};
@@ -11,6 +12,9 @@ use crate::{Area, Path, Prefix};
 /// Two Files with the same contents have the same Revision, on every Backend: a Revision is a
 /// 128-bit hash (XXH3) of the contents. So a File that is changed and then changed back counts
 /// as unchanged.
+///
+/// It is written as 32 lowercase hexadecimal digits, and parses back from them (in either case),
+/// so that it can be shown to a person, or passed between processes, and used as a Precondition.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Revision(u128);
 
@@ -41,9 +45,35 @@ impl Revision {
 
 impl fmt::Debug for Revision {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Revision({:032x})", self.0)
+        write!(f, "Revision({self})")
     }
 }
+
+/// 32 lowercase hexadecimal digits.
+impl fmt::Display for Revision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:032x}", self.0)
+    }
+}
+
+/// Exactly 32 hexadecimal digits, in either case, as [`Display`](fmt::Display) writes them.
+impl FromStr for Revision {
+    type Err = ParseRevisionError;
+
+    fn from_str(text: &str) -> Result<Revision, ParseRevisionError> {
+        // `from_str_radix` alone would also take a sign, and fewer digits.
+        if text.len() != 32 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ParseRevisionError);
+        }
+        u128::from_str_radix(text, 16).map(Revision).map_err(|_| ParseRevisionError)
+    }
+}
+
+/// Text that isn't a [`Revision`]: it must be exactly 32 hexadecimal digits.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("a Revision is 32 hexadecimal digits")]
+#[non_exhaustive]
+pub struct ParseRevisionError;
 
 /// An opaque value identifying the state of everything under a Prefix: which Paths exist there,
 /// and the Revision of each. It is given by [`Store::stat_prefix`](crate::Store::stat_prefix), and
@@ -52,6 +82,9 @@ impl fmt::Debug for Revision {
 /// Adding, removing or changing a File under the Prefix changes it. Two Prefix Revisions are equal
 /// when they were taken for the same Area and Prefix, and cover the same Paths with the same
 /// Revisions.
+///
+/// It is written as the 32 lowercase hexadecimal digits of that hash, for a person to compare. It
+/// doesn't parse back, since the Paths and Revisions it covers can't be recovered from the hash.
 ///
 /// It keeps a list of the Paths it covers and their Revisions, so that a Conflict can name the
 /// ones that changed. Holding one therefore costs memory in proportion to the number of Files
@@ -125,6 +158,13 @@ impl Eq for PrefixRevision {}
 impl std::hash::Hash for PrefixRevision {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         (self.area, &self.prefix, self.hash).hash(state);
+    }
+}
+
+/// The 32 lowercase hexadecimal digits of its hash. The Area and Prefix aren't written.
+impl fmt::Display for PrefixRevision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:032x}", self.hash)
     }
 }
 

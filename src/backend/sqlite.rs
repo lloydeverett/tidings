@@ -1,4 +1,6 @@
-//! The SQLite Backend: one database per Area, in that Area's directory, in WAL mode.
+//! The SQLite Backend: one database per Area, in WAL mode, in the `.tidings/` directory in the
+//! Area's directory, where the Area's Backend marker is. So nothing SQLite keeps there shows to
+//! someone looking at the Area's directory as if it held Files.
 //!
 //! Each database has a `files` table holding each File's Path, the Path's letter-case fold, its
 //! contents, when it was last modified and its Revision. A Commit is one write transaction, begun
@@ -40,12 +42,15 @@ use std::time::Duration;
 use jiff::Timestamp;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
 
-use super::{AreaState, CommitOutcome, CommitRequest, Observed, Planned, RawChange, off_runtime};
+use super::{
+    AreaState, CommitOutcome, CommitRequest, Observed, Planned, RawChange, marker, off_runtime,
+};
 use crate::app::AppIdentity;
 use crate::area::PerArea;
-use crate::path::{letter_case_fold, letter_case_fold_unicode_versions, range_under};
+use crate::path::{RESERVED, letter_case_fold, letter_case_fold_unicode_versions, range_under};
 use crate::{
-    Area, ChangeKind, Error, File, Origin, Path, Prefix, PrefixRevision, Result, Revision, Stat,
+    Area, BackendKind, ChangeKind, Error, File, Origin, Path, Prefix, PrefixRevision, Result,
+    Revision, Stat,
 };
 
 /// How to open a Store on SQLite, with [`Store::open_sqlite`](crate::Store::open_sqlite).
@@ -211,7 +216,8 @@ pub(crate) struct AreaConnection(Arc<Mutex<Connection>>);
 pub(crate) type SqliteSnapshot = AreaConnection;
 
 impl SqliteBackend {
-    /// Opens each Area's database, creating it and its directory if they don't exist. Gives the
+    /// Marks each Area for SQLite ([`marker`]), or fails if one is another Backend's, then opens
+    /// each Area's database, creating it and its directories if they don't exist. Gives the
     /// Backend, and the poller that notices other Stores' Commits from the end of each change log
     /// as it is now.
     pub(crate) async fn open(
@@ -220,10 +226,12 @@ impl SqliteBackend {
     ) -> Result<(SqliteBackend, SqlitePoller)> {
         let directories = app.area_directories(options.root_override.as_deref())?;
         let areas = off_runtime(move || {
+            for area in marker::claim(&directories, BackendKind::Sqlite)? {
+                warn_if_holding_other_files(area, directories.get(area));
+            }
             PerArea::try_from_fn(|area| {
-                let directory = directories.get(area);
-                std::fs::create_dir_all(directory).map_err(Error::backend)?;
-                let path = directory.join(format!("{}.sqlite3", area.name()));
+                let path =
+                    directories.get(area).join(RESERVED).join(format!("{}.sqlite3", area.name()));
                 let (connection, log) = open_database(&path)?;
                 let connection = AreaConnection::new(connection);
                 let log = Arc::new(Mutex::new(log));
@@ -299,6 +307,20 @@ impl SqliteBackend {
             store.read_log_and(TransactionBehavior::Immediate, committing).await?;
         outcome.observed_before = observed_before;
         Ok(outcome)
+    }
+}
+
+/// Warns that `area`, just adopted by SQLite, holds other files in `directory`, besides the
+/// `.tidings/` directory SQLite keeps everything in. SQLite never shows them as Files, so an app
+/// that expected them there, as if the Area were the filesystem's, finds it empty.
+fn warn_if_holding_other_files(area: Area, directory: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else { return };
+    let others = entries.flatten().any(|entry| entry.file_name() != RESERVED);
+    if others {
+        tracing::warn!(
+            "the {area:?} Area at {} already held files, which SQLite doesn't show as Files",
+            directory.display(),
+        );
     }
 }
 
@@ -760,7 +782,8 @@ mod tests {
         store.commit(staging).await.unwrap();
         drop(store);
 
-        let database = Connection::open(root.path().join("config/config.sqlite3")).unwrap();
+        let database = root.path().join("config/.tidings/config.sqlite3");
+        let database = Connection::open(database).unwrap();
         database.execute("UPDATE files SET fold = 'stale'", []).unwrap();
         let versions = "UPDATE meta SET value = 'other' WHERE name = ?1";
         database.execute(versions, [FOLD_UNICODE_VERSIONS]).unwrap();

@@ -3,7 +3,7 @@
 //!
 //! **Where Areas are.** In the platform's standard config, data and cache directories for the App
 //! identity, or under the Root override. Each Area's root has a `.tidings/` directory of tidings'
-//! own, which holds the lock and the journal.
+//! own, which holds the Backend marker ([`marker`]), the lock and the journal.
 //!
 //! **Reading.** Reads, stat and listing go straight to the directory tree, so they see Files other
 //! programs made as well. Where the journal holds a Commit that has happened but isn't finished,
@@ -106,13 +106,14 @@ use xxhash_rust::xxh3::xxh3_128;
 use self::journal::{AsFinished, Journal, Recovery, Remove, Replace, Target};
 pub(crate) use self::watch::FsWatcher;
 use self::watch::Reported;
-use super::{AreaState, CommitOutcome, CommitRequest, Planned, off_runtime};
+use super::{AreaState, CommitOutcome, CommitRequest, Planned, marker, off_runtime};
 use crate::app::AppIdentity;
 use crate::area::PerArea;
-use crate::path::{letter_case_fold, temporary_file_name};
+use crate::path::{RESERVED, letter_case_fold, temporary_file_name};
 use crate::staging::has_name;
 use crate::{
-    Area, Error, File, InvalidPathReason, Path, Prefix, PrefixRevision, Result, Revision, Stat,
+    Area, BackendKind, Error, File, InvalidPathReason, Path, Prefix, PrefixRevision, Result,
+    Revision, Stat,
 };
 
 /// How to open a Store on the filesystem, with [`Store::open_fs`](crate::Store::open_fs).
@@ -314,7 +315,9 @@ pub(crate) struct FsBackend {
 }
 
 impl FsBackend {
-    /// Makes each Area's root and its `.tidings/` directory if they don't exist, finishes or
+    /// Marks each Area for the filesystem ([`marker`]), adopting what an unmarked one holds, or
+    /// fails if one is another Backend's. Makes each Area's root and its `.tidings/` directory if
+    /// they don't exist, finishes or
     /// discards any Commit a crash left in its journal, and starts watching the Areas, giving the
     /// watcher for the Store to run.
     pub(crate) async fn open(
@@ -341,6 +344,7 @@ impl FsBackend {
             })),
         };
         let areas = off_runtime(move || {
+            marker::claim(&roots, BackendKind::Fs)?;
             PerArea::try_from_fn(|area| {
                 #[cfg_attr(not(feature = "testing"), expect(unused_mut))]
                 let mut root = AreaRoot::open(roots.get(area).clone())?;
@@ -484,7 +488,7 @@ impl AreaRoot {
 
     /// tidings' own directory in the Area.
     fn tidings(&self) -> PathBuf {
-        self.root.join(".tidings")
+        self.root.join(RESERVED)
     }
 
     /// Opens the lock file, making the Area's root and `.tidings/` first if they don't exist, as

@@ -43,9 +43,9 @@ impl Path {
     }
 }
 
-/// The top-level name tidings keeps its own bookkeeping under. It is its own
-/// [`letter_case_fold`].
-const RESERVED: &str = ".tidings";
+/// The top-level name tidings keeps its own bookkeeping under: the directory in each Area's root
+/// that holds everything a Backend keeps there. It is its own [`letter_case_fold`].
+pub(crate) const RESERVED: &str = ".tidings";
 
 /// Why `path` is refused, if it is.
 pub(crate) fn refusal(path: &str) -> Option<InvalidPathReason> {

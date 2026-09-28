@@ -27,6 +27,12 @@ an error.
 What actually holds a Store's Files: the filesystem, SQLite or memory.
 _Avoid_: provider, driver, adapter
 
+**Backend marker**:
+The record in each of an Area's directories of which Backend holds it: the filesystem or SQLite. A
+Store on the other Backend refuses to open the Area. An Area without one is unmarked, and the first
+Store to open it marks it.
+_Avoid_: backend tag, store type
+
 **App identity**:
 The app name, author and top-level domain that decide where a Store's Areas are on this platform.
 
@@ -56,13 +62,14 @@ _Avoid_: directory, folder
 
 **Revision**:
 An opaque value identifying one state of a File, as returned when the File is read. It is used to
-tell whether the File has changed since then.
+tell whether the File has changed since then. It can be written as text and read back.
 _Avoid_: version, etag, last_modified (that is a timestamp, not a Revision)
 
 **Prefix Revision**:
 An opaque value identifying the state of everything under a Prefix: which Paths exist there and the
 Revision of each. It changes if a File under the Prefix is added, removed or changed. It belongs to
-one Area and one Prefix, and can only be required for those.
+one Area and one Prefix, and can only be required for those. It can be written as text, to compare,
+but not read back.
 _Avoid_: token, digest, listing hash
 
 **Snapshot**:

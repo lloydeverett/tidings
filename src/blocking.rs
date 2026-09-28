@@ -20,14 +20,14 @@ use std::time::Duration;
 
 use tokio::runtime::Handle;
 
-#[cfg(any(feature = "fs", feature = "sqlite"))]
-use crate::AppIdentity;
 #[cfg(feature = "testing")]
 use crate::ChangeKind;
 #[cfg(feature = "fs")]
 use crate::FsOptions;
 #[cfg(feature = "sqlite")]
 use crate::SqliteOptions;
+#[cfg(any(feature = "fs", feature = "sqlite"))]
+use crate::{AppIdentity, BackendKind};
 use crate::{
     Area, Committed, FeedItem, File, IntoPath, IntoPrefix, Path, PrefixRevision, Result, Staging,
     Stat,
@@ -118,6 +118,17 @@ impl Store {
         let runtime = SharedRuntime::start();
         let opened = runtime.block_on(crate::Store::open_sqlite(app, options))?;
         Ok(Store::opened(opened, runtime))
+    }
+
+    /// Finds which Backend holds the Store for `app`, or the one under `root_override`, as
+    /// [`crate::Store::detect`] does, with the same errors. It needs no runtime, and can be called
+    /// anywhere.
+    #[cfg(any(feature = "fs", feature = "sqlite"))]
+    pub fn detect(
+        app: &AppIdentity,
+        root_override: Option<&std::path::Path>,
+    ) -> Result<Option<BackendKind>> {
+        crate::backend::marker::detect(&app.area_directories(root_override)?)
     }
 
     /// The blocking Store and Change feed for an async Store and its feed, opened on `runtime`.
