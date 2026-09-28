@@ -10,7 +10,7 @@
 //! they see the Area as finishing it will leave it (see **Commits**). A File's Revision is a hash
 //! of its contents, so stat reads the whole File, and so does working out a Prefix Revision, for
 //! every File under the Prefix. A File that isn't valid UTF-8 is listed and has a Revision, but
-//! reading it gives [`Error::NotText`]. Reads follow symlinks, to Files and to directories.
+//! reading it gives [`Error::NotText`]. Reads follow symlinks to Files.
 //!
 //! **Names on disk that aren't Paths.** Another program can make names no Path has: names Windows
 //! reserves, names not in NFC form or not valid UTF-8, `.tidings/`, and tidings' temporary files.
@@ -19,6 +19,13 @@
 //! letter case can both be on disk on a case-sensitive filesystem, if another program made them:
 //! both are listed, as the Files they are, but a Commit can't add another name that clashes with
 //! them.
+//!
+//! **Symlinks to directories.** An Area's root is resolved through any symlinks once, when the
+//! Store opens, so a root that is a link, as to a dotfiles repo, keeps the directory it led to
+//! then. Inside an Area, a symlink to a directory is left out, with everything under it, as names
+//! that aren't Paths are: so every File has one Path, and every directory that holds Files is in
+//! the Area, and watched. A Commit that would write through one is refused with
+//! [`DirectoryLink`](InvalidPathReason::DirectoryLink).
 //!
 //! **Exact names.** A Path names only the file on disk with exactly its name. Some filesystems
 //! (macOS's and Windows' by default) also find `Foo` when asked for `foo`. Opening a Store finds
@@ -34,8 +41,8 @@
 //! 2. work out what the Commit changes with the rules every Backend shares
 //!    ([`CommitRequest::plan`]), reading the Area from disk. Then refuse what the filesystem
 //!    couldn't finish, or would get wrong: two Paths that are the same file on disk (through a
-//!    symlink), something that isn't a File where a File or its directory must go, and a
-//!    symlink into a directory that doesn't exist;
+//!    symlink), something that isn't a File where a File or its directory must go, a symlink to
+//!    a directory on the way, and a symlink into a directory that doesn't exist;
 //! 3. write the journal as `prepared`, listing each temporary file and what it replaces, unless
 //!    the Commit only deletes, and so has none;
 //! 4. write each temporary file, with the Commit's timestamp as its modification time, and force it
@@ -65,9 +72,8 @@
 //!
 //! **Symlinks.** A write to a Path that is a symlink goes to the File the link points to, wherever
 //! that is, and the link stays. The directory it points into must exist: a write through a link to
-//! a File never makes a directory, so it can't make one outside the Area. (A write under a
-//! symlink to a directory makes any directories it needs in that directory, wherever it is.) A
-//! delete removes the link itself.
+//! a File never makes a directory, so it can't make one outside the Area. A delete removes the
+//! link itself.
 //!
 //! **What other programs see.** A program outside tidings can see a Commit half applied, during
 //! step 6. And one that writes a File after step 2 and before step 6 has its edit overwritten if
@@ -450,9 +456,9 @@ struct Writing {
 
 impl AreaRoot {
     /// The Area whose root is `root`, which it makes, with its `.tidings/` directory and lock
-    /// file, if they don't exist. It finds out whether the filesystem there treats names that
-    /// differ in letter case as the same: whether `.tidings/LOCK` finds the lock file, though no
-    /// entry has that name.
+    /// file, if they don't exist, and then resolves through any symlinks. It finds out whether
+    /// the filesystem there treats names that differ in letter case as the same: whether
+    /// `.tidings/LOCK` finds the lock file, though no entry has that name.
     fn open(root: PathBuf) -> Result<AreaRoot> {
         let mut area = AreaRoot {
             root,
@@ -461,6 +467,7 @@ impl AreaRoot {
             failures: FailureSetup::default(),
         };
         drop(area.lock_file()?);
+        area.root = fs::canonicalize(&area.root).map_err(|error| failed(&area.root, error))?;
         let tidings = area.tidings();
         let upper_case = tidings.join("LOCK");
         area.names_fold = present_at(fs::symlink_metadata(&upper_case), &upper_case)?.is_some()
@@ -574,36 +581,40 @@ impl AreaRoot {
     }
 
     /// Follows `segments` down from the root while each is a directory there under exactly its
-    /// own name. The one walk from the root that reads, writes and finishing share.
+    /// own name, and not a symlink. The one walk from the root that reads, writes and finishing
+    /// share.
     fn own_directories(&self, segments: &[&str]) -> Result<OwnDirectories> {
         let mut directory = self.root.clone();
         for (count, segment) in segments.iter().enumerate() {
             let next = directory.join(segment);
-            if next.is_dir() && self.named_exactly(&next)? {
+            let there = present_at(fs::symlink_metadata(&next), &next)?;
+            if there.as_ref().is_some_and(fs::Metadata::is_dir) && self.named_exactly(&next)? {
                 directory = next;
                 continue;
             }
-            let there = present_at(fs::symlink_metadata(&next), &next)?.is_some();
-            let next_under_other_name = there && !self.named_exactly(&next)?;
-            return Ok(OwnDirectories { directory, count, next_under_other_name });
+            let next_left_out = match there {
+                None => None,
+                Some(_) if !self.named_exactly(&next)? => Some(LeftOut::UnderOtherName),
+                Some(there) if there.is_symlink() && next.is_dir() => Some(LeftOut::DirectoryLink),
+                Some(_) => None,
+            };
+            return Ok(OwnDirectories { directory, count, next_left_out });
         }
-        Ok(OwnDirectories { directory, count: segments.len(), next_under_other_name: false })
+        Ok(OwnDirectories { directory, count: segments.len(), next_left_out: None })
     }
 
-    /// Whether nothing at `name`, a Path or a Prefix without its `/`, or on the way to it, is
-    /// found only under another name that the filesystem treats as the same.
-    fn found_under_its_own_name(&self, name: &str) -> Result<bool> {
-        if !self.names_fold {
-            return Ok(true);
-        }
+    /// Why `name`, a Path or a Prefix without its `/`, is left out of the Area, if it is: it, or
+    /// a directory on the way to it, is found only under another name that the filesystem treats
+    /// as the same, or is a symlink to a directory.
+    fn left_out(&self, name: &str) -> Result<Option<LeftOut>> {
         let segments: Vec<&str> = name.split('/').collect();
-        Ok(!self.own_directories(&segments)?.next_under_other_name)
+        Ok(self.own_directories(&segments)?.next_left_out)
     }
 
     /// The contents of the File at `path` and when it was last modified, or `None` if there is no
-    /// File there under exactly that name. It follows a symlink.
+    /// File there under exactly that name. It follows a symlink to a File.
     fn read(&self, path: &Path) -> Result<Option<(Vec<u8>, Timestamp)>> {
-        if !self.found_under_its_own_name(path.as_str())? {
+        if self.left_out(path.as_str())?.is_some() {
             return Ok(None);
         }
         read_file(&self.file(path.as_str()))
@@ -741,23 +752,27 @@ impl AreaRoot {
     /// Where a write of `path` goes. `removed` holds the [`deleted_form`](Self::deleted_form) of
     /// each Path the Commit deletes.
     ///
-    /// A symlink is followed to the File it points to, whose directory must exist. Otherwise the
-    /// File goes at `path`, and its temporary file in the nearest directory on the way that exists
-    /// under its own name. Whatever stands where the File or its first missing directory must go
-    /// has to be removed by the Commit's deletes, or the write is refused with
-    /// [`FileUnderFile`](InvalidPathReason::FileUnderFile) before the Commit happens, since
-    /// otherwise it couldn't be finished. Paths in the way were refused already, by the checks
-    /// every Backend shares. This catches the rest: a directory with nothing in it, or only names
-    /// that aren't Paths, a symlink to nothing or another kind of file where a directory must
-    /// go, and on a filesystem that ignores letter case, a name that differs only in case.
+    /// A Path that is, or is under, a symlink to a directory is refused with
+    /// [`DirectoryLink`](InvalidPathReason::DirectoryLink). A symlink to a File is followed to
+    /// it, and its directory must exist. Otherwise the File goes at `path`, and its temporary file
+    /// in the nearest directory on the way that exists under its own name. Whatever stands where
+    /// the File or its first missing directory must go has to be removed by the Commit's
+    /// deletes, or the write is refused with [`FileUnderFile`](InvalidPathReason::FileUnderFile)
+    /// before the Commit happens, since otherwise it couldn't be finished. Paths in the way were
+    /// refused already, by the checks every Backend shares. This catches the rest: a directory
+    /// with nothing in it, or only names that aren't Paths, a symlink to nothing or another kind
+    /// of file where a directory must go, and on a filesystem that ignores letter case, a name
+    /// that differs only in case.
     fn where_to_write(&self, path: &Path, removed: &HashSet<String>) -> Result<Destination> {
         let file = self.file(path.as_str());
-        let in_the_way = || Error::InvalidPath {
-            path: path.as_str().to_owned(),
-            reason: InvalidPathReason::FileUnderFile,
-        };
+        let refused = |reason| Error::InvalidPath { path: path.as_str().to_owned(), reason };
+        let in_the_way = || refused(InvalidPathReason::FileUnderFile);
+        let left_out = self.left_out(path.as_str())?;
+        if left_out == Some(LeftOut::DirectoryLink) {
+            return Err(refused(InvalidPathReason::DirectoryLink));
+        }
         let there = present_at(fs::symlink_metadata(&file), &file)?;
-        let own_name = self.found_under_its_own_name(path.as_str())?;
+        let own_name = left_out.is_none();
         if own_name && there.as_ref().is_some_and(fs::Metadata::is_symlink) {
             let target = through_links(file)?;
             let directory = target.parent().map(FsPath::to_path_buf).unwrap_or_default();
@@ -831,8 +846,9 @@ impl AreaRoot {
         Some(self.deleted_form(&segments?.join("/")))
     }
 
-    /// Which file on disk `name` in `directory` is, whichever symlinks to directories led there:
-    /// the directory as [`fs::canonicalize`] gives it, and `name`, which may go on through
+    /// Which file on disk `name` in `directory` is, whichever symlinks to directories led there,
+    /// as they can to the File a symlink points to, outside the Area: the directory as
+    /// [`fs::canonicalize`] gives it, and `name`, which may go on through
     /// directories that don't exist yet. Where names fold, it is folded as a whole, since two
     /// names that differ only in letter case are then one file. (If a symlink leads from there to
     /// a filesystem that doesn't fold, that could take two files for one, which refuses a Commit
@@ -868,35 +884,23 @@ impl AreaRoot {
     }
 
     /// The Path of every File under `prefix`, in order, with the directory tree walked from the
-    /// Prefix down. Names that aren't Paths are left out, and so is everything under them.
+    /// Prefix down. Names that aren't Paths are left out, and so is everything under them, and
+    /// under symlinks to directories.
     fn paths_under(&self, prefix: &Prefix) -> Result<Vec<Path>> {
         let mut found = Vec::new();
         if let Some(name) = prefix.as_str().strip_suffix('/')
-            && !self.found_under_its_own_name(name)?
+            && self.left_out(name)?.is_some()
         {
             return Ok(found);
         }
-        let start = self.file(prefix.as_str());
-        let mut ancestors = Vec::new();
-        if let Ok(canonical) = fs::canonicalize(&start) {
-            ancestors.push(canonical);
-        }
-        self.walk(&start, prefix.as_str(), &mut ancestors, &mut found)?;
+        self.walk(&self.file(prefix.as_str()), prefix.as_str(), &mut found)?;
         found.sort();
         Ok(found)
     }
 
     /// Adds every File in the directory `directory`, whose Prefix is `prefix`, and in the
-    /// directories under it, to `found`. `ancestors` are the directories it is in, as
-    /// [`fs::canonicalize`] gives them, so that a symlink to one of them isn't followed round and
-    /// round.
-    fn walk(
-        &self,
-        directory: &FsPath,
-        prefix: &str,
-        ancestors: &mut Vec<PathBuf>,
-        found: &mut Vec<Path>,
-    ) -> Result<()> {
+    /// directories under it, to `found`.
+    fn walk(&self, directory: &FsPath, prefix: &str, found: &mut Vec<Path>) -> Result<()> {
         let Some(entries) = present_at(fs::read_dir(directory), directory)? else { return Ok(()) };
         for entry in entries {
             let entry = entry.map_err(|error| failed(directory, error))?;
@@ -908,22 +912,9 @@ impl AreaRoot {
                         found.push(path);
                     }
                 }
-                OnDisk::Directory { symlink } => {
+                OnDisk::Directory => {
                     let Ok(under) = Prefix::new(format!("{prefix}{name}/")) else { continue };
-                    let entry = entry.path();
-                    let canonical = if symlink {
-                        let Ok(canonical) = fs::canonicalize(&entry) else { continue };
-                        if ancestors.contains(&canonical) {
-                            continue;
-                        }
-                        canonical
-                    } else {
-                        ancestors.last().map_or_else(|| entry.clone(), |last| last.join(&name))
-                    };
-                    ancestors.push(canonical);
-                    let walked = self.walk(&entry, under.as_str(), ancestors, found);
-                    ancestors.pop();
-                    walked?;
+                    self.walk(&entry.path(), under.as_str(), found)?;
                 }
             }
         }
@@ -931,19 +922,21 @@ impl AreaRoot {
     }
 }
 
-/// What a directory entry is, following a symlink.
+/// What a directory entry is, following a symlink to a File.
 enum OnDisk {
     File,
-    Directory { symlink: bool },
+    Directory,
 }
 
 impl OnDisk {
     /// What `entry` is, or `None` if it is neither a File nor a directory, as a symlink to nothing
-    /// isn't.
+    /// isn't. A symlink to a directory is `None` too, since it is left out of the Area.
     fn of(entry: &fs::DirEntry) -> Result<Option<OnDisk>> {
         let file_type = entry.file_type().map_err(|error| failed(&entry.path(), error))?;
-        let symlink = file_type.is_symlink();
-        let file_type = if symlink {
+        if file_type.is_dir() {
+            return Ok(Some(OnDisk::Directory));
+        }
+        let file_type = if file_type.is_symlink() {
             match present_at(fs::metadata(entry.path()), &entry.path())? {
                 Some(metadata) => metadata.file_type(),
                 None => return Ok(None),
@@ -951,13 +944,7 @@ impl OnDisk {
         } else {
             file_type
         };
-        Ok(if file_type.is_dir() {
-            Some(OnDisk::Directory { symlink })
-        } else if file_type.is_file() {
-            Some(OnDisk::File)
-        } else {
-            None
-        })
+        Ok(file_type.is_file().then_some(OnDisk::File))
     }
 }
 
@@ -1001,10 +988,10 @@ impl AreaState for AreaRoot {
                     let Some(on_disk) = OnDisk::of(&entry)? else { continue };
                     let named = format!("{prefix}{entry_name}");
                     match on_disk {
-                        OnDisk::Directory { .. } if !last => next.push(format!("{named}/")),
+                        OnDisk::Directory if !last => next.push(format!("{named}/")),
                         // Every File under `name` has the name `name`, so none is looked at.
-                        OnDisk::Directory { .. } if format!("{named}/") == name => {}
-                        OnDisk::Directory { .. } => {
+                        OnDisk::Directory if format!("{named}/") == name => {}
+                        OnDisk::Directory => {
                             if let Ok(under) = Prefix::new(format!("{named}/")) {
                                 found.extend(AreaRoot::paths_under(self, &under)?);
                             }
@@ -1038,15 +1025,22 @@ struct OwnDirectories {
     directory: PathBuf,
     /// How many segments they are.
     count: usize,
-    /// Whether the segment after them is there, but only under another name that the filesystem
-    /// treats as the same.
-    next_under_other_name: bool,
+    /// Why the segment after them is left out of the Area, if it is there but left out.
+    next_left_out: Option<LeftOut>,
+}
+
+/// Why something on disk is left out of the Area, as [`AreaRoot::left_out`] gives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeftOut {
+    /// It is there only under another name that the filesystem treats as the same.
+    UnderOtherName,
+    /// It is a symlink to a directory.
+    DirectoryLink,
 }
 
 /// Refuses a write to a file on disk that another Path of the Commit writes or deletes too, as
 /// two Paths are when one is a symlink to the other. Which of them wins would depend on the order
-/// they land in, and finishing the Commit again after a crash could lose the write. Two deletes of
-/// one file are fine, as through a directory link: the second finds nothing.
+/// they land in, and finishing the Commit again after a crash could lose the write.
 #[derive(Default)]
 struct SameFile {
     /// Each file on disk a Path the Commit writes is, as [`AreaRoot::identity`] gives it.
@@ -1170,8 +1164,11 @@ fn write_temporary_file(
 }
 
 /// Removes `directory`, which holds nothing but directories that hold nothing. It fails if there
-/// is anything else in it.
+/// is anything else in it, or if it is a symlink, so that nothing outside the Area is removed.
 fn remove_empty_directories(directory: &FsPath) -> io::Result<()> {
+    if !fs::symlink_metadata(directory)?.is_dir() {
+        return Err(io::Error::other("it isn't a directory"));
+    }
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         if entry.file_type()?.is_dir() {

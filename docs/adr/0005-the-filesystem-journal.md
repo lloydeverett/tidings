@@ -42,8 +42,8 @@ Details settled while building it (ticket 09):
 - A write through a symlink to a file goes to the file the link points to, and its temporary file
   next to that. Such a write never makes a directory, so it can't make one outside the Area: if
   the directory the link points into doesn't exist, the Commit is refused with `Backend` before
-  step 2. A write under a symlink to a directory is different: it makes the directories it needs
-  in that directory, wherever the link points, as writing there by hand would.
+  step 2. A symlink to a directory is left out of the Area, so a write under one is refused with
+  `DirectoryLink` before step 2 too.
 - Between steps 1 and 2, the Commit is also refused, with `InvalidPath`, where finishing it could
   go wrong. With `FileUnderFile`, if something that isn't a Path stands where a File it writes, or
   a directory for one, must go, and the Commit's deletes don't remove it: a directory holding
@@ -52,10 +52,8 @@ Details settled while building it (ticket 09):
   finished. With `SameFile`, if two of its Paths are the same file on disk, as a symlink and the
   File it points to are, or two links to one File, and one of them is written. Otherwise one
   Path's delete could remove what another's write put there, and which wins would depend on the
-  order they land in. Two deletes of one file are fine, as a Prefix delete over a directory link
-  and the directory it points to makes: the second finds nothing. Where names fold, which file a
-  Path is on disk is compared folded, so links to `foo` and `FOO` are one file; a write of `foo`
-  with a delete of `Foo` is still a rename.
+  order they land in. Where names fold, which file a Path is on disk is compared folded, so links
+  to `foo` and `FOO` are one file; a write of `foo` with a delete of `Foo` is still a rename.
 - A Path names only the file with exactly its name. Where the filesystem ignores letter case
   (macOS's and Windows' by default, found out when a Store opens, from whether `.tidings/LOCK`
   finds `.tidings/lock`), reads check each name on the way against the directory's entries, so

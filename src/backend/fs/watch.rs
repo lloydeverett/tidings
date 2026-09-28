@@ -44,12 +44,11 @@
 //!
 //! **What is remembered.** [`Reported`] holds every File in the Area, so that removing a
 //! directory, or a File no event names, can be told apart from nothing: memory in proportion to
-//! the number of Files. It starts from a listing when the Store opens. Config's Files are read
-//! then, so their Revisions are known; the other Areas' aren't, since a Cache can be large, so it
-//! knows no Revision until a File changes. Until then, an event that rewrites a File there with
-//! the same contents gives a Change, and so does setting only its modification time, which
-//! inotify reports as a write. (The Revisions of the Files of a Commit in the journal are known
-//! in every Area, so that finishing it later gives nothing.)
+//! the number of Files. It starts from a listing when the Store opens. The Files aren't read then,
+//! since they can be large, so it knows no Revision until a File changes. Until then, an event
+//! that rewrites a File with the same contents gives a Change, and so does setting only its
+//! modification time, which inotify reports as a write. (The Revisions of the Files of a Commit in
+//! the journal are known, so that finishing it later gives nothing.)
 //!
 //! **Removals the debouncer drops.** The debouncer drops the events of a name that was created and
 //! then removed within the window. But a File replaced by a rename readings created, so one replaced
@@ -62,11 +61,9 @@
 //! each chain of links, watches the directory of each link and of the file at the end if it is
 //! outside the Areas, and readings at the linking Path whenever any of them has events, following the
 //! chain again. It notices links made, changed or removed from their Paths' events. Symlinks to
-//! directories aren't followed by watching, and neither are those on the way to a link: each
-//! directory is watched under its own name only, so a directory reachable under two Prefixes
-//! isn't reported under both. So edits under a link to a directory elsewhere in the Area arrive
-//! under that directory's own Prefix, and edits under a link to a directory outside the Areas
-//! aren't reported.
+//! directories aren't followed by watching: they are left out of the Areas, with everything under
+//! them, so every directory that holds Files is watched under its own name. A directory replaced
+//! by a link to one is compared with the Files reported under it, as any directory removed is.
 //!
 //! **Resyncs, and watching again.** If the watcher reports an error, or that it lost track of
 //! events, the Areas it concerns get a Resync, and each is watched again from its root, since the
@@ -93,8 +90,8 @@ use notify_debouncer_full::{
 };
 use tokio::sync::{Notify, mpsc};
 
+use super::AreaRoot;
 use super::journal::AsFinished;
-use super::{AreaRoot, failed};
 use crate::area::PerArea;
 use crate::backend::{CommitOutcome, Observed, RawChange, off_runtime};
 use crate::path::{is_temporary_file_name, range_under};
@@ -392,9 +389,9 @@ struct Watches {
     debouncer: Debouncer<RecommendedWatcher, RemovalHook>,
     /// What the debouncer's file ID cache adds to, which unwatching adds to as well.
     removals: Arc<Removals>,
-    /// Each Area's root as [`fs::canonicalize`] gave it, which the paths of its events start
-    /// with. It is known while the Area isn't watched too, so that no directory in it is watched
-    /// apart from it.
+    /// Each Area's root, which the paths of its events start with, since it was resolved through
+    /// its symlinks when the Store opened. It is known while the Area isn't watched too, so that
+    /// no directory in it is watched apart from it.
     area_paths: PerArea<PathBuf>,
     /// Whether each Area is watched.
     watching: PerArea<bool>,
@@ -450,10 +447,7 @@ impl FsWatcher {
         let mut watches = Watches {
             debouncer,
             removals: Arc::clone(&removals),
-            area_paths: PerArea::from_fn(|area| {
-                let root = &areas.get(area).0.root;
-                fs::canonicalize(root).unwrap_or_else(|_| root.clone())
-            }),
+            area_paths: PerArea::from_fn(|area| areas.get(area).0.root.clone()),
             watching: PerArea::default(),
             retrying: PerArea::default(),
             outside: HashMap::new(),
@@ -710,7 +704,7 @@ impl Watches {
             return Err(Error::backend("failed at FailurePoint::WatchingAnAreaFails"));
         }
         drop(root.lock_file()?);
-        let path = fs::canonicalize(&root.root).map_err(|error| failed(&root.root, error))?;
+        let path = root.root.clone();
         self.debouncer.watch(&path, RecursiveMode::Recursive).map_err(|error| {
             Error::backend(format!("watching {} for changes failed: {error}", path.display()))
         })?;
@@ -953,8 +947,8 @@ impl Watched {
         Ok(read_files)
     }
 
-    /// Lists every File in `area`. Config's Files are read, and so are those of a Commit in the
-    /// journal. Keeps track of their symlinks.
+    /// Lists every File in `area`, reading only those of a Commit in the journal. Keeps track of
+    /// their symlinks.
     fn list(&mut self, area: Area) -> Result<ReadFiles> {
         self.links.forget(&mut self.watches, area);
         let root = Arc::clone(&self.areas.get(area).root);
@@ -962,7 +956,7 @@ impl Watched {
         let in_journal: BTreeSet<&Path> = finished.paths().collect();
         let mut listed = ReadFiles { whole_area: true, ..ReadFiles::default() };
         for path in finished.paths_under(&Prefix::new("")?)? {
-            let state = if area == Area::Config || in_journal.contains(&path) {
+            let state = if in_journal.contains(&path) {
                 // One that can't be read is listed with no known Revision, rather than stop
                 // the Store opening.
                 state_of(&finished, &path).unwrap_or_else(|error| {

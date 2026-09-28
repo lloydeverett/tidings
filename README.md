@@ -34,26 +34,17 @@ Ways you could lose data or see confusing behaviour, and why.
   - Outside programs can also see a commit half-applied.
 - **The change feed doesn't give you every step.** It says which path changed, not the new
   contents, and merges unread changes to the same path. Re-read to see what's there.
-- **The feed can send a resync instead of changes.** You must re-read the whole area, or miss
-  changes. *Why:* the alternative is missing them silently.
-  - Happens if watching fails or an area's directory is removed (cache cleared, say).
-  - On SQLite, also if a store falls over 10 minutes behind other processes' commits (a stopped
-    process, say).
 - **Other processes' changes arrive late,** so until then your reads and the feed disagree.
-  *Why:* SQLite has no cross-process notification, so is polled.
-  - SQLite: up to one poll interval (100 ms by default).
+  - SQLite: up to one poll interval (100 ms by default). *Why:* SQLite can't notify other
+    processes of a commit, so each store checks. Each check reads a counter from memory SQLite
+    shares between processes, not the disk.
   - Filesystem: once events have been quiet for 150 ms, so that a file an editor is saving isn't
     reported half-written. Longer if they keep coming.
   - On the filesystem, your own commit can be reported before another process's commit made just
     before it, and a commit can be split across batches if its files keep changing.
-- **Some changes are reported that didn't happen.** In the data and cache areas, the first
-  rewrite (or `touch`) of a file with unchanged contents reports a change. *Why:* avoiding it
-  means reading every file there when the store opens, and they can be large. Config is read at
-  open, so is unaffected.
-- **Some changes aren't reported under the path you read.** Edits under a symlink to a directory
-  are reported only under that directory's own path if it's in the area, and not at all if it's
-  outside. *Why:* watching through directory links means following arbitrary trees and cycles.
-  Links to files are followed.
+- **Some changes are reported that didn't happen.** On the filesystem, after the store opens,
+  the first rewrite (or `touch`) of a file with unchanged contents reports a change. *Why:*
+  avoiding it means reading every file when the store opens, and they can be large.
 
 ## Limitations
 
@@ -76,6 +67,11 @@ Each with why, where it isn't obvious.
 - **Non-UTF-8 files are listed but give `Error::NotText` when read.**
 - **Writes go through symlinks to files**, keeping the link. The target's directory must exist.
   A commit writing both a link and its target is refused (`SameFile`).
+- **Symlinks to directories inside an area are ignored**, with everything under them: not
+  listed, read or watched. Writing under one is refused (`DirectoryLink`). *Why:* so each file
+  has one path, and every directory holding files is watched.
+- **An area's directory can be a symlink, but it's resolved once, when the store opens.**
+  Re-pointing it later takes effect at the next open.
 
 ### Performance
 
@@ -98,5 +94,8 @@ Each with why, where it isn't obvious.
 - Writing a file's current contents again is skipped: it keeps its modified time, and no change
   is reported.
 - The change feed ends when every store clone is dropped, even if a snapshot is still held.
+- A SQLite store more than 10 minutes behind other processes' commits (a stopped process, say)
+  gets a resync. *Why:* the log of commits is pruned, so it stays small without tracking which
+  stores are open.
 - Not supported: binary files; moving data between backends; size limits or eviction for the
   cache; your own backends; other programs writing to tidings' SQLite databases.

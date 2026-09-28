@@ -336,22 +336,9 @@ mod fs {
     /// or permissions changed, or its contents written again as they were. Some of those events
     /// look like writes, so they are told apart by comparing Revisions. Only a File that has
     /// changed since the Store opened has a known Revision, so a File there before gets only the
-    /// events that can't be writes: see the README's Limitations.
+    /// events that can't be writes: see the README's Consistency section.
     #[tokio::test]
     async fn events_that_leave_a_files_contents_as_they_were_are_dropped() {
-        // Config's Files are read when the Store opens, so their Revisions are known: even a
-        // File there before gets none of these events.
-        let fixture = Fs::new();
-        fixture.write_directly(Area::Config, "settings.toml", "a = 1\n");
-        let Opened { store: _store, mut feed } = fixture.open().await;
-        let file = fixture.on_disk(Area::Config, "settings.toml");
-        std::fs::File::open(&file).unwrap().set_modified(SystemTime::UNIX_EPOCH).unwrap();
-        fixture.write_directly(Area::Config, "settings.toml", "a = 1\n");
-        assert_nothing_more(&mut feed).await;
-        fixture.write_directly(Area::Config, "settings.toml", "a = 2\n");
-        assert_eq!(changes(&next_batch(&mut feed).await), [("settings.toml", ChangeKind::Changed)]);
-
-        // In the other Areas, only once a File has changed.
         let fixture = Fs::new();
         fixture.write_directly(Area::Data, "before.txt", "there before");
         let Opened { store: _store, mut feed } = fixture.open().await;
@@ -424,6 +411,30 @@ mod fs {
         let expected =
             [("themes/a.toml", ChangeKind::Removed), ("themes/deeper/b.toml", ChangeKind::Removed)];
         assert_eq!(changes(&next_batch(&mut feed).await), expected);
+        assert_nothing_more(&mut feed).await;
+    }
+
+    /// A symlink to a directory is left out of the Area, so a directory replaced by one is
+    /// reported removed, and edits under it aren't reported.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_directory_replaced_by_a_symlink_to_one_is_reported_removed() {
+        let fixture = Fs::new();
+        fixture.write_directly(Area::Config, "themes/dark.toml", "dark");
+        let outside = fixture.root.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("dark.toml"), "dark").unwrap();
+        let Opened { store: _store, mut feed } = fixture.open().await;
+
+        std::fs::remove_dir_all(fixture.on_disk(Area::Config, "themes")).unwrap();
+        std::os::unix::fs::symlink(&outside, fixture.on_disk(Area::Config, "themes")).unwrap();
+        assert_eq!(
+            changes(&next_batch(&mut feed).await),
+            [("themes/dark.toml", ChangeKind::Removed)],
+        );
+
+        std::fs::write(outside.join("dark.toml"), "edited").unwrap();
+        std::fs::write(outside.join("light.toml"), "light").unwrap();
         assert_nothing_more(&mut feed).await;
     }
 
@@ -826,20 +837,21 @@ mod fs {
         );
     }
 
-    /// A Config File the Store can't read doesn't stop it opening. Its Revision isn't known, so
-    /// events for it are reported.
-    #[cfg(unix)]
+    /// No Area's Files are read when the Store opens, since they can be large, so a File there
+    /// before has no known Revision. Its first write is reported even with its contents as they
+    /// were. From then on its Revision is known, and a write like that is dropped.
     #[tokio::test]
-    async fn a_config_file_that_cant_be_read_doesnt_stop_the_store_opening() {
-        use std::os::unix::fs::PermissionsExt;
-        let fixture = Fs::new();
-        fixture.write_directly(Area::Config, "secret.toml", "secret");
-        let secret = fixture.on_disk(Area::Config, "secret.toml");
-        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let Opened { store: _store, mut feed } = fixture.open().await;
-        fixture.write_directly(Area::Config, "settings.toml", "a = 1\n");
-        assert_eq!(changes(&next_batch(&mut feed).await), [("settings.toml", ChangeKind::Changed)]);
-        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+    async fn the_first_write_of_a_file_there_before_the_store_opened_is_reported() {
+        for area in [Area::Config, Area::Data, Area::Cache] {
+            let fixture = Fs::new();
+            fixture.write_directly(area, "before.txt", "same");
+            let Opened { store: _store, mut feed } = fixture.open().await;
+            fixture.write_directly(area, "before.txt", "same");
+            let batch = next_batch(&mut feed).await;
+            assert_eq!(changes(&batch), [("before.txt", ChangeKind::Changed)], "{area:?}");
+            fixture.write_directly(area, "before.txt", "same");
+            assert_nothing_more(&mut feed).await;
+        }
     }
 
     /// Something on disk that isn't a File can have the name of a File a Commit writes, or of a
@@ -971,11 +983,9 @@ mod fs {
         fixture.write_directly(Area::Data, "b", "b");
         std::os::unix::fs::symlink("b", fixture.on_disk(Area::Data, "a")).unwrap();
         std::os::unix::fs::symlink("b", fixture.on_disk(Area::Data, "c")).unwrap();
-        std::os::unix::fs::symlink("sub", fixture.on_disk(Area::Data, "linked")).unwrap();
-        fixture.write_directly(Area::Data, "sub/x", "x");
 
         type Stage = fn(&mut Staging);
-        let refused: [(&str, Stage); 4] = [
+        let refused: [(&str, Stage); 3] = [
             ("write a, delete b", |staging| {
                 staging.write("a", "new a").unwrap();
                 staging.delete("b").unwrap();
@@ -988,10 +998,6 @@ mod fs {
                 staging.write("a", "new a").unwrap();
                 staging.write("c", "new c").unwrap();
             }),
-            ("through a directory", |staging| {
-                staging.write("linked/x", "new x").unwrap();
-                staging.delete("sub/x").unwrap();
-            }),
         ];
         for (doing, stage) in refused {
             let mut staging = Staging::new(Area::Data);
@@ -1001,7 +1007,7 @@ mod fs {
                 other => panic!("{doing} should be refused, got {other:?}"),
             }
         }
-        for (path, contents) in [("a", "b"), ("b", "b"), ("c", "b"), ("sub/x", "x")] {
+        for (path, contents) in [("a", "b"), ("b", "b"), ("c", "b")] {
             let file = store.read(Area::Data, path).await.unwrap().unwrap();
             assert_eq!(file.contents(), contents, "{path}");
         }
@@ -1015,21 +1021,75 @@ mod fs {
         assert_eq!(store.read(Area::Data, "a").await.unwrap(), None);
     }
 
-    /// A directory link in the Area lists its Files under both names. Deleting a File under both
-    /// is safe, since the second delete finds nothing, so a Prefix delete covering both works.
+    /// A symlink to a directory in an Area isn't a Prefix: it, and everything under it, are left
+    /// out, as names that aren't Paths are. A Commit that would write through one is refused
+    /// before anything is written, and a Prefix delete leaves it alone.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_prefix_delete_covers_files_listed_under_a_directory_link_too() {
+    async fn a_symlink_to_a_directory_is_left_out_of_the_area() {
+        use std::os::unix::fs::symlink;
         let fixture = Fs::new();
         let Opened { store, feed: _feed } = fixture.open().await;
         fixture.write_directly(Area::Data, "real/x", "x");
-        std::os::unix::fs::symlink("real", fixture.on_disk(Area::Data, "linked")).unwrap();
-        assert_eq!(list(&store, Area::Data).await, ["linked/x", "real/x"]);
+        let outside = fixture.root.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("y"), "y").unwrap();
+        symlink("real", fixture.on_disk(Area::Data, "linked")).unwrap();
+        symlink(&outside, fixture.on_disk(Area::Data, "elsewhere")).unwrap();
+
+        assert_eq!(list(&store, Area::Data).await, ["real/x"]);
+        assert_eq!(store.list(Area::Data, "linked/").await.unwrap(), Vec::<tidings::Path>::new());
+        assert_eq!(store.read(Area::Data, "linked/x").await.unwrap(), None);
+        assert_eq!(store.stat(Area::Data, "elsewhere/y").await.unwrap(), None);
+
+        for path in ["linked", "linked/x", "elsewhere/y", "elsewhere/new/z"] {
+            let mut staging = Staging::new(Area::Data);
+            staging.write(path, "new").unwrap();
+            match store.commit(staging).await {
+                Err(Error::InvalidPath { reason: InvalidPathReason::DirectoryLink, .. }) => {}
+                other => panic!("writing {path} should be refused, got {other:?}"),
+            }
+        }
+        assert_eq!(std::fs::read_to_string(fixture.on_disk(Area::Data, "real/x")).unwrap(), "x");
+        assert_eq!(std::fs::read_to_string(outside.join("y")).unwrap(), "y");
+        assert!(!outside.join("new").exists());
+        assert_eq!(temporary_files(fixture.root.path()), Vec::<PathBuf>::new());
 
         let mut staging = Staging::new(Area::Data);
         staging.delete_prefix("").unwrap();
         store.commit(staging).await.unwrap();
         assert_eq!(list(&store, Area::Data).await, Vec::<String>::new());
+        assert_eq!(std::fs::read_to_string(outside.join("y")).unwrap(), "y");
+        let link = std::fs::symlink_metadata(fixture.on_disk(Area::Data, "elsewhere")).unwrap();
+        assert!(link.is_symlink());
+    }
+
+    /// An Area's root can itself be a symlink to a directory, as when a person keeps an app's
+    /// config in a dotfiles repo. It is followed once, when the Store opens.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_area_root_that_is_a_symlink_is_followed() {
+        let fixture = Fs::new();
+        let dotfiles = fixture.root.path().join("dotfiles/app");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        std::fs::write(dotfiles.join("a.toml"), "a").unwrap();
+        let link = fixture.root.path().join("config");
+        std::os::unix::fs::symlink(&dotfiles, &link).unwrap();
+        let Opened { store, mut feed } = fixture.open().await;
+        assert_eq!(list(&store, Area::Config).await, ["a.toml"]);
+
+        let mut staging = Staging::new(Area::Config);
+        staging.write("b.toml", "b").unwrap();
+        store.commit(staging).await.unwrap();
+        assert_eq!(std::fs::read_to_string(dotfiles.join("b.toml")).unwrap(), "b");
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        next_batch(&mut feed).await;
+
+        std::fs::write(dotfiles.join("c.toml"), "c").unwrap();
+        assert_eq!(
+            changes_in_full(&next_batch(&mut feed).await),
+            [(Area::Config, "c.toml", ChangeKind::Changed, Origin::External)],
+        );
     }
 
     /// Files with the same name in different directories are different files, even while their

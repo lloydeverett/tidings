@@ -50,7 +50,8 @@ _Avoid_: key, filename
 **Prefix**:
 The leading part of a Path, up to a `/`, used to list or delete a group of Files. A Prefix is
 either empty, meaning the whole Area, or ends in `/`, as in `themes/`: `themes` alone is not a
-Prefix. Directories exist only as Prefixes: there are no empty directories.
+Prefix. Directories exist only as Prefixes: there are no empty directories. A symlink to a
+directory inside an Area is not a Prefix: it and everything under it are outside the Area.
 _Avoid_: directory, folder
 
 **Revision**:

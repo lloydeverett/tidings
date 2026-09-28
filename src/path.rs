@@ -221,6 +221,10 @@ pub enum InvalidPathReason {
     /// on disk, as a symlink and the File it points to are, or two symlinks to one File. Deleting
     /// both is fine.
     SameFile,
+    /// A filesystem Commit would write a Path that is, or is under, a symlink to a directory. A
+    /// symlink to a directory is left out of the Area, with everything under it, so nothing is
+    /// written through one.
+    DirectoryLink,
 }
 
 impl fmt::Display for InvalidPathReason {
@@ -246,6 +250,9 @@ impl fmt::Display for InvalidPathReason {
             InvalidPathReason::SameFile => {
                 "it is written, and is the same file on disk as another Path the Commit writes or \
                  deletes"
+            }
+            InvalidPathReason::DirectoryLink => {
+                "it is, or is under, a symlink to a directory, which is left out of the Area"
             }
         })
     }
