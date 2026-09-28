@@ -973,6 +973,39 @@ mod fs {
         assert_eq!(since.contents(), "written since");
     }
 
+    /// Finishing a Commit again never follows a symlink to a directory made since: what it writes
+    /// or deletes under one is outside the Area, so it is left as it is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finishing_a_commit_again_leaves_what_is_under_a_directory_link_made_since() {
+        let fixture = Fs::new();
+        let Opened { store, feed: _feed } = fixture.open().await;
+        let mut staging = Staging::new(Area::Data);
+        staging.write("x/y.txt", "y").unwrap();
+        store.commit(staging).await.unwrap();
+        drop(store);
+
+        let Opened { store, feed: _feed } =
+            fixture.open_with(|options| options.fail_at(FailurePoint::AfterCommittedJournal)).await;
+        let mut staging = Staging::new(Area::Data);
+        staging.delete("x/y.txt").unwrap();
+        staging.write("d/e.txt", "e").unwrap();
+        assert!(matches!(store.commit(staging).await, Err(Error::Backend(_))));
+        drop(store);
+        let [elsewhere_x, elsewhere_d] =
+            ["elsewhere x", "elsewhere d"].map(|name| fixture.root.path().join(name));
+        std::fs::rename(fixture.on_disk(Area::Data, "x"), &elsewhere_x).unwrap();
+        std::os::unix::fs::symlink(&elsewhere_x, fixture.on_disk(Area::Data, "x")).unwrap();
+        std::fs::create_dir(&elsewhere_d).unwrap();
+        std::os::unix::fs::symlink(&elsewhere_d, fixture.on_disk(Area::Data, "d")).unwrap();
+
+        let Opened { store, feed: _feed } = fixture.open().await;
+        assert_eq!(list(&store, Area::Data).await, Vec::<String>::new());
+        assert_eq!(std::fs::read_to_string(elsewhere_x.join("y.txt")).unwrap(), "y");
+        assert!(std::fs::read_dir(&elsewhere_d).unwrap().next().is_none());
+        assert_eq!(temporary_files(fixture.root.path()), Vec::<PathBuf>::new());
+    }
+
     /// Two Paths can be the same file on disk, through a symlink. A Commit that writes or deletes
     /// both is refused, since which of them wins would depend on the order they land in.
     #[cfg(unix)]

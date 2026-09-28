@@ -25,7 +25,8 @@
 //! then. Inside an Area, a symlink to a directory is left out, with everything under it, as names
 //! that aren't Paths are: so every File has one Path, and every directory that holds Files is in
 //! the Area, and watched. A Commit that would write through one is refused with
-//! [`DirectoryLink`](InvalidPathReason::DirectoryLink).
+//! [`DirectoryLink`](InvalidPathReason::DirectoryLink), and finishing a Commit never writes or
+//! deletes through one made since.
 //!
 //! **Exact names.** A Path names only the file on disk with exactly its name. Some filesystems
 //! (macOS's and Windows' by default) also find `Foo` when asked for `foo`. Opening a Store finds

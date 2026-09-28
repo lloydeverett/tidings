@@ -43,7 +43,8 @@ Details settled while building it (ticket 09):
   next to that. Such a write never makes a directory, so it can't make one outside the Area: if
   the directory the link points into doesn't exist, the Commit is refused with `Backend` before
   step 2. A symlink to a directory is left out of the Area, so a write under one is refused with
-  `DirectoryLink` before step 2 too.
+  `DirectoryLink` before step 2 too. One made later, before the Commit is finished, puts the
+  Paths under it outside the Area, so finishing neither deletes nor writes them.
 - Between steps 1 and 2, the Commit is also refused, with `InvalidPath`, where finishing it could
   go wrong. With `FileUnderFile`, if something that isn't a Path stands where a File it writes, or
   a directory for one, must go, and the Commit's deletes don't remove it: a directory holding

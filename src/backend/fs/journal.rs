@@ -44,7 +44,8 @@ use super::FailurePoint;
 use jiff::Timestamp;
 
 use super::{
-    AreaRoot, failed, on_disk, present, present_at, read_file, remove_empty_directories, revisions,
+    AreaRoot, LeftOut, failed, on_disk, present, present_at, read_file, remove_empty_directories,
+    revisions,
 };
 use crate::backend::AreaState;
 use crate::{Error, Path, Prefix, Result, Revision};
@@ -250,10 +251,18 @@ impl Journal {
     ///    that has the File's name, and renames the temporary file over the File;
     /// 3. forces each directory changed or made to disk, so that the Commit is on disk before the
     ///    journal is removed.
+    ///
+    /// A Path that is under a symlink to a directory, made since the Commit checked its Paths, is
+    /// outside the Area, so it is neither deleted nor written, and its temporary file is removed.
     pub(super) fn finish(&self, area: &AreaRoot, again: bool) -> Result<()> {
         let root = &area.root;
+        let under_link =
+            |path: &Path| Ok(area.left_out(path.as_str())? == Some(LeftOut::DirectoryLink));
         let mut changed = BTreeSet::new();
         for Remove { path, revision } in &self.removes {
+            if under_link(path)? {
+                continue;
+            }
             let file = on_disk(root, path.as_str());
             let there = present_at(fs::symlink_metadata(&file), &file)?;
             // A directory there now was made by one of the writes.
@@ -275,6 +284,12 @@ impl Journal {
         for (_n, replace) in self.replaces.iter().enumerate() {
             let Replace { path, temporary, target } = replace;
             if present_at(fs::symlink_metadata(temporary), temporary)?.is_none() {
+                continue;
+            }
+            if let Target::AtPath = target
+                && under_link(path)?
+            {
+                fs::remove_file(temporary).map_err(|error| failed(temporary, error))?;
                 continue;
             }
             if let Target::AtPath = target {
