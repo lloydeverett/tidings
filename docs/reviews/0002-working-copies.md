@@ -858,3 +858,142 @@ Fixed in 81754f5:
 Not acted on: `"events":[]` on every commit's JSON (a stable shape is easier for scripts than a
 key that appears only sometimes), the `reconcile_after_commit` wrapper (documented), and the
 `files`/`changes` pair (tolerable).
+
+---
+
+## Ticket 07: The ignore file, and files that can't be Files
+
+Reviewed: `git diff 03e4bfc...5ead549` (commit 5ead549).
+
+### Standards
+
+**(a) Documented-standard violations:** none hard. No line over 100 columns; every new item is
+documented; the design follows spec 0002 (`Failure::invalid` exits 1 listing every file, JSON via
+`EventParts`, the `ignore` crate's `.gitignore` syntax, a file with a Base never ignored). Tests go
+through the binary on fs and SQLite; reading `.tidings/ignore` is fine, since the person edits it.
+Nits: one test's assert message lacks `{backend}`; the crash-leftover allowance depends on
+`atomic-write-file`'s undocumented temp-file name (accepted before for the record).
+
+**(b) Judgement calls:**
+
+1. **Possible Primitive Obsession / glossary tension:** `EventParts.path` and `Selection` /
+   `Target::covers` went from `Path` to `&str`, so a field named `path` can hold something that
+   isn't a Path, and callers add `.as_str()`.
+2. **Possible Mysterious Name:** `InvalidFile`; in CONTEXT.md a File is a Store File, and this is
+   exactly a file that can't be one.
+3. **Possible Primitive Obsession:** `Result<Path, Option<tidings::Error>>` with `None` meaning
+   "not UTF-8".
+4. **Possible Duplicated Code:** the ignore file's path built twice; a repeated `map_err`; joining
+   a folder-relative path's parts into a name, and the `.tidings` check, written in both scan and
+   select.
+5. **Possible Repeated Switches:** each `Outcomes` variant needs an arm in two matches in
+   `failure.rs`'s `print`. Tolerable at three.
+6. **Possible long method:** `scan_directory` recurses, filters, names, ignores and classifies in
+   one loop body.
+7. **Module size:** `working_copy.rs` is 1397 lines; scanning and the ignore file are
+   self-contained behind `scan(&bases) -> Scan` and would sit well in `working_copy/scan.rs`.
+
+### Spec
+
+Probed on fs and SQLite: a new Working copy's `ignore` holds the six defaults, and each is left
+out by `commit`; naming an ignored file is a clear exit 1; a default removed lets `.DS_Store` be
+committed, and put back, its edit and delete are still committed (story 52); a `cfg/` pattern
+still commits edits to a Base'd `cfg/a.toml` while leaving out a new `cfg/b.toml`; one full commit
+names every invalid file (`CON`, `con.txt`, `a:b`, `trail `, NFD `é.txt`, non-UTF-8 contents, a
+symlink, a fifo, a nested symlink), exit 1, with a `{"failure":"invalid",…}` JSON shape; each can
+be ignored; an invalid file outside the named paths doesn't block the commit; a tracked Path turned
+into a symlink is invalid even when a pattern matches it; `mv app.toml App.toml` commits as an add
+and a delete. (A non-UTF-8 name can't be made on APFS, so it is untested here.)
+
+**(a) Missing or partial:** none. **(b) Scope creep:** none; keeping an existing `ignore` in an
+unfinished `.tidings/` is fine.
+
+**(c) Wrong or questionable:**
+
+1. **A symlinked ignore file is read as empty:** with `.tidings/ignore` a symlink, `commit .x.swp`
+   committed the swap file, against story 49 ("so that editor and OS leftovers don't land in my
+   Store"), and inconsistent with a bad pattern stopping the command.
+2. **Negation differs from `.gitignore`:** with `build/` and `!build/keep`, tidings commits
+   `build/keep`; git doesn't (a file can't be re-included under an excluded directory). Spec: "It
+   uses `.gitignore` syntax."
+3. **Malformed patterns** exit 1 naming the file but not the line. Refusing is the safer choice
+   (git skips them silently); the line number would make it friendly.
+4. **For the spec's owner:** an ignored local `.DS_Store` with no Base, then the Store gets a
+   `.DS_Store`: `sync` makes it Diverged (the table's "added … contents differ"), and full commits
+   are then refused. "Local states" says such a file "is left out entirely", which read literally
+   would make it absent, so `sync` would overwrite it. Diverged keeps local data; the spec should
+   say so.
+
+### Summary
+
+Standards: 0 hard violations, 2 nits and 7 judgement calls (worst: `&str` standing where a Path
+was). Spec: 3 wrong or questionable (worst: a symlinked ignore file letting leftovers into the
+Store) and 1 question for the owner.
+
+### Resolution
+
+Fixed in c0c2717:
+
+1. **Spec (c)1, a symlinked ignore file:** fixed. A `.tidings/ignore` that is a symlink or isn't a
+   regular file refuses the commit (exit 1), saying why. A missing ignore file still means no
+   patterns (see below). Test: `an_ignore_file_that_isnt_a_regular_file_refuses_the_commit`.
+2. **Spec (c)2, negation under an ignored directory:** fixed to git's rule: the scan carries "a
+   parent directory is ignored" down, so a file under it stays ignored whatever re-includes it; a
+   Path with a Base is still never ignored. Test:
+   `a_file_in_an_ignored_directory_is_ignored_whatever_re_includes_it`.
+3. **Spec (c)3, malformed patterns:** still refused, now naming the line
+   (`…/.tidings/ignore:3: error parsing glob 'a{b': …`). Test:
+   `a_malformed_pattern_refuses_the_commit_naming_its_line`.
+4. **Standards 1–3:** a `LocalName` type holds a name in the folder that may not be a Path;
+   `EventParts.path` is a `Path` again; `covers(&Path)` stays beside `covers_name`; `InvalidFile`
+   was renamed; `Result<Path, Option<Error>>` became an `AsPath` enum.
+5. **Standards 4, 6 and 7:** scanning and the ignore file moved to `working_copy/scan.rs` behind
+   `scan(folder, bases)`, with the ignore file's path built in one place, one name-joining helper
+   and `.tidings` check shared with `select`, and `scan_directory` split up.
+6. The test nit is fixed.
+
+The three new tests fail on 5ead549.
+
+**For the spec's owner:** an ignored local file with no Base where the Store then creates the
+same Path is Diverged (Spec (c)4), which keeps local data; the spec's "left out entirely" could be
+read as absent, which would let `sync` overwrite it. Also, a missing ignore file silently means no
+patterns (as git treats a missing `.gitignore`), and nothing recreates it.
+
+### Re-review of c0c2717
+
+**Standards.** Every claimed fix is clean except one: the rename landed on `InvalidEntry`, and
+"entry" is an _Avoid_ word for File in CONTEXT.md (hard). Nits: `Scanner.folder` lacks a doc
+comment; `ignore_file` is `pub(super)` but used only in `scan.rs`. Judgement calls: `Selection` and
+`Target` each gained the same three `covers*` methods; `EventParts` holds `path` and `local_name`
+side by side though never both set; `as_path` takes a path only to check UTF-8.
+
+**Spec.** Probed on fs and SQLite; the three new tests fail on 5ead549. A symlink, dangling
+symlink, directory or fifo at `.tidings/ignore` refuses `commit` (full, named and `--json`);
+`sync` doesn't scan, so it is unaffected. Nested ignored directories with negations, anchored
+patterns, `**`, CRLF, comments, blank lines, `\#` and trailing spaces all behave as in git; Base'd
+Files under ignored directories still commit. The first review's probes give the same output.
+Findings:
+
+1. **A UTF-8 BOM breaks the first pattern:** adding lines one by one skips the BOM stripping the
+   `ignore` crate's own `add` does, so `\xEF\xBB\xBFsecret.txt` lets `secret.txt` be committed.
+   (Also true before this commit.)
+2. A missing ignore file silently means no patterns (for the owner, noted above).
+3. A non-UTF-8 ignore file refuses with a raw "stream did not contain valid UTF-8".
+
+### Resolution of the re-review
+
+Fixed in c1c1157:
+
+- **The BOM:** a leading byte order mark is stripped before the patterns are parsed. Test:
+  `a_byte_order_mark_doesnt_spoil_the_first_pattern`, which fails without the fix.
+- **A non-UTF-8 ignore file:** refused with `.tidings/ignore:N: isn't UTF-8 text: save the ignore
+  file as UTF-8`. Tested.
+- **"entry":** `InvalidEntry` became `Unfit` (and its variables `unfit`). `entry` stays only where
+  it names a std `DirEntry` in older directory loops.
+- **The `covers*` duplication:** one `covers(&str)` each on `Selection` and `Target`.
+- **`path` beside `local_name`:** one `subject: Option<Subject>` (`Subject::Path | Subject::Local`);
+  the JSON is unchanged.
+- The two nits are fixed.
+
+Not acted on: `as_path` taking a path only to check UTF-8 (minor). No third review: each fix is
+narrow and tested.
