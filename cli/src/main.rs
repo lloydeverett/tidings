@@ -148,7 +148,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
-            eprintln!("tidings: {failure}");
+            failure.print(cli.json);
             failure.exit_code()
         }
     }

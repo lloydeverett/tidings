@@ -147,20 +147,36 @@ fn a_conflict_commits_nothing_and_marks_each_conflicting_path_diverged_as_sync_w
         fs::write(folder.path().join("same.toml"), "same").unwrap();
         fs::write(folder.path().join("gone.toml"), "mine\n").unwrap();
         fs::write(folder.path().join("unrelated.toml"), "mine\n").unwrap();
-        let run = commit_in(folder.path(), &[]).expect_code(3);
-        let lines: Vec<&str> = run.stderr.lines().collect();
+        let run = commit_in(folder.path(), &["--json"]).expect_code(3);
+        let failure: serde_json::Value = serde_json::from_str(&run.stderr).unwrap();
+        let theirs_in = |path: &str| format!("the Store's version is in .tidings/theirs/{path}");
+        let diverged = |path: &str| {
+            serde_json::json!({
+                "event": "diverged",
+                "path": path,
+                "message": theirs_in(path),
+                "theirs": format!(".tidings/theirs/{path}"),
+            })
+        };
         assert_eq!(
-            lines,
-            [
-                "tidings: Conflict: the Store changed these since their Base, so nothing was \
-                 committed",
-                "  diverged app.toml: the Store's version is in .tidings/theirs/app.toml",
-                "  diverged created.toml: the Store's version is in .tidings/theirs/created.toml",
-                "  diverged gone.toml: removed in the Store",
-                "  same same.toml: the Store has the same contents, which are now its Base",
-                "  diverged themes/dark.toml: the Store's version is in \
-                 .tidings/theirs/themes/dark.toml",
-            ],
+            failure,
+            serde_json::json!({
+                "failure": "conflict",
+                "message": "Conflict: the Store changed these since their Base, so nothing was \
+                            committed",
+                "paths": [
+                    diverged("app.toml"),
+                    diverged("created.toml"),
+                    {
+                        "event": "diverged",
+                        "path": "gone.toml",
+                        "message": "removed in the Store",
+                        "theirs": null,
+                    },
+                    {"event": "same", "path": "same.toml"},
+                    diverged("themes/dark.toml"),
+                ],
+            }),
             "{backend}: {run:?}"
         );
 
@@ -202,15 +218,21 @@ fn a_conflict_while_sync_runs_leaves_the_path_diverged_either_way() {
         fs::write(folder.path().join("app.toml"), "mine\n").unwrap();
         location.write("config", "app.toml", "theirs\n");
         let mut command = tidings();
-        command.arg("commit").current_dir(folder.path());
+        command.args(["--json", "commit"]).current_dir(folder.path());
         let commit = common::spawn(&mut command);
+        // Only so that `commit` is likely to be waiting for the lock by the time it's released, so
+        // that a Conflict is what's usually tested. Nothing it does before then can be seen from
+        // here, and the test holds whichever goes first.
         thread::sleep(Duration::from_millis(200));
         drop(lock);
         let output = commit.wait_with_output().unwrap();
         let stderr = String::from_utf8(output.stderr).unwrap();
         // A Conflict, or refused as Diverged if `sync` went first.
         assert_eq!(output.status.code(), Some(3), "{backend}: {stderr}");
-        assert!(stderr.contains("diverged app.toml"), "{backend}: {stderr}");
+        let failure: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+        assert!(["conflict", "diverged"].contains(&failure["failure"].as_str().unwrap()));
+        let failed = failure["paths"].as_array().unwrap();
+        assert_eq!(paths(failed, "diverged"), ["app.toml"], "{backend}: {stderr}");
 
         // `sync` reports the Divergence at most once, whichever found it.
         location.write("config", "later.toml", "later\n");
@@ -255,8 +277,10 @@ fn a_conflict_whose_theirs_cant_be_written_is_diverged_all_the_same() {
     }
 }
 
-#[test]
-fn a_full_commit_while_a_path_is_diverged_is_refused() {
+/// Runs `test` on each backend, with `sync` both running and stopped: it's given a label for its
+/// failures, a Store from [`store_with_config`], and a folder synced from it, where `diverge`
+/// has made at least one Path Diverged while `sync` ran.
+fn with_a_diverged_path(diverge: impl Fn(&Location, &Path), test: impl Fn(&str, &Location, &Path)) {
     for backend in BACKENDS {
         for sync_running in [false, true] {
             let label = format!("{backend}, sync running: {sync_running}");
@@ -264,34 +288,16 @@ fn a_full_commit_while_a_path_is_diverged_is_refused() {
             let folder = TempDir::new().unwrap();
             let mut sync = Sync::start(&location, "config", folder.path());
             sync.wait_for("caught-up");
-            fs::write(folder.path().join("app.toml"), "mine\n").unwrap();
-            fs::remove_file(folder.path().join("themes/dark.toml")).unwrap();
-            fs::write(folder.path().join("new.toml"), "new\n").unwrap();
-            location.write("config", "app.toml", "theirs\n");
-            location.run(&["store", "delete", "config", "themes/dark.toml"]).expect_success();
-            // `themes/dark.toml` is deleted on both sides, so isn't Diverged.
+            diverge(&location, folder.path());
             sync.wait_for("diverged");
-            let sync = if sync_running {
+            let running = if sync_running {
                 Some(sync)
             } else {
                 sync.stop();
                 None
             };
-
-            let run = commit_in(folder.path(), &[]).expect_code(3);
-            let lines: Vec<&str> = run.stderr.lines().collect();
-            assert_eq!(
-                lines,
-                [
-                    "tidings: can't commit Diverged Paths: merge each and `tidings resolve` it, \
-                     or `tidings discard` it, or name only other paths to commit",
-                    "  diverged app.toml: the Store's version is in .tidings/theirs/app.toml",
-                ],
-                "{label}: {run:?}"
-            );
-            // Nothing was committed, not even the changes that aren't Diverged.
-            location.run(&["store", "read", "config", "new.toml"]).expect_code(2);
-            if let Some(sync) = sync {
+            test(&label, &location, folder.path());
+            if let Some(sync) = running {
                 sync.stop();
             }
         }
@@ -299,44 +305,70 @@ fn a_full_commit_while_a_path_is_diverged_is_refused() {
 }
 
 #[test]
+fn a_full_commit_while_a_path_is_diverged_is_refused() {
+    let diverge = |location: &Location, folder: &Path| {
+        fs::write(folder.join("app.toml"), "mine\n").unwrap();
+        fs::remove_file(folder.join("themes/dark.toml")).unwrap();
+        fs::write(folder.join("new.toml"), "new\n").unwrap();
+        location.write("config", "app.toml", "theirs\n");
+        // `themes/dark.toml` is deleted on both sides, so isn't Diverged.
+        location.run(&["store", "delete", "config", "themes/dark.toml"]).expect_success();
+    };
+    with_a_diverged_path(diverge, |label, location, folder| {
+        let message = "can't commit Diverged Paths: merge each and `tidings resolve` it, or \
+                       `tidings discard` it, or name only other paths to commit";
+        let run = commit_in(folder, &[]).expect_code(3);
+        let lines: Vec<&str> = run.stderr.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                &format!("tidings: {message}")[..],
+                "  diverged app.toml: the Store's version is in .tidings/theirs/app.toml",
+            ],
+            "{label}: {run:?}"
+        );
+        let run = commit_in(folder, &["--json"]).expect_code(3);
+        let failure: serde_json::Value = serde_json::from_str(&run.stderr).unwrap();
+        let expected = serde_json::json!({
+            "failure": "diverged",
+            "message": message,
+            "paths": [{
+                "event": "diverged",
+                "path": "app.toml",
+                "message": "the Store's version is in .tidings/theirs/app.toml",
+                "theirs": ".tidings/theirs/app.toml",
+            }],
+        });
+        assert_eq!(failure, expected, "{label}: {run:?}");
+        // Nothing was committed, not even the changes that aren't Diverged.
+        location.run(&["store", "read", "config", "new.toml"]).expect_code(2);
+    });
+}
+
+#[test]
 fn naming_a_diverged_path_is_refused_and_naming_only_others_goes_ahead() {
-    for backend in BACKENDS {
-        for sync_running in [false, true] {
-            let label = format!("{backend}, sync running: {sync_running}");
-            let location = store_with_config(backend);
-            let folder = TempDir::new().unwrap();
-            let mut sync = Sync::start(&location, "config", folder.path());
-            sync.wait_for("caught-up");
-            fs::write(folder.path().join("themes/dark.toml"), "mine\n").unwrap();
-            fs::write(folder.path().join("themes/light.toml"), "light\n").unwrap();
-            fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
-            location.write("config", "themes/dark.toml", "theirs\n");
-            sync.wait_for("diverged");
-            let sync = if sync_running {
-                Some(sync)
-            } else {
-                sync.stop();
-                None
-            };
-
-            // A directory holding a Diverged Path names it too.
-            for named in [&["themes/dark.toml"][..], &["app.toml", "themes"]] {
-                let run = commit_in(folder.path(), named).expect_code(3);
-                assert!(run.stderr.contains("can't commit Diverged Paths"), "{label}: {run:?}");
-                assert!(run.stderr.contains("diverged themes/dark.toml"), "{label}: {run:?}");
-                assert_eq!(location.read("config", "app.toml"), "a = 1\n", "{label}");
-            }
-
-            let run = commit_in(folder.path(), &["app.toml", "themes/light.toml"]);
-            let run = run.expect_success();
-            assert_eq!(run.stdout, "modified app.toml\nadded themes/light.toml\n", "{label}");
-            assert_eq!(location.read("config", "app.toml"), "a = 2\n", "{label}");
-            assert_eq!(location.read("config", "themes/light.toml"), "light\n", "{label}");
-            if let Some(sync) = sync {
-                sync.stop();
-            }
+    let diverge = |location: &Location, folder: &Path| {
+        fs::write(folder.join("themes/dark.toml"), "mine\n").unwrap();
+        fs::write(folder.join("themes/light.toml"), "light\n").unwrap();
+        fs::write(folder.join("app.toml"), "a = 2\n").unwrap();
+        location.write("config", "themes/dark.toml", "theirs\n");
+    };
+    with_a_diverged_path(diverge, |label, location, folder| {
+        // A directory holding a Diverged Path names it too.
+        for named in [&["--json", "themes/dark.toml"][..], &["--json", "app.toml", "themes"]] {
+            let run = commit_in(folder, named).expect_code(3);
+            let failure: serde_json::Value = serde_json::from_str(&run.stderr).unwrap();
+            assert_eq!(failure["failure"], "diverged", "{label}: {run:?}");
+            let refused = failure["paths"].as_array().unwrap();
+            assert_eq!(paths(refused, "diverged"), ["themes/dark.toml"], "{label}: {run:?}");
+            assert_eq!(location.read("config", "app.toml"), "a = 1\n", "{label}");
         }
-    }
+
+        let run = commit_in(folder, &["app.toml", "themes/light.toml"]).expect_success();
+        assert_eq!(run.stdout, "modified app.toml\nadded themes/light.toml\n", "{label}");
+        assert_eq!(location.read("config", "app.toml"), "a = 2\n", "{label}");
+        assert_eq!(location.read("config", "themes/light.toml"), "light\n", "{label}");
+    });
 }
 
 #[test]
@@ -434,6 +466,8 @@ fn a_pending_commit_updates_the_bases_says_so_and_succeeds() {
     let run = commit_while_locked(&["--json"]).expect_success();
     let json: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
     assert_eq!(json["pending"], true, "{json}");
+    // No other Commit landed in between, so reconciling the committed Paths found nothing.
+    assert_eq!(json["events"], serde_json::json!([]), "{json}");
     let committed = json["committed"].as_array().unwrap();
     assert_eq!(committed[0]["path"], "b.toml", "{json}");
     let stat = location.run(&["--json", "store", "stat", "config", "b.toml"]).expect_success();

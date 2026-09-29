@@ -93,12 +93,15 @@ impl Output {
                 eprintln!("nothing to commit");
                 Ok(())
             }
+            // Each change committed, then anything reconciling after a `Pending` Commit found, as
+            // `sync` prints it.
             Report::WorkingCopyCommit(report) => {
                 print_stdout(
                     &report
                         .changes
                         .iter()
                         .map(|change| format!("{} {}\n", change_name(change.change), change.path))
+                        .chain(report.events.iter().map(|event| format!("{}\n", event_line(event))))
                         .collect::<String>(),
                 )?;
                 if report.pending {
@@ -165,27 +168,28 @@ impl SyncOutput {
         if self.quiet && !needs_attention {
             return Ok(());
         }
-        let line = if self.output.json {
-            let (name, path, message) = event_parts(event);
-            let mut object = serde_json::Map::new();
-            object.insert("event".to_owned(), json!(name));
-            if let Some(path) = path {
-                object.insert("path".to_owned(), json!(path.as_str()));
-            }
-            if let Some(message) = message {
-                object.insert("message".to_owned(), json!(message));
-            }
-            // So that another program following the Working copy can find the Store's version.
-            if let SyncEvent::Diverged { theirs_file, .. } = event {
-                let theirs_file = theirs_file.as_ref().map(|file| file.to_string_lossy());
-                object.insert("theirs".to_owned(), json!(theirs_file));
-            }
-            Value::Object(object).to_string()
-        } else {
-            event_line(event)
-        };
+        let line = if self.output.json { event_json(event).to_string() } else { event_line(event) };
         print_stdout(&format!("{line}\n"))
     }
+}
+
+/// The JSON object that says what `sync` did, or found, as in `{"event": "created", "path": "a"}`.
+pub fn event_json(event: &SyncEvent) -> Value {
+    let (name, path, message) = event_parts(event);
+    let mut object = serde_json::Map::new();
+    object.insert("event".to_owned(), json!(name));
+    if let Some(path) = path {
+        object.insert("path".to_owned(), json!(path.as_str()));
+    }
+    if let Some(message) = message {
+        object.insert("message".to_owned(), json!(message));
+    }
+    // So that another program following the Working copy can find the Store's version.
+    if let SyncEvent::Diverged { theirs_file, .. } = event {
+        let theirs_file = theirs_file.as_ref().map(|file| file.to_string_lossy());
+        object.insert("theirs".to_owned(), json!(theirs_file));
+    }
+    Value::Object(object)
 }
 
 /// The line for a person that says what `sync` did, or found, as in "diverged a: removed in the
@@ -279,6 +283,7 @@ fn as_json(report: &Report) -> Option<Value> {
                 }))
                 .collect::<Vec<_>>(),
             "pending": report.pending,
+            "events": report.events.iter().map(event_json).collect::<Vec<_>>(),
         }),
     })
 }
@@ -310,5 +315,44 @@ pub fn area_name(area: Area) -> &'static str {
         Area::Config => "config",
         Area::Data => "data",
         Area::Cache => "cache",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::working_copy::{CommitReport, CommittedChange};
+
+    /// A Path another Commit made Diverged between a Commit that gave `Pending` and the reconcile
+    /// after it, which no test through the binary can time, is reported with the Commit.
+    #[test]
+    fn a_pending_commit_reports_the_paths_reconciling_made_diverged() {
+        let path = Path::new("app.toml").unwrap();
+        let report = CommitReport {
+            changes: vec![CommittedChange {
+                path: path.clone(),
+                change: LocalChange::Modified,
+                revision: None,
+            }],
+            pending: true,
+            events: vec![SyncEvent::Diverged {
+                path,
+                theirs_file: Some(".tidings/theirs/app.toml".into()),
+                blocked: None,
+            }],
+        };
+        assert_eq!(
+            as_json(&Report::WorkingCopyCommit(report)),
+            Some(json!({
+                "committed": [{"path": "app.toml", "change": "modified", "revision": null}],
+                "pending": true,
+                "events": [{
+                    "event": "diverged",
+                    "path": "app.toml",
+                    "message": "the Store's version is in .tidings/theirs/app.toml",
+                    "theirs": ".tidings/theirs/app.toml",
+                }],
+            }))
+        );
     }
 }

@@ -3,15 +3,29 @@
 use std::fmt;
 use std::process::ExitCode;
 
+use serde_json::{Value, json};
 use tidings::Area;
 
-use crate::output::area_name;
+use crate::output::{area_name, event_json, event_line};
+use crate::working_copy::{Reconciled, SyncEvent};
 
 /// A command that failed: what to tell the person, and the exit code.
 #[derive(Debug)]
 pub struct Failure {
     kind: FailureKind,
     message: String,
+    /// Each Path that stopped a Working copy's commit, and what was found there, if that is how it
+    /// failed.
+    paths: Option<StoppedPaths>,
+}
+
+/// The Paths that stopped a Working copy's commit, each with what was found there.
+#[derive(Debug)]
+enum StoppedPaths {
+    /// It was refused because these are Diverged, each a [`SyncEvent::Diverged`].
+    Diverged(Vec<SyncEvent>),
+    /// A Conflict for these, after which each was reconciled as `sync` would.
+    Conflict(Vec<Reconciled>),
 }
 
 /// Each exit code other than success.
@@ -29,18 +43,41 @@ enum FailureKind {
 impl Failure {
     /// Anything else that went wrong, which exits with 1.
     pub fn error(message: impl Into<String>) -> Failure {
-        Failure { kind: FailureKind::Error, message: message.into() }
+        Failure { kind: FailureKind::Error, message: message.into(), paths: None }
     }
 
     /// Nothing was committed, because of a Conflict or a Divergence, which exits with 3.
     pub fn conflict(message: impl Into<String>) -> Failure {
-        Failure { kind: FailureKind::Conflict, message: message.into() }
+        Failure { kind: FailureKind::Conflict, message: message.into(), paths: None }
+    }
+
+    /// A Working copy's commit was refused because the Paths in `diverged`, each a
+    /// [`SyncEvent::Diverged`], are Diverged, which exits with 3.
+    pub fn diverged(diverged: Vec<SyncEvent>) -> Failure {
+        Failure {
+            paths: Some(StoppedPaths::Diverged(diverged)),
+            ..Failure::conflict(
+                "can't commit Diverged Paths: merge each and `tidings resolve` it, or `tidings \
+                 discard` it, or name only other paths to commit",
+            )
+        }
+    }
+
+    /// A Working copy's commit met a Conflict, so nothing was committed, and `reconciled` is what
+    /// became of each Path it named. Exits with 3.
+    pub fn conflicted(reconciled: Vec<Reconciled>) -> Failure {
+        Failure {
+            paths: Some(StoppedPaths::Conflict(reconciled)),
+            ..Failure::conflict(
+                "Conflict: the Store changed these since their Base, so nothing was committed",
+            )
+        }
     }
 
     /// There is no File at `path` in `area`.
     pub fn missing(area: Area, path: &str) -> Failure {
         let message = format!("no File at {} {path}", area_name(area));
-        Failure { kind: FailureKind::Missing, message }
+        Failure { kind: FailureKind::Missing, message, paths: None }
     }
 
     /// Adds `note` to the end of the message.
@@ -63,11 +100,64 @@ impl Failure {
             FailureKind::Conflict => 3,
         })
     }
+
+    /// Prints this on stderr: for a person, or, with `json`, as one JSON object if it has Paths to
+    /// give, as in
+    /// `{"failure": "conflict", "message": "…", "paths": [{"event": "diverged", …}]}`.
+    /// Each Path is given as `sync --json` gives an event, or, for one that took the Store's
+    /// version as its Base, as `{"event": "same", "path": "…"}`. Other failures are printed for a
+    /// person, with `json` or without.
+    pub fn print(&self, json: bool) {
+        match &self.paths {
+            Some(paths) if json => {
+                let (failure, paths) = match paths {
+                    StoppedPaths::Diverged(diverged) => {
+                        ("diverged", diverged.iter().map(event_json).collect())
+                    }
+                    StoppedPaths::Conflict(reconciled) => {
+                        ("conflict", reconciled.iter().map(reconciled_json).collect::<Vec<_>>())
+                    }
+                };
+                eprintln!(
+                    "{}",
+                    json!({"failure": failure, "message": self.message, "paths": paths})
+                );
+            }
+            _ => eprintln!("tidings: {self}"),
+        }
+    }
 }
 
+/// What became of a Path a Conflict named, as `sync --json` gives an event.
+fn reconciled_json(reconciled: &Reconciled) -> Value {
+    match reconciled {
+        Reconciled::Event(event) => event_json(event),
+        Reconciled::TookStoresVersion(path) => json!({"event": "same", "path": path.as_str()}),
+    }
+}
+
+/// What became of a Path a Conflict named, as a line for a person, as `sync` gives an event.
+fn reconciled_line(reconciled: &Reconciled) -> String {
+    match reconciled {
+        Reconciled::Event(event) => event_line(event),
+        Reconciled::TookStoresVersion(path) => {
+            format!("same {path}: the Store has the same contents, which are now its Base")
+        }
+    }
+}
+
+/// The message, then each Path on a line of its own, indented.
 impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
+        f.write_str(&self.message)?;
+        let lines: Vec<String> = match &self.paths {
+            None => Vec::new(),
+            Some(StoppedPaths::Diverged(diverged)) => diverged.iter().map(event_line).collect(),
+            Some(StoppedPaths::Conflict(reconciled)) => {
+                reconciled.iter().map(reconciled_line).collect()
+            }
+        };
+        lines.iter().try_for_each(|line| write!(f, "\n  {line}"))
     }
 }
 
