@@ -1,5 +1,5 @@
-//! The record, `.tidings/working-copy`: which Store and Area a Working copy belongs to, and each
-//! Path's Base.
+//! The record, `.tidings/working-copy`: which Store and Area a Working copy belongs to, each
+//! Path's Base, and which Paths are Diverged.
 //!
 //! It is plain text, in the style of the filesystem journal (ADR 0005): a first line that names
 //! the format, then a line for each item, with fields separated by tabs, and `\`, tabs and line
@@ -8,7 +8,9 @@
 //! - `backend` and the Backend;
 //! - `area` and the Area;
 //! - `base`, a Path, its Base Revision, and the hash of the contents last written to or read from
-//!   the folder for that Base, in hexadecimal.
+//!   the folder for that Base, in hexadecimal;
+//! - `diverged`, a Diverged Path, and the Revision of the Store's version in `theirs`, which is
+//!   left out if the Store has no File there.
 //!
 //! It is always replaced whole, with `atomic-write-file`, which writes a new file, forces it to
 //! disk and renames it over the record.
@@ -40,6 +42,8 @@ pub struct Record {
     pub area: Area,
     /// The Base of each Path that has one.
     pub bases: BTreeMap<Path, Base>,
+    /// Each Diverged Path, which may or may not have a Base.
+    pub divergences: BTreeMap<Path, Divergence>,
 }
 
 /// A Path's Base, and the hash of its contents.
@@ -47,6 +51,13 @@ pub struct Record {
 pub struct Base {
     pub revision: Revision,
     pub hash: Hash,
+}
+
+/// That a Path is Diverged, and which of the Store's versions `theirs` holds for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Divergence {
+    /// The Revision of the Store's version in `theirs`, or `None` if the Store has no File there.
+    pub theirs: Option<Revision>,
 }
 
 /// The hash of a file's contents (XXH3), which tells whether a local file still holds what the
@@ -70,7 +81,7 @@ pub fn is_record(file: &FsPath) -> bool {
 impl Record {
     /// A record with no Bases yet.
     pub fn new(store: StoreAddress, area: Area) -> Record {
-        Record { store, area, bases: BTreeMap::new() }
+        Record { store, area, bases: BTreeMap::new(), divergences: BTreeMap::new() }
     }
 
     /// Reads the record in `file`.
@@ -114,6 +125,12 @@ impl Record {
             let hash = format!("{:032x}", base.hash.0);
             line(&["base", path.as_str(), &revision, &hash]);
         }
+        for (path, divergence) in &self.divergences {
+            match divergence.theirs {
+                Some(revision) => line(&["diverged", path.as_str(), &revision.to_string()]),
+                None => line(&["diverged", path.as_str()]),
+            }
+        }
         text
     }
 
@@ -128,7 +145,10 @@ impl Record {
             _ => return Err("is not a Working copy's record".to_owned()),
         }
         let (mut location, mut backend, mut area) = (None, None, None);
-        let mut bases = BTreeMap::new();
+        let (mut bases, mut divergences) = (BTreeMap::new(), BTreeMap::new());
+        let parse_path = |path: &str| Path::new(path).map_err(|error| error.to_string());
+        let parse_revision =
+            |revision: &str| revision.parse().map_err(|_| bad("Revision", revision));
         for line in lines {
             let fields: Vec<String> = line.split('\t').map(unescape).collect();
             let fields: Vec<&str> = fields.iter().map(String::as_str).collect();
@@ -140,10 +160,16 @@ impl Record {
                 ["backend", name] => backend = Some(parse_backend(name)?),
                 ["area", name] => area = Some(Area::from(parse_value::<AreaName>(name)?)),
                 ["base", path, revision, hash] => {
-                    let path = Path::new(path).map_err(|error| error.to_string())?;
-                    let revision = revision.parse().map_err(|_| bad("Revision", revision))?;
+                    let revision = parse_revision(revision)?;
                     let hash = u128::from_str_radix(hash, 16).map_err(|_| bad("hash", hash))?;
-                    bases.insert(path, Base { revision, hash: Hash(hash) });
+                    bases.insert(parse_path(path)?, Base { revision, hash: Hash(hash) });
+                }
+                ["diverged", path] => {
+                    divergences.insert(parse_path(path)?, Divergence { theirs: None });
+                }
+                ["diverged", path, revision] => {
+                    let theirs = Some(parse_revision(revision)?);
+                    divergences.insert(parse_path(path)?, Divergence { theirs });
                 }
                 _ => return Err(format!("has a line it can't read: {line:?}")),
             }
@@ -153,7 +179,8 @@ impl Record {
             location: location.ok_or_else(|| missing("where the Store is"))?,
             backend: backend.ok_or_else(|| missing("the Backend"))?,
         };
-        Ok(Record { store, area: area.ok_or_else(|| missing("the Area"))?, bases })
+        let area = area.ok_or_else(|| missing("the Area"))?;
+        Ok(Record { store, area, bases, divergences })
     }
 }
 

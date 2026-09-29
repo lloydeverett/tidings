@@ -1,6 +1,7 @@
 //! What commands print: for a person to read, or as JSON with `--json`.
 
 use std::io::{self, Write};
+use std::path::Path as FsPath;
 
 use serde_json::{Value, json};
 use tidings::{
@@ -151,7 +152,7 @@ pub struct SyncOutput {
 impl SyncOutput {
     /// Prints what `sync` did, as one line, unless it is quiet and this needs no attention.
     pub fn print(self, event: &SyncEvent) -> io::Result<()> {
-        if self.quiet && !matches!(event, SyncEvent::Resync | SyncEvent::Blocked { .. }) {
+        if self.quiet && !matches!(event, SyncEvent::Resync | SyncEvent::Diverged { .. }) {
             return Ok(());
         }
         // Each event is a name, and the Path and message it has, if any.
@@ -159,7 +160,12 @@ impl SyncOutput {
             SyncEvent::Created(path) => ("created", Some(path), None),
             SyncEvent::Updated(path) => ("updated", Some(path), None),
             SyncEvent::Removed(path) => ("removed", Some(path), None),
-            SyncEvent::Blocked { path, reason } => ("error", Some(path), Some(reason)),
+            SyncEvent::Diverged { path, theirs, blocked } => (
+                "diverged",
+                Some(path),
+                Some(diverged_message(theirs.as_deref(), blocked.as_deref())),
+            ),
+            SyncEvent::Resolved(path) => ("resolved", Some(path), None),
             SyncEvent::Resync => ("resync", None, None),
             SyncEvent::CaughtUp => ("caught-up", None, None),
         };
@@ -185,6 +191,19 @@ impl SyncOutput {
             line
         };
         print_stdout(&format!("{line}\n"))
+    }
+}
+
+/// What a *diverged* line says: where the Store's version is, or that the Store removed it, after
+/// what in the folder kept it from being applied, if anything.
+fn diverged_message(theirs: Option<&FsPath>, blocked: Option<&str>) -> String {
+    let theirs = match theirs {
+        Some(theirs) => format!("the Store's version is in {}", theirs.display()),
+        None => "removed in the Store".to_owned(),
+    };
+    match blocked {
+        Some(blocked) => format!("{blocked}; {theirs}"),
+        None => theirs,
     }
 }
 

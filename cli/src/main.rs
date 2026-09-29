@@ -46,13 +46,14 @@ enum Command {
     ///
     /// The folder must be empty or missing, or a Working copy of the Area, which is resumed: the
     /// Store flags are needed only to make a new one. Files the Store adds, changes or removes
-    /// appear in it, but a file changed locally is left alone. Nothing in it reaches the Store
-    /// until `commit`.
+    /// appear in it, but a file changed locally is left alone: if the Store changes it too, it is
+    /// Diverged, and the Store's version is put in `.tidings/theirs/` to merge against. Nothing in
+    /// the folder reaches the Store until `commit`.
     Sync {
         area: AreaName,
         /// The folder. The current directory if left out.
         folder: Option<PathBuf>,
-        /// Print only resyncs and errors.
+        /// Print only divergences, resyncs and errors.
         #[arg(long)]
         quiet: bool,
     },
