@@ -964,6 +964,7 @@ dependencies = [
 name = "tidings-cli"
 version = "0.1.0"
 dependencies = [
+ "atomic-write-file",
  "clap",
  "rustyline",
  "serde_json",
@@ -971,6 +972,7 @@ dependencies = [
  "tempfile",
  "tidings",
  "tokio",
+ "xxhash-rust",
 ]
 
 [[package]]

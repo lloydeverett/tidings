@@ -7,6 +7,8 @@ use tidings::{
     Area, Change, ChangeKind, Committed, FeedItem, File, Origin, Path, Prefix, PrefixRevision, Stat,
 };
 
+use crate::working_copy::{CommitReport, LocalChange, SyncEvent};
+
 /// What a command gives, for [`Output`] to print.
 pub enum Report {
     /// Nothing to print.
@@ -27,6 +29,8 @@ pub enum Report {
     Unchanged,
     /// The editor `edit` ran quit with a failure, so the edit was dropped.
     Cancelled,
+    /// What `commit` committed from a Working copy.
+    WorkingCopyCommit(CommitReport),
 }
 
 /// How to print.
@@ -84,7 +88,35 @@ impl Output {
                 eprintln!("cancelled: the editor quit with a failure, so the edit was dropped");
                 Ok(())
             }
+            Report::WorkingCopyCommit(report) if report.changes.is_empty() => {
+                eprintln!("nothing to commit");
+                Ok(())
+            }
+            Report::WorkingCopyCommit(report) => print_stdout(
+                &report
+                    .changes
+                    .iter()
+                    .map(|change| format!("{} {}\n", change_name(change.change), change.path))
+                    .collect::<String>(),
+            ),
         }
+    }
+
+    /// Prints what `sync` did, as one line.
+    pub fn print_sync_event(self, event: &SyncEvent) -> io::Result<()> {
+        let (name, path) = match event {
+            SyncEvent::Created(path) => ("created", Some(path)),
+            SyncEvent::Updated(path) => ("updated", Some(path)),
+            SyncEvent::Removed(path) => ("removed", Some(path)),
+            SyncEvent::CaughtUp => ("caught up", None),
+        };
+        let line = match (self.json, path) {
+            (true, Some(path)) => json!({"event": name, "path": path.as_str()}).to_string(),
+            (true, None) => json!({"event": name}).to_string(),
+            (false, Some(path)) => format!("{name} {path}"),
+            (false, None) => name.to_owned(),
+        };
+        print_stdout(&format!("{line}\n"))
     }
 
     /// The lines that show `item` for the Areas in `areas`, or every Area if it is empty.
@@ -158,7 +190,27 @@ fn as_json(report: &Report) -> Option<Value> {
         }
         Report::Unchanged => json!({"unchanged": true}),
         Report::Cancelled => json!({"cancelled": true}),
+        Report::WorkingCopyCommit(report) => json!({
+            "committed": report
+                .changes
+                .iter()
+                .map(|change| json!({
+                    "path": change.path.as_str(),
+                    "change": change_name(change.change),
+                    "revision": change.revision.map(|revision| revision.to_string()),
+                }))
+                .collect::<Vec<_>>(),
+        }),
     })
+}
+
+/// A local change's name, as `commit` prints it.
+fn change_name(change: LocalChange) -> &'static str {
+    match change {
+        LocalChange::Added => "added",
+        LocalChange::Modified => "modified",
+        LocalChange::Deleted => "deleted",
+    }
 }
 
 /// Writes `text` to stdout straight away, so that a line reaches a pipe as soon as it's printed.

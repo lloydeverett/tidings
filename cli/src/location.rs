@@ -60,14 +60,14 @@ impl fmt::Display for BackendName {
 
 /// An App identity written as `tld.author.app`, in the order of a reverse domain name.
 #[derive(Debug, Clone)]
-struct Identity {
+pub struct Identity {
     text: String,
     identity: AppIdentity,
 }
 
 impl Identity {
     /// Parses `tld.author.app`: exactly three parts, none of them empty.
-    fn parse(text: &str) -> Result<Identity, String> {
+    pub fn parse(text: &str) -> Result<Identity, String> {
         let parts: Vec<&str> = text.split('.').collect();
         match parts[..] {
             [tld, author, app] if parts.iter().all(|part| !part.is_empty()) => {
@@ -75,6 +75,94 @@ impl Identity {
             }
             _ => Err("an identity is written TLD.AUTHOR.APP, as in com.example.myapp".to_owned()),
         }
+    }
+}
+
+impl fmt::Display for Identity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+/// Where a Store on the filesystem or SQLite is.
+#[derive(Debug, Clone)]
+pub enum StoreLocation {
+    /// A Root override, always absolute, so that it means the same from any directory.
+    Root(PathBuf),
+    /// The standard directories of an App identity.
+    Identity(Identity),
+}
+
+impl StoreLocation {
+    /// For a person to read.
+    fn description(&self) -> String {
+        match self {
+            StoreLocation::Root(root) => root.display().to_string(),
+            StoreLocation::Identity(identity) => format!("the directories of {identity}"),
+        }
+    }
+
+    /// The App identity to open the Store with.
+    fn app_identity(&self) -> AppIdentity {
+        match self {
+            // The Root override replaces every directory the App identity would give, so any
+            // identity will do.
+            StoreLocation::Root(_) => AppIdentity::new("tidings", "tidings", "cli"),
+            StoreLocation::Identity(identity) => identity.identity.clone(),
+        }
+    }
+
+    /// The Root override, if there is one.
+    fn root(&self) -> Option<&std::path::Path> {
+        match self {
+            StoreLocation::Root(root) => Some(root),
+            StoreLocation::Identity(_) => None,
+        }
+    }
+
+    /// Opens the Store here, on `backend`, or on the Backend found here if that is `None`.
+    /// `create` makes a new Store where there is none.
+    pub async fn open(
+        &self,
+        backend: Option<BackendName>,
+        create: bool,
+    ) -> Result<Opened, Failure> {
+        let (identity, root) = (self.app_identity(), self.root());
+        let detected = Store::detect(&identity, root).await?;
+        let backend = match (detected, backend) {
+            // A Backend that doesn't match gives the library's `WrongBackend` when it opens.
+            (Some(_), Some(backend)) => backend,
+            (None, Some(backend)) if create => backend,
+            (Some(kind), None) => kind.into(),
+            (None, None) if create => {
+                return Err(Failure::error("--create needs --backend, to say which one to make"));
+            }
+            (None, _) => {
+                return Err(Failure::error(format!(
+                    "there is no Store at {}: pass --create and --backend to make one",
+                    self.description(),
+                )));
+            }
+        };
+        let (store, feed) = match backend {
+            BackendName::Fs => {
+                let mut options = FsOptions::default();
+                if let Some(root) = root {
+                    options = options.root_override(root);
+                }
+                Store::open_fs(&identity, options).await?
+            }
+            BackendName::Sqlite => {
+                let mut options = SqliteOptions::default();
+                if let Some(root) = root {
+                    options = options.root_override(root);
+                }
+                Store::open_sqlite(&identity, options).await?
+            }
+            BackendName::Memory => unreachable!("the memory Backend has no location"),
+        };
+        let description = format!("{} ({backend})", self.description());
+        Ok(Opened { store, feed, backend, description })
     }
 }
 
@@ -89,14 +177,6 @@ pub struct Opened {
     pub description: String,
 }
 
-/// Where a Store on the filesystem or SQLite is.
-struct Location {
-    identity: AppIdentity,
-    root: Option<PathBuf>,
-    /// For a person to read.
-    description: String,
-}
-
 impl StoreArgs {
     /// Opens the Store the flags choose. `in_shell` allows the memory Backend, which is gone as
     /// soon as the command that opened it is.
@@ -104,42 +184,7 @@ impl StoreArgs {
         if self.backend == Some(BackendName::Memory) {
             return self.open_memory(in_shell);
         }
-        let location = self.location()?;
-        let detected = Store::detect(&location.identity, location.root.as_deref()).await?;
-        let backend = match (detected, self.backend) {
-            // A Backend that doesn't match gives the library's `WrongBackend` when it opens.
-            (Some(_), Some(backend)) => backend,
-            (None, Some(backend)) if self.create => backend,
-            (Some(kind), None) => kind.into(),
-            (None, None) if self.create => {
-                return Err(Failure::error("--create needs --backend, to say which one to make"));
-            }
-            (None, _) => {
-                return Err(Failure::error(format!(
-                    "there is no Store at {}: pass --create and --backend to make one",
-                    location.description,
-                )));
-            }
-        };
-        let (store, feed) = match backend {
-            BackendName::Fs => {
-                let mut options = FsOptions::default();
-                if let Some(root) = &location.root {
-                    options = options.root_override(root);
-                }
-                Store::open_fs(&location.identity, options).await?
-            }
-            BackendName::Sqlite => {
-                let mut options = SqliteOptions::default();
-                if let Some(root) = &location.root {
-                    options = options.root_override(root);
-                }
-                Store::open_sqlite(&location.identity, options).await?
-            }
-            BackendName::Memory => unreachable!("opened above"),
-        };
-        let description = format!("{} ({backend})", location.description);
-        Ok(Opened { store, feed, backend, description })
+        self.location()?.open(self.backend, self.create).await
     }
 
     /// Opens a Store on the memory Backend, if `in_shell`, and nothing says where it is.
@@ -163,20 +208,15 @@ impl StoreArgs {
 
     /// Where the Store on the filesystem or SQLite is, from exactly one of `--root` and
     /// `--identity`.
-    fn location(&self) -> Result<Location, Failure> {
+    pub fn location(&self) -> Result<StoreLocation, Failure> {
         match (&self.root, &self.identity) {
-            (Some(root), None) => Ok(Location {
-                // The Root override replaces every directory the App identity would give, so
-                // any identity will do.
-                identity: AppIdentity::new("tidings", "tidings", "cli"),
-                root: Some(root.clone()),
-                description: root.display().to_string(),
-            }),
-            (None, Some(identity)) => Ok(Location {
-                identity: identity.identity.clone(),
-                root: None,
-                description: format!("the directories of {}", identity.text),
-            }),
+            (Some(root), None) => match std::path::absolute(root) {
+                Ok(root) => Ok(StoreLocation::Root(root)),
+                Err(error) => {
+                    Err(Failure::error(format!("can't use --root {}: {error}", root.display())))
+                }
+            },
+            (None, Some(identity)) => Ok(StoreLocation::Identity(identity.clone())),
             (Some(_), Some(_)) => Err(Failure::error("give either --root or --identity, not both")),
             (None, None) => Err(Failure::error(
                 "say where the Store is, with --root or --identity (or TIDINGS_ROOT or \

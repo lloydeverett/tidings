@@ -1,10 +1,14 @@
 //! Running the `tidings` binary, as a person or a script would, against a temporary Root override.
 #![allow(dead_code)]
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::Duration;
 
+use serde_json::Value;
 use tempfile::TempDir;
 
 /// What a run of `tidings` gave.
@@ -115,4 +119,82 @@ pub fn spawn(command: &mut Command) -> Child {
 /// Whether `text` is a Revision as the CLI writes one: 32 lowercase hexadecimal digits.
 pub fn is_revision(text: &str) -> bool {
     text.len() == 32 && text.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+}
+
+/// How long [`Sync::wait_for`] waits for an event before failing the test.
+const EVENT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A running `tidings sync --json`, with the events it prints as they come.
+pub struct Sync {
+    process: Child,
+    lines: Receiver<String>,
+}
+
+impl Sync {
+    /// Starts `tidings --root <root> --json sync <area> <folder>`.
+    pub fn start(location: &Location, area: &str, folder: &Path) -> Sync {
+        let mut command = location.command(&["--json", "sync", area]);
+        command.arg(folder);
+        Sync::spawn(command)
+    }
+
+    /// Starts `command`, which runs `sync`, reading its stdout on another thread so that waiting
+    /// for a line can time out.
+    pub fn spawn(mut command: Command) -> Sync {
+        command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+        let mut process = command.spawn().unwrap();
+        let stdout = BufReader::new(process.stdout.take().unwrap());
+        let (sender, lines) = mpsc::channel();
+        thread::spawn(move || {
+            for line in stdout.lines().map_while(Result::ok) {
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Sync { process, lines }
+    }
+
+    /// The next line `sync` prints, failing the test if none comes in time.
+    #[track_caller]
+    pub fn next_line(&mut self) -> String {
+        match self.lines.recv_timeout(EVENT_TIMEOUT) {
+            Ok(line) => line,
+            Err(error) => panic!("no line from sync: {error}"),
+        }
+    }
+
+    /// The events `sync` prints up to and including the first whose `event` is `event`, failing
+    /// the test if it doesn't come in time.
+    #[track_caller]
+    pub fn wait_for(&mut self, event: &str) -> Vec<Value> {
+        let mut events = Vec::new();
+        loop {
+            let line = self.next_line();
+            let value: Value = serde_json::from_str(&line)
+                .unwrap_or_else(|error| panic!("{error}: sync printed {line:?}"));
+            let found = value["event"] == event;
+            events.push(value);
+            if found {
+                return events;
+            }
+        }
+    }
+
+    /// Stops `sync` as Ctrl-C would, with SIGINT, and fails the test unless it exits with 0.
+    #[track_caller]
+    pub fn stop(mut self) {
+        let pid = self.process.id().to_string();
+        let killed = Command::new("kill").args(["-INT", &pid]).status().unwrap();
+        assert!(killed.success());
+        let status = self.process.wait().unwrap();
+        assert_eq!(status.code(), Some(0), "sync stopped with {status}");
+    }
+}
+
+impl Drop for Sync {
+    fn drop(&mut self) {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+    }
 }

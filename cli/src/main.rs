@@ -6,17 +6,20 @@ mod failure;
 mod location;
 mod output;
 mod shell;
+mod working_copy;
 
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use tidings::Area;
 
 use crate::command::{AreaName, Session, StoreCommand};
 use crate::failure::Failure;
 use crate::location::StoreArgs;
-use crate::output::{Output, print_stdout};
+use crate::output::{Output, Report, print_stdout};
+use crate::working_copy::{SyncEvent, WorkingCopy};
 
 /// Read, write and watch a tidings Store.
 ///
@@ -39,9 +42,44 @@ struct Cli {
 /// A top-level command.
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Make a folder a Working copy of an Area, holding its Files, until Ctrl-C
+    ///
+    /// The folder must be empty or missing. Nothing in it reaches the Store until `commit`.
+    Sync {
+        area: AreaName,
+        /// The folder. The current directory if left out.
+        folder: Option<PathBuf>,
+    },
+    /// Commit every local change in a Working copy, all together or not at all
+    ///
+    /// Each change requires the File to be unchanged in the Store since the Working copy last
+    /// took it from, or committed it to, the Store, or to be still absent for a new file.
+    Commit {
+        #[command(flatten)]
+        working_copy: WorkingCopyArgs,
+    },
     /// Work on the Store directly: read, write and watch its Files, or keep it open in a shell
     #[command(subcommand)]
     Store(StoreSubcommand),
+}
+
+/// Which Working copy a command acts on.
+#[derive(Debug, Args)]
+struct WorkingCopyArgs {
+    /// The Working copy's folder. Found from the current directory, or a folder above it, if
+    /// left out.
+    #[arg(short = 'C', value_name = "FOLDER")]
+    folder: Option<PathBuf>,
+}
+
+impl WorkingCopyArgs {
+    /// Opens the Working copy.
+    fn open(&self) -> Result<WorkingCopy, Failure> {
+        match &self.folder {
+            Some(folder) => WorkingCopy::open(folder),
+            None => WorkingCopy::find(&std::env::current_dir()?),
+        }
+    }
 }
 
 /// The commands under `tidings store`: a one-shot command, or the shell.
@@ -80,7 +118,10 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let output = Output { json: cli.json, at_prompt: false };
     let result = match cli.command {
+        Command::Sync { area, folder } => runtime.block_on(sync(&cli.store, output, area, folder)),
+        Command::Commit { working_copy } => runtime.block_on(commit(output, &working_copy)),
         Command::Store(StoreSubcommand::Shell) => shell::run(&runtime, &cli.store, cli.json),
         Command::Store(StoreSubcommand::OneShot(command)) => {
             runtime.block_on(one_shot(&cli.store, cli.json, command))
@@ -126,4 +167,58 @@ async fn one_shot(store: &StoreArgs, json: bool, command: OneShot) -> Result<(),
             }
         }
     }
+}
+
+/// `sync`: makes `folder` a Working copy of `area`, writes every File into it, and waits for
+/// Ctrl-C.
+async fn sync(
+    store: &StoreArgs,
+    output: Output,
+    area: AreaName,
+    folder: Option<PathBuf>,
+) -> Result<(), Failure> {
+    let ctrl_c = listen_for_ctrl_c()?;
+    let folder = match folder {
+        Some(folder) => folder,
+        None => std::env::current_dir()?,
+    };
+    let opened = store.open(false).await?;
+    let mut working_copy =
+        WorkingCopy::create(&folder, store.location()?, opened.backend, area.into())?;
+    let _syncing = working_copy.lock_for_sync()?;
+    for event in working_copy.reconcile_all(&opened.store).await? {
+        output.print_sync_event(&event)?;
+    }
+    output.print_sync_event(&SyncEvent::CaughtUp)?;
+    ctrl_c.await;
+    Ok(())
+}
+
+/// `commit`: commits every local change in the Working copy.
+async fn commit(output: Output, working_copy: &WorkingCopyArgs) -> Result<(), Failure> {
+    let mut working_copy = working_copy.open()?;
+    let opened = working_copy.open_store().await?;
+    let report = working_copy.commit(&opened.store).await?;
+    Ok(output.print(&Report::WorkingCopyCommit(report))?)
+}
+
+/// Starts listening for Ctrl-C now, and gives what finishes once it is pressed. Until it is, Ctrl-C
+/// doesn't stop the process. (`tokio::signal::ctrl_c` only starts listening once it is awaited.)
+#[cfg(unix)]
+fn listen_for_ctrl_c() -> io::Result<impl Future<Output = ()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut interrupts = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        interrupts.recv().await;
+    })
+}
+
+/// Starts listening for Ctrl-C now, and gives what finishes once it is pressed. Until it is, Ctrl-C
+/// doesn't stop the process. (`tokio::signal::ctrl_c` only starts listening once it is awaited.)
+#[cfg(windows)]
+fn listen_for_ctrl_c() -> io::Result<impl Future<Output = ()>> {
+    let mut interrupts = tokio::signal::windows::ctrl_c()?;
+    Ok(async move {
+        interrupts.recv().await;
+    })
 }
