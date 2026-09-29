@@ -57,13 +57,19 @@ enum Command {
         #[arg(long)]
         quiet: bool,
     },
-    /// Commit every local change in a Working copy, all together or not at all
+    /// Commit every local change in a Working copy, or only those named, all together or not at
+    /// all
     ///
     /// Each change requires the File to be unchanged in the Store since the Working copy last
-    /// took it from, or committed it to, the Store, or to be still absent for a new file.
+    /// took it from, or committed it to, the Store, or to be still absent for a new file. If not,
+    /// nothing is committed, and each such Path is Diverged, with the Store's version put in
+    /// `.tidings/theirs/` to merge against. A commit that includes a Diverged Path is refused.
     Commit {
         #[command(flatten)]
         working_copy: WorkingCopyArgs,
+        /// Commit only these files, and everything under these directories, relative to the
+        /// current directory.
+        paths: Vec<PathBuf>,
     },
     /// Work on the Store directly: read, write and watch its Files, or keep it open in a shell
     #[command(subcommand)]
@@ -131,8 +137,8 @@ fn main() -> ExitCode {
             let output = SyncOutput { output, quiet };
             runtime.block_on(sync(&cli.store, output, area, folder))
         }
-        Command::Commit { working_copy } => {
-            runtime.block_on(commit(&cli.store, output, &working_copy))
+        Command::Commit { working_copy, paths } => {
+            runtime.block_on(commit(&cli.store, output, &working_copy, &paths))
         }
         Command::Store(StoreSubcommand::Shell) => shell::run(&runtime, &cli.store, cli.json),
         Command::Store(StoreSubcommand::OneShot(command)) => {
@@ -198,16 +204,17 @@ async fn sync(
     WorkingCopy::sync(&folder, Area::from(area), store, ctrl_c, report).await
 }
 
-/// `commit`: commits every local change in the Working copy. Any Store flags in `store` must
-/// match its record.
+/// `commit`: commits every local change in the Working copy, or only those at or under `paths`,
+/// relative to the current directory. Any Store flags in `store` must match its record.
 async fn commit(
     store: &StoreArgs,
     output: Output,
     working_copy: &WorkingCopyArgs,
+    paths: &[PathBuf],
 ) -> Result<(), Failure> {
     let working_copy = working_copy.open()?;
     let opened = working_copy.open_store(store).await?;
-    let report = working_copy.commit(&opened.store).await?;
+    let report = working_copy.commit(&opened.store, paths, &std::env::current_dir()?).await?;
     Ok(output.print(&Report::WorkingCopyCommit(report))?)
 }
 

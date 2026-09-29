@@ -21,7 +21,8 @@ enum FailureKind {
     Error,
     /// Exit code 2: `read` or `stat` found no File.
     Missing,
-    /// Exit code 3: a Precondition didn't hold, so the Commit wrote nothing.
+    /// Exit code 3: a Precondition didn't hold, so the Commit wrote nothing, or a Working copy's
+    /// commit was refused because a Path it would commit is Diverged.
     Conflict,
 }
 
@@ -29,6 +30,11 @@ impl Failure {
     /// Anything else that went wrong, which exits with 1.
     pub fn error(message: impl Into<String>) -> Failure {
         Failure { kind: FailureKind::Error, message: message.into() }
+    }
+
+    /// Nothing was committed, because of a Conflict or a Divergence, which exits with 3.
+    pub fn conflict(message: impl Into<String>) -> Failure {
+        Failure { kind: FailureKind::Conflict, message: message.into() }
     }
 
     /// There is no File at `path` in `area`.
@@ -70,9 +76,10 @@ impl From<tidings::Error> for Failure {
         match error {
             tidings::Error::Conflict { paths } => {
                 let paths: Vec<&str> = paths.iter().map(|path| path.as_str()).collect();
-                let message =
-                    format!("Conflict: a Precondition did not hold for {}", paths.join(", "));
-                Failure { kind: FailureKind::Conflict, message }
+                Failure::conflict(format!(
+                    "Conflict: a Precondition did not hold for {}",
+                    paths.join(", ")
+                ))
             }
             error => Failure::error(error.to_string()),
         }

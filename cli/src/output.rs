@@ -93,13 +93,19 @@ impl Output {
                 eprintln!("nothing to commit");
                 Ok(())
             }
-            Report::WorkingCopyCommit(report) => print_stdout(
-                &report
-                    .changes
-                    .iter()
-                    .map(|change| format!("{} {}\n", change_name(change.change), change.path))
-                    .collect::<String>(),
-            ),
+            Report::WorkingCopyCommit(report) => {
+                print_stdout(
+                    &report
+                        .changes
+                        .iter()
+                        .map(|change| format!("{} {}\n", change_name(change.change), change.path))
+                        .collect::<String>(),
+                )?;
+                if report.pending {
+                    eprintln!("{PENDING_NOTE}");
+                }
+                Ok(())
+            }
         }
     }
 
@@ -159,22 +165,8 @@ impl SyncOutput {
         if self.quiet && !needs_attention {
             return Ok(());
         }
-        // Each event is a name, and the Path and message it has, if any.
-        let (name, path, message) = match event {
-            SyncEvent::Created(path) => ("created", Some(path), None),
-            SyncEvent::Updated(path) => ("updated", Some(path), None),
-            SyncEvent::Removed(path) => ("removed", Some(path), None),
-            SyncEvent::Diverged { path, theirs_file, blocked } => (
-                "diverged",
-                Some(path),
-                Some(diverged_message(theirs_file.as_deref(), blocked.as_ref())),
-            ),
-            SyncEvent::Resolved(path) => ("resolved", Some(path), None),
-            SyncEvent::Error { path, message } => ("error", Some(path), Some(message.clone())),
-            SyncEvent::Resync => ("resync", None, None),
-            SyncEvent::CaughtUp => ("caught-up", None, None),
-        };
         let line = if self.output.json {
+            let (name, path, message) = event_parts(event);
             let mut object = serde_json::Map::new();
             object.insert("event".to_owned(), json!(name));
             if let Some(path) = path {
@@ -190,17 +182,42 @@ impl SyncOutput {
             }
             Value::Object(object).to_string()
         } else {
-            // For a person, a name is words.
-            let mut line = name.replace('-', " ");
-            if let Some(path) = path {
-                line.push_str(&format!(" {path}"));
-            }
-            if let Some(message) = message {
-                line.push_str(&format!(": {message}"));
-            }
-            line
+            event_line(event)
         };
         print_stdout(&format!("{line}\n"))
+    }
+}
+
+/// The line for a person that says what `sync` did, or found, as in "diverged a: removed in the
+/// Store".
+pub fn event_line(event: &SyncEvent) -> String {
+    let (name, path, message) = event_parts(event);
+    // For a person, a name is words.
+    let mut line = name.replace('-', " ");
+    if let Some(path) = path {
+        line.push_str(&format!(" {path}"));
+    }
+    if let Some(message) = message {
+        line.push_str(&format!(": {message}"));
+    }
+    line
+}
+
+/// An event's name, and the Path and message it has, if any.
+fn event_parts(event: &SyncEvent) -> (&'static str, Option<&Path>, Option<String>) {
+    match event {
+        SyncEvent::Created(path) => ("created", Some(path), None),
+        SyncEvent::Updated(path) => ("updated", Some(path), None),
+        SyncEvent::Removed(path) => ("removed", Some(path), None),
+        SyncEvent::Diverged { path, theirs_file, blocked } => (
+            "diverged",
+            Some(path),
+            Some(diverged_message(theirs_file.as_deref(), blocked.as_ref())),
+        ),
+        SyncEvent::Resolved(path) => ("resolved", Some(path), None),
+        SyncEvent::Error { path, message } => ("error", Some(path), Some(message.clone())),
+        SyncEvent::Resync => ("resync", None, None),
+        SyncEvent::CaughtUp => ("caught-up", None, None),
     }
 }
 
@@ -261,9 +278,15 @@ fn as_json(report: &Report) -> Option<Value> {
                     "revision": change.revision.map(|revision| revision.to_string()),
                 }))
                 .collect::<Vec<_>>(),
+            "pending": report.pending,
         }),
     })
 }
+
+/// What `commit` says after a Commit that gave `Pending`.
+const PENDING_NOTE: &str = "the Commit happened, but isn't finished yet: a File in the Store \
+                            couldn't be replaced, and the next Commit to the Area, or opening the \
+                            Store, finishes it";
 
 /// A local change's name, as `commit` prints it.
 fn change_name(change: LocalChange) -> &'static str {

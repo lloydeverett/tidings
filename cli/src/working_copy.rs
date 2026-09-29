@@ -9,14 +9,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, TryLockError};
 use std::future::{self, Future};
 use std::io::{self, ErrorKind, Write};
-use std::path::{Path as FsPath, PathBuf};
+use std::path::{Component, Path as FsPath, PathBuf};
 use std::pin::{Pin, pin};
 
 use tidings::{Area, ChangeFeed, FeedItem, File, Path, Precondition, Revision, Staging, Store};
 
 use crate::failure::Failure;
 use crate::location::{Opened, StoreAddress, StoreArgs};
-use crate::output::area_name;
+use crate::output::{area_name, event_line};
 use record::{Base, Divergence, Hash, Record};
 
 /// The directory in a Working copy's folder that holds its record and locks, which is never a
@@ -99,10 +99,28 @@ pub enum SyncEvent {
     CaughtUp,
 }
 
+impl SyncEvent {
+    /// The Path this is about, if any.
+    fn path(&self) -> Option<&Path> {
+        match self {
+            SyncEvent::Created(path)
+            | SyncEvent::Updated(path)
+            | SyncEvent::Removed(path)
+            | SyncEvent::Diverged { path, .. }
+            | SyncEvent::Resolved(path)
+            | SyncEvent::Error { path, .. } => Some(path),
+            SyncEvent::Resync | SyncEvent::CaughtUp => None,
+        }
+    }
+}
+
 /// What `commit` committed: nothing, if there were no local changes.
 #[derive(Debug)]
 pub struct CommitReport {
+    /// Each local change committed.
     pub changes: Vec<CommittedChange>,
+    /// Whether the Commit gave [`tidings::Error::Pending`]: it happened, but isn't finished.
+    pub pending: bool,
 }
 
 /// One local change that was committed.
@@ -131,6 +149,45 @@ enum Paths {
     All,
     /// Only these.
     Only(BTreeSet<Path>),
+}
+
+/// Which Paths a commit covers.
+enum Chosen {
+    /// Every Path.
+    All,
+    /// Each Path at or under one of these, given as the person named it and as a Path, or a Prefix
+    /// without its last `/`: `""` for the whole folder.
+    Under(Vec<(PathBuf, String)>),
+}
+
+impl Chosen {
+    /// Whether this covers `path`.
+    fn covers(&self, path: &Path) -> bool {
+        match self {
+            Chosen::All => true,
+            Chosen::Under(names) => names.iter().any(|(_, name)| is_at_or_under(path, name)),
+        }
+    }
+
+    /// Fails unless each name covers a file in `files` or a Path in `record`, so that a mistyped
+    /// name isn't taken for one with nothing to commit.
+    fn check_each_names_something(
+        &self,
+        files: &BTreeMap<Path, String>,
+        record: &Record,
+    ) -> Result<(), Failure> {
+        let Chosen::Under(names) = self else { return Ok(()) };
+        let known = files.keys().chain(record.bases.keys()).chain(record.divergences.keys());
+        for (named, name) in names {
+            if !name.is_empty() && !known.clone().any(|path| is_at_or_under(path, name)) {
+                return Err(Failure::error(format!(
+                    "{}: no such file in the Working copy",
+                    named.display()
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What in the folder keeps the Store's version of a Path from being applied there: one of the
@@ -422,6 +479,21 @@ impl WorkingCopy {
         // it can be.
         paths.extend(record.divergences.keys().cloned());
         paths.extend(theirs_failures.iter().cloned());
+        let events = self.reconcile_paths(store, record, paths, theirs_failures).await?;
+        // The folder is changed first and the record saved after.
+        self.save(&lock.record)?;
+        Ok(events)
+    }
+
+    /// Reconciles `paths` with the Store in `record`, which the caller holds under [`Lock`] and
+    /// saves after, and in the folder, as [`WorkingCopy::reconcile`] says, but only those Paths.
+    async fn reconcile_paths(
+        &self,
+        store: &Store,
+        record: &mut Record,
+        paths: BTreeSet<Path>,
+        theirs_failures: &mut BTreeSet<Path>,
+    ) -> Result<Vec<SyncEvent>, Failure> {
         let mut removed = Vec::new();
         let mut written = Vec::new();
         for path in paths {
@@ -480,8 +552,6 @@ impl WorkingCopy {
                 events.push(SyncEvent::Error { path, message });
             }
         }
-        // The folder is changed first and the record saved after.
-        self.save(&lock.record)?;
         Ok(events)
     }
 
@@ -673,16 +743,48 @@ impl WorkingCopy {
         Ok(())
     }
 
-    /// Commits every local change as one Commit: an added file requires the Path to be absent in
-    /// the Store, and a modified or deleted one that the File is unchanged since its Base. The
-    /// committed Revisions become the new Bases.
-    pub async fn commit(&self, store: &Store) -> Result<CommitReport, Failure> {
+    /// Commits every local change as one Commit, or only those at or under `named`: files or
+    /// directories in the folder, relative to `current`, the current directory. An added file
+    /// requires the Path to be absent in the Store, and a modified or deleted one that the File
+    /// is unchanged since its Base. The committed Revisions become the new Bases, as they do when
+    /// the Commit gives [`tidings::Error::Pending`], which the report says.
+    ///
+    /// Refused, exiting with 3, if any Path it would commit is Diverged. On a Conflict, nothing is
+    /// committed: each Path it names is reconciled as `sync` would, which makes it Diverged, or
+    /// gives it the new Base if the local contents turn out the same as the Store's, and the
+    /// failure says which.
+    pub async fn commit(
+        &self,
+        store: &Store,
+        named: &[PathBuf],
+        current: &FsPath,
+    ) -> Result<CommitReport, Failure> {
         let mut lock = self.lock()?;
-        let bases = &mut lock.record.bases;
+        let chosen = self.choose(named, current)?;
+        let diverged: Vec<SyncEvent> = lock
+            .record
+            .divergences
+            .iter()
+            .filter(|(path, _)| chosen.covers(path))
+            .map(|(path, divergence)| SyncEvent::Diverged {
+                path: path.clone(),
+                theirs_file: divergence.theirs_revision.map(|_| theirs_file(path)),
+                blocked: None,
+            })
+            .collect();
+        if !diverged.is_empty() {
+            return Err(Failure::conflict(listing(
+                "can't commit Diverged Paths: merge each and `tidings resolve` it, or `tidings \
+                 discard` it, or name only other paths to commit",
+                diverged.iter().map(event_line),
+            )));
+        }
         let files = self.scan()?;
+        chosen.check_each_names_something(&files, &lock.record)?;
+        let bases = &lock.record.bases;
         let mut staging = Staging::new(self.area);
         let mut changes = Vec::new();
-        for (path, contents) in &files {
+        for (path, contents) in files.iter().filter(|(path, _)| chosen.covers(path)) {
             let (change, precondition) = match bases.get(path) {
                 None => (LocalChange::Added, Precondition::Absent),
                 Some(base) if Hash::of(contents) != base.hash => {
@@ -693,32 +795,123 @@ impl WorkingCopy {
             staging.write_requiring(path, contents.as_str(), precondition)?;
             changes.push((path.clone(), change));
         }
-        for (path, base) in bases.iter() {
+        for (path, base) in bases.iter().filter(|(path, _)| chosen.covers(path)) {
             if !files.contains_key(path) {
                 staging.delete_requiring(path, Precondition::UnchangedSince(base.revision))?;
                 changes.push((path.clone(), LocalChange::Deleted));
             }
         }
         if changes.is_empty() {
-            return Ok(CommitReport { changes: Vec::new() });
+            return Ok(CommitReport { changes: Vec::new(), pending: false });
         }
-        let committed = store.commit(staging).await?;
-        let mut report = CommitReport { changes: Vec::new() };
-        for (path, change) in changes {
-            let revision = committed.revisions().get(&path).copied();
-            match (revision, files.get(&path)) {
-                (Some(revision), Some(contents)) => {
-                    let base = Base { revision, hash: Hash::of(contents) };
-                    bases.insert(path.clone(), base);
+        let pending = match store.commit(staging).await {
+            Ok(committed) => {
+                for (path, _) in &changes {
+                    match (committed.revisions().get(path), files.get(path)) {
+                        (Some(&revision), Some(contents)) => {
+                            let base = Base { revision, hash: Hash::of(contents) };
+                            lock.record.bases.insert(path.clone(), base);
+                        }
+                        _ => {
+                            lock.record.bases.remove(path);
+                        }
+                    }
                 }
-                _ => {
-                    bases.remove(&path);
-                }
+                false
             }
-            report.changes.push(CommittedChange { path, change, revision });
-        }
+            // The Commit happened, and reads show it, so reconciling each Path takes the Store's
+            // version, which holds the local contents, as its Base, as `sync` would. Only another
+            // Commit landing straight after could give an event, which `sync` would report again.
+            Err(tidings::Error::Pending) => {
+                let paths = changes.iter().map(|(path, _)| path.clone()).collect();
+                let record = &mut lock.record;
+                self.reconcile_paths(store, record, paths, &mut BTreeSet::new()).await?;
+                true
+            }
+            Err(tidings::Error::Conflict { paths }) => {
+                return Err(self.reconcile_conflict(store, &mut lock.record, paths).await?);
+            }
+            Err(error) => return Err(error.into()),
+        };
         self.save(&lock.record)?;
-        Ok(report)
+        let changes = changes
+            .into_iter()
+            .map(|(path, change)| {
+                // The new Base's Revision, if it holds what was committed.
+                let base = lock.record.bases.get(&path);
+                let committed = files.get(&path).map(|contents| Hash::of(contents));
+                let revision = base.filter(|base| Some(base.hash) == committed);
+                CommittedChange { revision: revision.map(|base| base.revision), path, change }
+            })
+            .collect();
+        Ok(CommitReport { changes, pending })
+    }
+
+    /// After a Conflict for `paths`, reconciles each of them in `record` as `sync` would, and
+    /// saves it, giving the failure that says what became of each.
+    async fn reconcile_conflict(
+        &self,
+        store: &Store,
+        record: &mut Record,
+        paths: Vec<Path>,
+    ) -> Result<Failure, Failure> {
+        let paths: BTreeSet<Path> = paths.into_iter().collect();
+        let events =
+            self.reconcile_paths(store, record, paths.clone(), &mut BTreeSet::new()).await?;
+        self.save(record)?;
+        let mut lines: BTreeMap<&Path, Vec<String>> = BTreeMap::new();
+        for event in &events {
+            if let Some(path) = event.path() {
+                lines.entry(path).or_default().push(event_line(event));
+            }
+        }
+        // A Path with no event took the Store's version as its Base silently.
+        for path in &paths {
+            lines.entry(path).or_insert_with(|| {
+                vec![format!(
+                    "same {path}: the Store has the same contents, which are now its Base"
+                )]
+            });
+        }
+        Ok(Failure::conflict(listing(
+            "Conflict: the Store changed these since their Base, so nothing was committed",
+            lines.into_values().flatten(),
+        )))
+    }
+
+    /// Which Paths a commit covers: every one if `named` is empty, or else each at or under one
+    /// of the files or directories it names, relative to `current`.
+    ///
+    /// Each must be in the folder, but not in `.tidings/`. The folder and each directory named
+    /// are compared as they are on disk, so that they may be reached through a symlink.
+    fn choose(&self, named: &[PathBuf], current: &FsPath) -> Result<Chosen, Failure> {
+        if named.is_empty() {
+            return Ok(Chosen::All);
+        }
+        let folder = fs::canonicalize(&self.folder).map_err(failed_at(&self.folder))?;
+        let mut names = Vec::new();
+        for name in named {
+            let refuse = |why: &str| Failure::error(format!("{} {why}", name.display()));
+            let on_disk = on_disk(&current.join(name))?;
+            let Ok(in_folder) = on_disk.strip_prefix(&folder) else {
+                return Err(refuse(&format!("is outside the Working copy {}", folder.display())));
+            };
+            let mut parts = Vec::new();
+            for part in in_folder.components() {
+                let Some(part) = part.as_os_str().to_str() else {
+                    return Err(refuse("has a name that isn't UTF-8"));
+                };
+                // Matched as `scan` matches it, which never reads a `.tidings/` in any case.
+                if parts.is_empty() && part.eq_ignore_ascii_case(RECORD_DIRECTORY) {
+                    return Err(refuse(&format!(
+                        "is in {RECORD_DIRECTORY}, which holds the Working copy's record"
+                    )));
+                }
+                parts.push(part);
+            }
+            names.push((name.clone(), parts.join("/")));
+        }
+        Ok(Chosen::Under(names))
     }
 
     /// What the folder holds at `path`.
@@ -949,6 +1142,40 @@ fn holds_no_record(directory: &FsPath) -> Result<bool, Failure> {
         }
     }
     Ok(true)
+}
+
+/// Whether `path` is `name`, or under it as a directory: `""` is the whole folder.
+fn is_at_or_under(path: &Path, name: &str) -> bool {
+    let rest = path.as_str().strip_prefix(name);
+    name.is_empty() || rest.is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// `name`, an absolute path, as it is on disk: each directory it is in with every symlink,
+/// `.` and `..` resolved, as far as they exist, then the rest as given. Its last part, if a name,
+/// is kept as it is, so that a symlink there is named rather than followed.
+fn on_disk(name: &FsPath) -> Result<PathBuf, Failure> {
+    let (directory, last) = match name.components().next_back() {
+        Some(Component::Normal(last)) => (name.parent().unwrap_or(name), Some(last)),
+        _ => (name, None),
+    };
+    let existing = directory.ancestors().find(|ancestor| ancestor.exists()).unwrap_or(directory);
+    let mut on_disk = fs::canonicalize(existing).map_err(failed_at(existing))?;
+    for part in directory.strip_prefix(existing).unwrap_or(FsPath::new("")).components() {
+        match part {
+            Component::ParentDir => {
+                on_disk.pop();
+            }
+            Component::Normal(part) => on_disk.push(part),
+            _ => {}
+        }
+    }
+    on_disk.extend(last);
+    Ok(on_disk)
+}
+
+/// A failure's message: `heading`, then each of `lines` on a line of its own, indented.
+fn listing(heading: &str, lines: impl Iterator<Item = String>) -> String {
+    lines.fold(heading.to_owned(), |message, line| format!("{message}\n  {line}"))
 }
 
 /// Turns an I/O error about `path` into a Failure that names it.
