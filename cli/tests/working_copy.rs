@@ -585,9 +585,9 @@ fn a_path_blocked_by_a_local_file_is_reported_and_the_rest_still_applied() {
         let events = sync.wait_for("caught-up");
         assert_eq!(paths(&events, "error"), ["q/r"], "{backend}: {events:?}");
         let error = events.iter().find(|event| event["event"] == "error").unwrap();
-        assert!(error["message"].as_str().unwrap().contains('q'), "{backend}: {events:?}");
+        assert_eq!(error["message"], "q isn't a directory", "{backend}: {events:?}");
         assert_eq!(paths(&events, "created"), ["a", "z"], "{backend}: {events:?}");
-        assert_eq!(fs::read_to_string(folder.path().join("q")).unwrap(), "mine\n");
+        assert_eq!(fs::read_to_string(folder.path().join("q")).unwrap(), "mine\n", "{backend}");
 
         // `sync` keeps running.
         location.write("config", "later", "later\n");
@@ -596,6 +596,35 @@ fn a_path_blocked_by_a_local_file_is_reported_and_the_rest_still_applied() {
         sync.stop();
 
         // The applied Paths were recorded, so with the person's file gone nothing is an addition.
+        fs::remove_file(folder.path().join("q")).unwrap();
+        let run = commit_in(folder.path(), &[]).expect_success();
+        assert!(run.stderr.contains("nothing to commit"), "{backend}: {run:?}");
+    }
+}
+
+#[test]
+fn a_removal_under_a_local_file_needs_nothing_applied_so_takes_the_base_silently() {
+    for backend in BACKENDS {
+        let location = Location::with_store(backend);
+        location.write("config", "q/r", "r\n");
+        let folder = TempDir::new().unwrap();
+        let mut sync = Sync::start(&location, "config", folder.path());
+        sync.wait_for("caught-up");
+        // The person replaces the directory with a file of their own.
+        fs::remove_dir_all(folder.path().join("q")).unwrap();
+        fs::write(folder.path().join("q"), "mine\n").unwrap();
+
+        location
+            .run_with_stdin(&["store", "shell"], "stage config\ndelete config q/r\ncommit\n")
+            .expect_success();
+        // Local and Store are both absent at `q/r`, so the Store's absence becomes the Base.
+        let events = sync.wait_for("caught-up");
+        let names: Vec<&str> =
+            events.iter().map(|event| event["event"].as_str().unwrap()).collect();
+        assert_eq!(names, ["caught-up"], "{backend}");
+        sync.stop();
+        assert_eq!(fs::read_to_string(folder.path().join("q")).unwrap(), "mine\n", "{backend}");
+
         fs::remove_file(folder.path().join("q")).unwrap();
         let run = commit_in(folder.path(), &[]).expect_success();
         assert!(run.stderr.contains("nothing to commit"), "{backend}: {run:?}");

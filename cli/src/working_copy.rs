@@ -107,9 +107,27 @@ enum Paths {
     Only(BTreeSet<Path>),
 }
 
-/// Why the Store's version of a Path can't be applied to the folder: something in the way, as in
-/// "q isn't a directory".
-struct Blocked(String);
+/// A directory a Path is in, in the folder, that isn't one, so the Store's version of the Path
+/// can't be applied there. Each holds the directory, relative to the folder.
+enum Blocked {
+    /// A symlink, through which something outside the folder would be reached.
+    Symlink(PathBuf),
+    /// A file, or anything else that isn't a directory.
+    NotADirectory(PathBuf),
+}
+
+impl Blocked {
+    /// The event reporting that this blocks `path`, as in "q isn't a directory".
+    fn event(&self, path: &Path) -> SyncEvent {
+        let reason = match self {
+            Blocked::Symlink(directory) => format!("{} is a symlink", directory.display()),
+            Blocked::NotADirectory(directory) => {
+                format!("{} isn't a directory", directory.display())
+            }
+        };
+        SyncEvent::Blocked { path: path.clone(), reason }
+    }
+}
 
 /// What the folder holds at a Path.
 enum Local {
@@ -321,11 +339,15 @@ impl WorkingCopy {
         path: &Path,
         theirs: Option<&File>,
     ) -> Result<Option<SyncEvent>, Failure> {
-        if let Err(Blocked(reason)) = self.check_directories(path)? {
-            return Ok(Some(SyncEvent::Blocked { path: path.clone(), reason }));
-        }
+        let blocked = self.blocking_directory(path)?;
+        let local = match &blocked {
+            None => self.local(path)?,
+            // Nothing can be at `path` under a file.
+            Some(Blocked::NotADirectory(_)) => Local::Absent,
+            // What is there is outside the folder, so it is never read, and nothing is decided.
+            Some(blocked @ Blocked::Symlink(_)) => return Ok(Some(blocked.event(path))),
+        };
         let base = bases.get(path).copied();
-        let local = self.local(path)?;
         let unchanged = match (&local, base) {
             (Local::Absent, None) => true,
             (Local::File(contents), Some(base)) => Hash::of(contents) == base.hash,
@@ -340,7 +362,14 @@ impl WorkingCopy {
             // A local change stays as it is.
             return Ok(None);
         }
-        let event = if unchanged { self.apply(path, &local, theirs)? } else { None };
+        let event = match (unchanged, blocked) {
+            (false, _) => None,
+            (true, Some(blocked)) => return Ok(Some(blocked.event(path))),
+            // Between checking the directories and applying through them, another process could
+            // swap one for a symlink and so redirect the write or removal outside the folder. Only
+            // a deliberate race could do that, so it isn't guarded against.
+            (true, None) => self.apply(path, &local, theirs)?,
+        };
         match theirs {
             Some(file) => {
                 let base = Base { revision: file.revision(), hash: Hash::of(file.contents()) };
@@ -353,32 +382,34 @@ impl WorkingCopy {
         Ok(event)
     }
 
-    /// Whether the directories `path` is in, in the folder, are each a real directory or missing,
-    /// so that nothing outside the folder is reached through them: not a symlink, nor a file.
-    fn check_directories(&self, path: &Path) -> Result<Result<(), Blocked>, Failure> {
-        let mut at = self.folder.clone();
-        let mut directories = path.as_str().split('/');
-        // The last part names the File, not a directory.
-        directories.next_back();
-        for name in directories {
-            at.push(name);
-            let metadata = match fs::symlink_metadata(&at) {
+    /// The first of the directories `path` is in, in the folder, that isn't a real directory or
+    /// missing, if any: a symlink, through which something outside the folder would be reached,
+    /// or a file.
+    fn blocking_directory(&self, path: &Path) -> Result<Option<Blocked>, Failure> {
+        let at = self.path_in_folder(path);
+        let directories: Vec<&FsPath> =
+            at.ancestors().skip(1).take_while(|directory| *directory != self.folder).collect();
+        // From the folder down, since nothing under a missing directory can be there either.
+        for directory in directories.into_iter().rev() {
+            let metadata = match fs::symlink_metadata(directory) {
                 Ok(metadata) => metadata,
                 // Missing, so made as a real directory when a File is written under it.
                 Err(error) if error.kind() == ErrorKind::NotFound => break,
-                Err(error) => return Err(failed_at(&at)(error)),
+                Err(error) => return Err(failed_at(directory)(error)),
             };
+            let in_folder = || directory.strip_prefix(&self.folder).unwrap_or(directory).to_owned();
+            if metadata.is_symlink() {
+                return Ok(Some(Blocked::Symlink(in_folder())));
+            }
             if !metadata.is_dir() {
-                let directory = at.strip_prefix(&self.folder).unwrap_or(&at).display();
-                let what = if metadata.is_symlink() { "is a symlink" } else { "isn't a directory" };
-                return Ok(Err(Blocked(format!("{directory} {what}"))));
+                return Ok(Some(Blocked::NotADirectory(in_folder())));
             }
         }
-        Ok(Ok(()))
+        Ok(None)
     }
 
-    /// Makes the folder hold `theirs` at `path`, where it now holds `local`. The directories
-    /// `path` is in must have passed [`WorkingCopy::check_directories`].
+    /// Makes the folder hold `theirs` at `path`, where it now holds `local`. None of the
+    /// directories `path` is in may be a [`WorkingCopy::blocking_directory`].
     fn apply(
         &self,
         path: &Path,
@@ -406,27 +437,23 @@ impl WorkingCopy {
     /// seen half-written: in `.tidings/tmp/` first, forced to disk, then renamed into place. A
     /// file it replaces keeps its permissions.
     fn write(&self, at: &FsPath, contents: &str) -> Result<(), Failure> {
-        self.write_io(at, contents).map_err(failed_at(at))
-    }
-
-    /// [`WorkingCopy::write`], failing with the I/O error.
-    fn write_io(&self, at: &FsPath, contents: &str) -> io::Result<()> {
+        let failed = failed_at(at);
         let tmp = self.folder.join(RECORD_DIRECTORY).join(TMP_DIRECTORY);
-        fs::create_dir_all(&tmp)?;
+        fs::create_dir_all(&tmp).map_err(failed_at(&tmp))?;
         let mut builder = tempfile::Builder::new();
         // As a new file would be made, before the umask, rather than only for its owner.
         #[cfg(unix)]
         builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666));
-        let mut file = builder.tempfile_in(&tmp)?;
-        file.write_all(contents.as_bytes())?;
+        let mut file = builder.tempfile_in(&tmp).map_err(failed_at(&tmp))?;
+        file.write_all(contents.as_bytes()).map_err(failed)?;
         if let Ok(metadata) = fs::metadata(at) {
-            file.as_file().set_permissions(metadata.permissions())?;
+            file.as_file().set_permissions(metadata.permissions()).map_err(failed)?;
         }
-        file.as_file().sync_all()?;
+        file.as_file().sync_all().map_err(failed)?;
         if let Some(parent) = at.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).map_err(failed_at(parent))?;
         }
-        file.persist(at).map_err(|error| error.error)?;
+        file.persist(at).map_err(|error| failed(error.error))?;
         Ok(())
     }
 

@@ -154,6 +154,7 @@ impl SyncOutput {
         if self.quiet && !matches!(event, SyncEvent::Resync | SyncEvent::Blocked { .. }) {
             return Ok(());
         }
+        // Each event is a name, and the Path and message it has, if any.
         let (name, path, message) = match event {
             SyncEvent::Created(path) => ("created", Some(path), None),
             SyncEvent::Updated(path) => ("updated", Some(path), None),
@@ -162,16 +163,26 @@ impl SyncOutput {
             SyncEvent::Resync => ("resync", None, None),
             SyncEvent::CaughtUp => ("caught-up", None, None),
         };
-        let line = match (self.output.json, path, message) {
-            (true, Some(path), Some(message)) => {
-                json!({"event": name, "path": path.as_str(), "message": message}).to_string()
+        let line = if self.output.json {
+            let mut object = serde_json::Map::new();
+            object.insert("event".to_owned(), json!(name));
+            if let Some(path) = path {
+                object.insert("path".to_owned(), json!(path.as_str()));
             }
-            (true, Some(path), None) => json!({"event": name, "path": path.as_str()}).to_string(),
-            (true, None, _) => json!({"event": name}).to_string(),
-            (false, Some(path), Some(message)) => format!("{name} {path}: {message}"),
-            (false, Some(path), None) => format!("{name} {path}"),
+            if let Some(message) = message {
+                object.insert("message".to_owned(), json!(message));
+            }
+            Value::Object(object).to_string()
+        } else {
             // For a person, a name is words.
-            (false, None, _) => name.replace('-', " "),
+            let mut line = name.replace('-', " ");
+            if let Some(path) = path {
+                line.push_str(&format!(" {path}"));
+            }
+            if let Some(message) = message {
+                line.push_str(&format!(": {message}"));
+            }
+            line
         };
         print_stdout(&format!("{line}\n"))
     }
