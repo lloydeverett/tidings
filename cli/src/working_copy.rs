@@ -25,7 +25,9 @@ use crate::output::area_name;
 use record::{Base, Divergence, Record};
 use scan::{Difference, IGNORE_FILE, Scan, is_record_directory};
 pub use scan::{LocalName, Unfit};
-pub use settle::{DiscardReport, Discarded, DiscardedChange, ResolveReport, Resolved};
+pub use settle::{
+    DiscardOutcome, DiscardReport, Discarded, DiscardedChange, ResolveReport, Resolved,
+};
 
 /// The directory in a Working copy's folder that holds its record and locks, which is never a
 /// File.
@@ -236,14 +238,24 @@ impl Selection {
         }
     }
 
+    /// Whether this names the file `name` spells itself, not only a directory it is in.
+    fn names_itself(&self, name: &str) -> bool {
+        match self {
+            Selection::All => false,
+            Selection::Named(named) => named.iter().any(
+                |named| matches!(&named.target, Target::Under(target) if target.as_str() == name),
+            ),
+        }
+    }
+
     /// Fails unless each named path covers a file in `scan` or a Path in `record`, so that a
-    /// mistyped one isn't taken for one with nothing to `command` (`commit` or `discard`), nor an
-    /// ignored one for one it would act on.
+    /// mistyped one isn't taken for one with nothing for `command` to do, nor an ignored one for
+    /// one it would act on.
     fn check_each_names_something(
         &self,
         scan: &Scan,
         record: &Record,
-        command: &str,
+        command: Naming,
     ) -> Result<(), Failure> {
         let Selection::Named(named) = self else { return Ok(()) };
         let paths = scan.files.keys().chain(record.bases.keys()).chain(record.divergences.keys());
@@ -259,7 +271,8 @@ impl Selection {
             let why = if matches!(target, Target::Under(name) if scan.ignored.contains(name)) {
                 format!(
                     "is left out by {RECORD_DIRECTORY}/{IGNORE_FILE}: remove the pattern that \
-                     matches it there to {command} it"
+                     matches it there to {} it",
+                    command.verb()
                 )
             } else if scan.ignored.iter().any(|name| target.covers(name.as_str())) {
                 format!("holds only files {RECORD_DIRECTORY}/{IGNORE_FILE} leaves out")
@@ -269,6 +282,23 @@ impl Selection {
             return Err(Failure::error(format!("{}: {why}", given.display())));
         }
         Ok(())
+    }
+}
+
+/// Which command named the paths a [`Selection`] checks.
+#[derive(Debug, Clone, Copy)]
+enum Naming {
+    Commit,
+    Discard,
+}
+
+impl Naming {
+    /// The command's name, as a verb.
+    fn verb(self) -> &'static str {
+        match self {
+            Naming::Commit => "commit",
+            Naming::Discard => "discard",
+        }
     }
 }
 
@@ -585,7 +615,9 @@ impl WorkingCopy {
     /// written if it is Diverged and the Store has a File there, and removed otherwise. If that
     /// fails, the Path is added to `theirs_failures`, and the failure reported, in place of a
     /// *diverged* event that would name a `theirs` file that wasn't written; but a Path already
-    /// there is tried again silently, unless its Divergence changed.
+    /// there is tried again silently, unless its Divergence changed. Reconciling every Path also
+    /// removes each stale `theirs` file, as [`WorkingCopy::remove_stale_theirs`] says, so that one
+    /// that couldn't be removed doesn't stay once `sync` restarts.
     async fn reconcile(
         &self,
         store: &Store,
@@ -594,6 +626,7 @@ impl WorkingCopy {
     ) -> Result<Vec<SyncEvent>, Failure> {
         let mut lock = self.lock()?;
         let record = &mut lock.record;
+        let everything = matches!(paths, Paths::All);
         let mut paths = match paths {
             Paths::All => {
                 let mut paths: BTreeSet<Path> =
@@ -608,7 +641,15 @@ impl WorkingCopy {
         // it can be.
         paths.extend(record.divergences.keys().cloned());
         paths.extend(theirs_failures.iter().cloned());
-        let events = self.reconcile_paths(store, record, paths, theirs_failures).await?;
+        let mut events = self.reconcile_paths(store, record, paths, theirs_failures).await?;
+        if everything {
+            // Reported once while `sync` runs, as a `theirs` file reconciling couldn't remove is.
+            for event in self.remove_stale_theirs(record) {
+                if event.path().is_some_and(|path| theirs_failures.insert(path.clone())) {
+                    events.push(event);
+                }
+            }
+        }
         // The folder is changed first and the record saved after.
         self.save(&lock.record)?;
         Ok(events)
@@ -748,14 +789,7 @@ impl WorkingCopy {
             record.divergences.remove(path);
             Some(event)
         };
-        match store_file {
-            Some(file) => {
-                record.bases.insert(path.clone(), Base::of(file.revision(), file.contents()));
-            }
-            None => {
-                record.bases.remove(path);
-            }
-        }
+        record.set_base(path, store_file.map(Base::of_file));
         Ok(event)
     }
 
@@ -842,6 +876,21 @@ impl WorkingCopy {
         }
     }
 
+    /// Removes each file in `.tidings/theirs/` whose name is a Path that isn't Diverged in
+    /// `record`, and each directory there left empty, so that a `theirs` file that once couldn't
+    /// be removed doesn't stay for good. No symlink is followed, but removed like a file, and
+    /// nothing outside `.tidings/theirs/` is touched. A file whose name isn't a Path was never a
+    /// `theirs` file, so it is left alone. Gives the error event for each file or directory it
+    /// couldn't remove, or read, whose name is a Path.
+    fn remove_stale_theirs(&self, record: &Record) -> Vec<SyncEvent> {
+        let top = self.folder.join(RECORD_DIRECTORY).join(THEIRS_DIRECTORY);
+        let mut events = Vec::new();
+        if fs::symlink_metadata(&top).is_ok_and(|metadata| metadata.is_dir()) {
+            remove_stale_theirs_in(&top, "", record, &mut events);
+        }
+        events
+    }
+
     /// Writes `contents` to the file `at`, making the directories it needs, so that it is never
     /// seen half-written: in `.tidings/tmp/` first, forced to disk, then renamed into place. A
     /// file it replaces keeps its permissions. `failed` gives the failure for an error at a file
@@ -894,7 +943,7 @@ impl WorkingCopy {
         let selection = self.select(named, current)?;
         refuse_diverged(&lock.record, &selection)?;
         let scan = scan::scan(&self.folder, &lock.record.bases)?;
-        selection.check_each_names_something(&scan, &lock.record, "commit")?;
+        selection.check_each_names_something(&scan, &lock.record, Naming::Commit)?;
         refuse_invalid(&scan.invalid, &selection)?;
         let (staging, changes) = self.stage(&scan, &selection)?;
         let files = scan.files;
@@ -1002,14 +1051,11 @@ impl WorkingCopy {
         match result {
             Ok(committed) => {
                 for (path, _) in changes {
-                    match (committed.revisions().get(path), files.get(path)) {
-                        (Some(&revision), Some(contents)) => {
-                            record.bases.insert(path.clone(), Base::of(revision, contents));
-                        }
-                        _ => {
-                            record.bases.remove(path);
-                        }
-                    }
+                    let committed = committed.revisions().get(path).zip(files.get(path));
+                    record.set_base(
+                        path,
+                        committed.map(|(&revision, contents)| Base::of(revision, contents)),
+                    );
                 }
                 Ok(CommitOutcome::Committed)
             }
@@ -1166,6 +1212,56 @@ fn blocking_directory(top: &FsPath, at: &FsPath) -> Result<Option<Blocked>, Fail
         }
     }
     Ok(None)
+}
+
+/// Does what [`WorkingCopy::remove_stale_theirs`] says in the directory `name`, a real one, under
+/// `top`, the `.tidings/theirs/` directory, adding an error event to `events` for each failure.
+fn remove_stale_theirs_in(top: &FsPath, name: &str, record: &Record, events: &mut Vec<SyncEvent>) {
+    // The event for failing at `name`, if it is a Path.
+    let failed = |name: &str, what: &str, error: io::Error| {
+        let path = Path::new(name).ok()?;
+        let file = FsPath::new(RECORD_DIRECTORY).join(THEIRS_DIRECTORY).join(name);
+        let message = format!("can't {what} {}: {error}", file.display());
+        Some(SyncEvent::Error { path, message })
+    };
+    let entries = match fs::read_dir(top.join(name)) {
+        Ok(entries) => entries,
+        Err(error) => {
+            events.extend(failed(name, "read", error));
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                events.extend(failed(name, "read", error));
+                return;
+            }
+        };
+        // Nothing under a name that isn't UTF-8 can be a Path.
+        let Some(part) = entry.file_name().to_str().map(str::to_owned) else { continue };
+        let child = if name.is_empty() { part } else { format!("{name}/{part}") };
+        let is_dir = match entry.file_type() {
+            Ok(file_type) => file_type.is_dir(),
+            Err(error) => {
+                events.extend(failed(&child, "read", error));
+                continue;
+            }
+        };
+        if is_dir {
+            remove_stale_theirs_in(top, &child, record, events);
+            match fs::remove_dir(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::DirectoryNotEmpty => {}
+                Err(error) => events.extend(failed(&child, "remove", error)),
+            }
+        } else if Path::new(&child).is_ok_and(|path| !record.divergences.contains_key(&path))
+            && let Err(error) = fs::remove_file(entry.path())
+        {
+            events.extend(failed(&child, "remove", error));
+        }
+    }
 }
 
 /// Removes the file `at`, then each directory above it that the removal emptied, stopping at the

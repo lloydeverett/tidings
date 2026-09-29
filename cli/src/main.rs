@@ -86,8 +86,8 @@ enum Command {
     /// Each Path that is modified, deleted, invalid or Diverged, or only those named, gets the
     /// Store's version as it is now, which becomes what the Working copy last took from the
     /// Store. A Diverged Path's `.tidings/theirs/` file is removed. A file the Store never had is
-    /// left alone unless named, when it is removed. Files `.tidings/ignore` leaves out are never
-    /// touched.
+    /// left alone unless it is named itself, not only a directory it is in, when it is removed.
+    /// Files `.tidings/ignore` leaves out are never touched.
     Discard {
         #[command(flatten)]
         working_copy: WorkingCopyArgs,

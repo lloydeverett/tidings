@@ -2,8 +2,8 @@
 //! Path's Base, and which Paths are Diverged.
 //!
 //! It is plain text, in the style of the filesystem journal (ADR 0005): a first line that names
-//! the format, then a line for each item, with fields separated by tabs, and `\`, tabs and line
-//! breaks escaped:
+//! the format and its version, then a line for each item, with fields separated by tabs, and `\`,
+//! tabs and line breaks escaped:
 //! - `root` and the absolute Root override, or `identity` and the App identity;
 //! - `backend` and the Backend;
 //! - `area` and the Area;
@@ -11,6 +11,9 @@
 //!   the folder for that Base, in hexadecimal, which is left out if they aren't known;
 //! - `diverged`, a Diverged Path, and the Revision of the Store's version in `theirs`, which is
 //!   left out if the Store has no File there.
+//!
+//! This is version 2, which may leave a Base's hash out. Version 1, which never does, is read as
+//! well, since it is otherwise the same; any other version is refused.
 //!
 //! It is always replaced whole, with `atomic-write-file`, which writes a new file, forces it to
 //! disk and renames it over the record.
@@ -20,15 +23,19 @@ use std::io::{self, Write};
 use std::path::{Path as FsPath, PathBuf};
 
 use atomic_write_file::AtomicWriteFile;
-use tidings::{Area, Path, Revision};
+use tidings::{Area, File, Path, Revision};
 
 use crate::command::AreaName;
 use crate::failure::Failure;
 use crate::location::{BackendName, Identity, StoreAddress, StoreLocation};
 use crate::output::area_name;
 
-/// The first line of every record, which names its format.
-const FORMAT: &str = "tidings working-copy 1";
+/// The first line of every record this version writes, which names its format.
+const FORMAT: &str = "tidings working-copy 2";
+
+/// The first line of a record in version 1, which this version reads as well: it is the same, but
+/// always gives a Base's hash.
+const FORMAT_1: &str = "tidings working-copy 1";
 
 /// What the first line of a record in any version starts with.
 const FORMAT_NAME: &str = "tidings working-copy ";
@@ -51,7 +58,8 @@ pub struct Record {
 pub struct Base {
     pub revision: Revision,
     /// The hash of the Base's contents, or `None` if they aren't known, as when `resolve` takes a
-    /// Revision the Store no longer holds: every local file then counts as changed since the Base.
+    /// Revision that neither the Store nor the `theirs` file holds any longer: every local file
+    /// then counts as changed since the Base.
     pub hash: Option<Hash>,
 }
 
@@ -59,6 +67,11 @@ impl Base {
     /// The Base of the Revision `revision`, which holds `contents`.
     pub fn of(revision: Revision, contents: &str) -> Base {
         Base { revision, hash: Some(Hash::of(contents)) }
+    }
+
+    /// The Base of the Store's File `file`: its Revision, which holds its contents.
+    pub fn of_file(file: &File) -> Base {
+        Base::of(file.revision(), file.contents())
     }
 
     /// Whether `contents` are the Base's, as far as is known.
@@ -97,6 +110,19 @@ impl Record {
     /// A record with no Bases yet.
     pub fn new(store: StoreAddress, area: Area) -> Record {
         Record { store, area, bases: BTreeMap::new(), divergences: BTreeMap::new() }
+    }
+
+    /// Makes `base` the Base of `path`, or leaves `path` with no Base if `base` is `None`, as when
+    /// the Store has no File there.
+    pub fn set_base(&mut self, path: &Path, base: Option<Base>) {
+        match base {
+            Some(base) => {
+                self.bases.insert(path.clone(), base);
+            }
+            None => {
+                self.bases.remove(path);
+            }
+        }
     }
 
     /// Reads the record in `file`.
@@ -157,7 +183,7 @@ impl Record {
     fn parse(text: &str) -> Result<Record, String> {
         let mut lines = text.lines();
         match lines.next() {
-            Some(FORMAT) => {}
+            Some(FORMAT | FORMAT_1) => {}
             Some(first) if first.starts_with(FORMAT_NAME) => {
                 return Err(format!("is in a format this version doesn't know: {first:?}"));
             }

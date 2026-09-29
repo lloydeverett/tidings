@@ -9,8 +9,8 @@ use tidings::{
 };
 
 use crate::working_copy::{
-    Blocked, CommitReport, DiscardReport, Discarded, DiscardedChange, DivergedPath, LocalChange,
-    LocalName, PathStatus, ResolveReport, Resolved, StatusReport, SyncEvent, Unfit,
+    Blocked, CommitReport, DiscardOutcome, DiscardReport, Discarded, DiscardedChange, DivergedPath,
+    LocalChange, LocalName, PathStatus, ResolveReport, Resolved, StatusReport, SyncEvent, Unfit,
 };
 
 /// What a command gives, for [`Output`] to print.
@@ -133,25 +133,14 @@ impl Output {
                 eprintln!("nothing to discard");
                 Ok(())
             }
-            // Each Path, then each `theirs` file that couldn't be removed, as `sync` prints it.
-            Report::WorkingCopyDiscard(report) => print_stdout(
-                &report
-                    .discarded
-                    .iter()
-                    .map(|discarded| discarded_parts(discarded).line())
-                    .chain(report.events.iter().map(event_line))
-                    .map(|line| format!("{line}\n"))
-                    .collect::<String>(),
-            ),
-            Report::WorkingCopyResolve(report) => print_stdout(
-                &report
-                    .resolved
-                    .iter()
-                    .map(|resolved| resolved_parts(resolved).line())
-                    .chain(report.events.iter().map(event_line))
-                    .map(|line| format!("{line}\n"))
-                    .collect::<String>(),
-            ),
+            Report::WorkingCopyDiscard(report) => print_stdout(&settled_lines(
+                report.discarded.iter().map(discarded_parts),
+                &report.events,
+            )),
+            Report::WorkingCopyResolve(report) => print_stdout(&settled_lines(
+                report.resolved.iter().map(resolved_parts),
+                &report.events,
+            )),
         }
     }
 
@@ -358,12 +347,30 @@ fn status_parts(status: &PathStatus) -> EventParts<'_> {
     }
 }
 
+/// What `discard` or `resolve` prints for a person: a line for each Path it settled, from
+/// `parts`, then one for each `theirs` file that couldn't be removed, among `events`, as `sync`
+/// prints it.
+fn settled_lines<'a>(parts: impl Iterator<Item = EventParts<'a>>, events: &[SyncEvent]) -> String {
+    let lines = parts.map(|parts| parts.line()).chain(events.iter().map(event_line));
+    lines.map(|line| format!("{line}\n")).collect()
+}
+
+/// What `discard` or `resolve` prints as JSON: `settled`, an object for each Path it settled,
+/// under `key`, then `events`, each `theirs` file that couldn't be removed, as `sync --json` gives
+/// it.
+fn settled_json(key: &str, settled: impl Iterator<Item = Value>, events: &[SyncEvent]) -> Value {
+    json!({
+        key: settled.collect::<Vec<_>>(),
+        "events": events.iter().map(event_json).collect::<Vec<_>>(),
+    })
+}
+
 /// What `discard` says about one Path, as in "discarded a: took the Store's version".
 fn discarded_parts(discarded: &Discarded) -> EventParts<'_> {
-    let message = match (discarded.revision, discarded.removed) {
-        (Some(_), _) => "took the Store's version",
-        (None, true) => "removed, since the Store has no File there",
-        (None, false) => "the Store has no File there either",
+    let message = match discarded.outcome {
+        DiscardOutcome::TookStoresVersion(_) => "took the Store's version",
+        DiscardOutcome::Removed => "removed, since the Store has no File there",
+        DiscardOutcome::Absent => "the Store has no File there either",
     };
     EventParts {
         name: "discarded",
@@ -447,29 +454,29 @@ fn as_json(report: &Report) -> Option<Value> {
             "paths": report.paths.iter().map(|path| status_parts(path).json()).collect::<Vec<_>>(),
             "syncing": report.syncing,
         }),
-        Report::WorkingCopyDiscard(report) => json!({
-            "discarded": report
-                .discarded
-                .iter()
-                .map(|discarded| json!({
+        Report::WorkingCopyDiscard(report) => {
+            let discarded = report.discarded.iter().map(|discarded| {
+                let revision = match discarded.outcome {
+                    DiscardOutcome::TookStoresVersion(revision) => Some(revision.to_string()),
+                    DiscardOutcome::Removed | DiscardOutcome::Absent => None,
+                };
+                json!({
                     "path": discarded.path.as_str(),
                     "change": discarded_change_name(discarded.change),
-                    "revision": discarded.revision.map(|revision| revision.to_string()),
-                }))
-                .collect::<Vec<_>>(),
-            "events": report.events.iter().map(event_json).collect::<Vec<_>>(),
-        }),
-        Report::WorkingCopyResolve(report) => json!({
-            "resolved": report
-                .resolved
-                .iter()
-                .map(|resolved| json!({
+                    "revision": revision,
+                })
+            });
+            settled_json("discarded", discarded, &report.events)
+        }
+        Report::WorkingCopyResolve(report) => {
+            let resolved = report.resolved.iter().map(|resolved| {
+                json!({
                     "path": resolved.path.as_str(),
                     "revision": resolved.revision.map(|revision| revision.to_string()),
-                }))
-                .collect::<Vec<_>>(),
-            "events": report.events.iter().map(event_json).collect::<Vec<_>>(),
-        }),
+                })
+            });
+            settled_json("resolved", resolved, &report.events)
+        }
     })
 }
 
