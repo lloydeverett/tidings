@@ -891,14 +891,14 @@ fn a_working_copy_whose_store_has_gone_fails_to_open() {
         fs::write(folder.join("new.toml"), "new\n").unwrap();
 
         let folder_arg = folder.to_str().unwrap();
-        let commands = [&["commit", "-C", folder_arg][..], &["sync", "config", folder_arg]];
-        for command in commands {
+        let invocations = [&["commit", "-C", folder_arg][..], &["sync", "config", folder_arg]];
+        for invocation in invocations {
             // It says the Working copy's Store is missing, and not to make one with `--create`,
             // which would sync the folder with an empty Store.
-            let mut run = tidings();
-            run.args(command);
-            let run = common::run(run, "").expect_code(1);
-            let label = format!("{backend} {command:?}");
+            let mut command = tidings();
+            command.args(invocation);
+            let run = common::run(command, "").expect_code(1);
+            let label = format!("{backend} {invocation:?}");
             assert!(run.stderr.contains("missing"), "{label}: {run:?}");
             assert!(run.stderr.contains(root_arg), "{label}: {run:?}");
             assert!(!run.stderr.contains("--create"), "{label}: {run:?}");
@@ -907,9 +907,9 @@ fn a_working_copy_whose_store_has_gone_fails_to_open() {
             let with_create: [&[&str]; 2] =
                 [&["--create"], &["--root", root_arg, "--backend", backend, "--create"]];
             for flags in with_create {
-                let mut run = tidings();
-                run.args(flags).args(command);
-                let run = common::run(run, "").expect_code(1);
+                let mut command = tidings();
+                command.args(flags).args(invocation);
+                let run = common::run(command, "").expect_code(1);
                 assert!(run.stderr.contains("--create"), "{label} {flags:?}: {run:?}");
             }
         }

@@ -165,7 +165,7 @@ impl StoreAddress {
     }
 
     /// Opens the Store, making a new one if there is none, without looking for it first.
-    async fn open_or_make(&self) -> Result<Opened, Failure> {
+    pub async fn open_or_make(&self) -> Result<Opened, Failure> {
         let (identity, root) = (self.location.app_identity(), self.location.root());
         // A Backend that doesn't match the one found gives the library's `WrongBackend` when it
         // opens.
@@ -216,27 +216,24 @@ impl StoreArgs {
         if self.is_memory() {
             return self.open_memory(in_shell);
         }
-        Ok(self.open_located().await?.1)
+        self.address().await?.open_or_make().await
     }
 
-    /// Opens the Store the flags choose for a new Working copy, which can't be one in memory, and
-    /// gives its address too.
-    pub async fn open_with_address(&self) -> Result<(StoreAddress, Opened), Failure> {
-        self.check_not_memory()?;
-        self.open_located().await
-    }
-
-    /// Fails if the flags choose the memory Backend, which no Working copy can be of.
-    pub fn check_not_memory(&self) -> Result<(), Failure> {
+    /// Where the Store the flags choose for a new Working copy is, and its Backend: the one
+    /// `--backend` names, or the one found there. It can't be a Store in memory. The Store is
+    /// looked for but neither opened nor made, so a Working copy refused after this leaves no
+    /// Store behind.
+    pub async fn address_for_working_copy(&self) -> Result<StoreAddress, Failure> {
         if self.is_memory() {
             return Err(memory_for_a_working_copy());
         }
-        Ok(())
+        self.address().await
     }
 
-    /// Opens the Store the flags choose, which isn't one in memory, and gives its address: on the
-    /// Backend `--backend` names, or the one found where the Store is.
-    async fn open_located(&self) -> Result<(StoreAddress, Opened), Failure> {
+    /// Where the Store the flags choose, which isn't one in memory, is, and its Backend: the one
+    /// `--backend` names, or the one found there. Fails if there is no Store there and `--create`
+    /// is left out, but never makes one.
+    async fn address(&self) -> Result<StoreAddress, Failure> {
         let location = self.location()?;
         let backend = match (self.backend, location.detect().await?) {
             (_, None) if !self.create => return Err(location.missing()),
@@ -245,9 +242,7 @@ impl StoreArgs {
                 return Err(Failure::error("--create needs --backend, to say which one to make"));
             }
         };
-        let address = StoreAddress { location, backend };
-        let opened = address.open_or_make().await?;
-        Ok((address, opened))
+        Ok(StoreAddress { location, backend })
     }
 
     /// Whether the flags choose the memory Backend.

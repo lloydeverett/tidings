@@ -141,8 +141,8 @@ enum Local {
 impl WorkingCopy {
     /// `sync`: makes `folder` a Working copy of `area` in the Store `flags` choose, or resumes the
     /// Working copy it is, which must be of `area`, and keeps it in step with its Store until
-    /// `stop` finishes, giving each [`SyncEvent`] to `report` as it happens. `stop` is acted on only
-    /// between reconciles, so each one finishes and saves the record.
+    /// `stop` finishes, giving each [`SyncEvent`] to `report` as it happens. `stop` is acted on
+    /// only between reconciles, so each one finishes and saves the record.
     ///
     /// Only one `sync` of a Working copy runs at a time: a second is refused before it opens the
     /// Store.
@@ -166,7 +166,6 @@ impl WorkingCopy {
         area: Area,
         flags: &StoreArgs,
     ) -> Result<(WorkingCopy, SyncLock, Opened), Failure> {
-        flags.check_not_memory()?;
         if WorkingCopy::exists(folder) {
             let working_copy = WorkingCopy::open(folder)?;
             working_copy.check_area(area)?;
@@ -174,19 +173,24 @@ impl WorkingCopy {
             let opened = working_copy.open_store(flags).await?;
             return Ok((working_copy, syncing, opened));
         }
-        // Before the Store, which `--create` would otherwise make even for a folder that can't be a
-        // Working copy.
+        // The flags and the folder are checked before anything is made, so that a refused `sync`
+        // makes neither the Store nor the folder.
+        let store = flags.address_for_working_copy().await?;
         WorkingCopy::check_can_create(folder)?;
-        let (address, opened) = flags.open_with_address().await?;
-        let working_copy = WorkingCopy::create(folder, address, area)?;
+        fs::create_dir_all(folder.join(RECORD_DIRECTORY)).map_err(failed_at(folder))?;
+        let working_copy = WorkingCopy { folder: folder.to_owned(), store, area };
         let syncing = working_copy.lock_for_sync()?;
+        // Checked again under the lock, since another `sync` may have made it a Working copy
+        // meanwhile.
+        WorkingCopy::check_can_create(folder)?;
+        let opened = working_copy.store.open_or_make().await?;
+        working_copy.save_new_record()?;
         Ok((working_copy, syncing, opened))
     }
 
     /// Fails unless `folder` can become a Working copy: it must be missing or empty. A `.tidings/`
     /// holding no record, as a `sync` that stopped while making the Working copy leaves, counts as
-    /// empty. [`WorkingCopy::create`] checks this again, so this is only for failing before doing
-    /// anything else, such as making a Store.
+    /// empty.
     fn check_can_create(folder: &FsPath) -> Result<(), Failure> {
         if is_missing_empty_or_unfinished(folder)? {
             return Ok(());
@@ -201,19 +205,11 @@ impl WorkingCopy {
         ))
     }
 
-    /// Makes `folder`, which must be missing or empty, a Working copy of `area` in `store`, with
-    /// no Files yet, as [`WorkingCopy::check_can_create`] says.
-    fn create(folder: &FsPath, store: StoreAddress, area: Area) -> Result<WorkingCopy, Failure> {
-        WorkingCopy::check_can_create(folder)?;
-        fs::create_dir_all(folder.join(RECORD_DIRECTORY)).map_err(failed_at(folder))?;
-        let working_copy = WorkingCopy { folder: folder.to_owned(), store, area };
-        let _lock = working_copy.lock_waiting(LOCK_FILE)?;
-        // Another `sync` may have made it a Working copy since the folder was found empty.
-        if record_file(folder).exists() {
-            return Err(refuse_to_create(folder, "is a Working copy already"));
-        }
-        working_copy.save(&Record::new(working_copy.store.clone(), area))?;
-        Ok(working_copy)
+    /// Saves the record of a new Working copy, with no Files yet, once
+    /// [`WorkingCopy::check_can_create`] has passed the folder under the [`SyncLock`].
+    fn save_new_record(&self) -> Result<(), Failure> {
+        let _lock = self.lock_waiting(LOCK_FILE)?;
+        self.save(&Record::new(self.store.clone(), self.area))
     }
 
     /// Whether `folder` is a Working copy: whether it has a record, of this version or another.
@@ -728,8 +724,9 @@ fn is_missing_empty_or_unfinished(folder: &FsPath) -> Result<bool, Failure> {
 /// Whether `directory`, a `.tidings/`, holds only what making a Working copy leaves before it
 /// writes the record: the lock files, and a temporary file the record was being written to.
 ///
-/// These are the only leftovers allowed, so once [`WorkingCopy::create`] makes more in `.tidings/`
-/// before writing the record (the spec's `ignore` file and `tmp/`), they must be added here.
+/// These are the only leftovers allowed, so once [`WorkingCopy::open_or_create`] makes more in
+/// `.tidings/` before writing the record (the spec's `ignore` file and `tmp/`), they must be added
+/// here.
 fn holds_no_record(directory: &FsPath) -> Result<bool, Failure> {
     let temporary = format!(".{RECORD_FILE}.");
     for entry in fs::read_dir(directory).map_err(failed_at(directory))? {
