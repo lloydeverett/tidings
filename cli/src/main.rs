@@ -41,12 +41,12 @@ struct Cli {
 enum Command {
     /// Work on the Store directly: read, write and watch its Files, or keep it open in a shell
     #[command(subcommand)]
-    Store(StoreGroup),
+    Store(StoreSubcommand),
 }
 
 /// The commands under `tidings store`: a one-shot command, or the shell.
 #[derive(Debug, Subcommand)]
-enum StoreGroup {
+enum StoreSubcommand {
     #[command(flatten)]
     OneShot(OneShot),
     /// Keep the Store open and type commands, building up Stagings over several of them
@@ -81,8 +81,8 @@ fn main() -> ExitCode {
         }
     };
     let result = match cli.command {
-        Command::Store(StoreGroup::Shell) => shell::run(&runtime, &cli.store, cli.json),
-        Command::Store(StoreGroup::OneShot(command)) => {
+        Command::Store(StoreSubcommand::Shell) => shell::run(&runtime, &cli.store, cli.json),
+        Command::Store(StoreSubcommand::OneShot(command)) => {
             runtime.block_on(one_shot(&cli.store, cli.json, command))
         }
     };

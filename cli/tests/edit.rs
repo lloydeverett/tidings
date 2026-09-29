@@ -19,9 +19,8 @@ fn editing(location: &Location, args: &[&str], script: &str, stdin: &str) -> Run
 /// An editor script that saves `text`, then has someone else write `theirs` to data `a.txt`
 /// before the edit is written back.
 fn saving_while_someone_writes(text: &str) -> String {
-    format!(
-        r#"printf {text} > "$0" && "$TIDINGS" --root "$ROOT" store write data a.txt --contents theirs"#
-    )
+    let write = r#""$TIDINGS" --root "$ROOT" store write data a.txt --contents theirs"#;
+    format!(r#"printf {text} > "$0" && {write}"#)
 }
 
 /// The file a failure's message says the edited text is kept in, which is the last word of it.

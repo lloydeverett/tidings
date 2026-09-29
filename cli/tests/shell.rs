@@ -1,5 +1,5 @@
-//! `tidings store shell` in script mode, reading its commands from stdin, as a script or heredoc does.
-//! Interactive mode needs a terminal, so these tests don't cover it.
+//! `tidings store shell` in script mode, reading its commands from stdin, as a script or heredoc
+//! does. Interactive mode needs a terminal, so these tests don't cover it.
 
 mod common;
 

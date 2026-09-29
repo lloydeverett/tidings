@@ -248,16 +248,27 @@ fn shell_commands_are_refused_as_one_shot_commands() {
     }
 }
 
+/// Every command under `tidings store`.
+const STORE_COMMANDS: [&str; 10] = [
+    "read",
+    "stat",
+    "list",
+    "stat-prefix",
+    "write",
+    "delete",
+    "delete-prefix",
+    "edit",
+    "watch",
+    "shell",
+];
+
 #[test]
 fn the_store_commands_are_only_under_store() {
     let location = Location::with_store("fs");
     location.write("data", "a.txt", "a");
-    for command in ["read", "stat", "list", "stat-prefix", "write", "delete", "delete-prefix"] {
+    for command in STORE_COMMANDS {
         let run = location.run(&[command, "data", "a.txt"]).expect_code(1);
         assert!(run.stderr.contains(command), "{command}: {run:?}");
-    }
-    for command in ["edit", "watch", "shell"] {
-        location.run(&[command]).expect_code(1);
     }
     assert_eq!(location.read("data", "a.txt"), "a");
 }
@@ -268,7 +279,7 @@ fn help_lists_the_commands_where_they_live() {
     assert!(top.status.success());
     let top = String::from_utf8(top.stdout).unwrap();
     assert!(top.contains("store"), "{top}");
-    for command in ["read", "stat-prefix", "delete-prefix", "edit", "watch", "shell"] {
+    for command in STORE_COMMANDS {
         let listed = top.lines().any(|line| line.trim_start().starts_with(command));
         assert!(!listed, "{command} is listed at the top level: {top}");
     }
@@ -276,9 +287,7 @@ fn help_lists_the_commands_where_they_live() {
     let store = tidings().args(["store", "--help"]).output().unwrap();
     assert!(store.status.success());
     let store = String::from_utf8(store.stdout).unwrap();
-    let commands =
-        ["read", "stat", "list", "stat-prefix", "write", "delete", "delete-prefix", "edit"];
-    for command in commands.into_iter().chain(["watch", "shell"]) {
+    for command in STORE_COMMANDS {
         let listed = store.lines().any(|line| line.trim_start().starts_with(command));
         assert!(listed, "{command} isn't listed under store: {store}");
     }
