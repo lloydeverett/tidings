@@ -694,3 +694,167 @@ failed in the fixer's two full workspace runs and passed alone. The orchestrator
 afterwards passed all 467 tests. The library is untouched by this spec; together with the two
 noted under tickets 02 and 03, the fs watcher tests look timing-sensitive under load and may be
 worth a look separately.
+
+---
+
+## Ticket 06: Commit: Conflicts, Divergence and naming paths
+
+Reviewed: `git diff 399a2d3...bcbab60` (commit bcbab60). (The implementer was interrupted by a
+usage limit and resumed; the review covers the final commit.)
+
+### Standards
+
+**(a) Documented-standard violations:** none hard. No line over 100 columns; every new item is
+documented; tests go through the binary on fs and SQLite. Soft departures:
+
+1. **Spec 0002, "reports and failures are added to [the output and failure modules] rather than
+   printed separately":** `working_copy.rs` now imports `output::event_line` and builds the
+   finished person-facing text of the Conflict and Diverged-refusal failures (`listing` at
+   `:1177`, the "same {path}: …" line at `:866-879`). The failure module gets an opaque string, so
+   `--json` gets prose.
+2. **CONTEXT.md, Prefix:** the doc on `Chosen::Under` (`:158-159`) calls something "a Prefix
+   without its last `/`", which the glossary says is not a Prefix.
+3. **Testing Decisions:** a test sleeps 200 ms (`tests/working_copy.rs:207`); two reach into
+   `.tidings/lock` and `.tidings/theirs` (internal layout, not the record's format: coupling).
+
+**(b) Judgement calls:**
+
+1. **Possible Primitive Obsession / Mysterious Name, `working_copy.rs:155-160`:**
+   `Chosen::Under(Vec<(PathBuf, String)>)`, with `""` meaning the whole folder; `Chosen` doesn't
+   say it is a selection of Paths.
+2. **Possible Duplicated Code:** the `sync_running` scaffolding in two tests; "reconcile the
+   Paths, then save" in both the `Pending` arm and `reconcile_conflict`.
+3. **Possible Divergent Change / long method:** `WorkingCopy::commit` (`:756-849`) selects,
+   refuses, stages, commits, handles three outcomes and builds the report.
+4. **Possible Feature Envy:** `output::event_line` made public for the Working copy module's
+   failure text.
+
+### Spec
+
+Probed on fs and SQLite. Working as asked: paths relative to the current directory from a
+subdirectory, `..`, absolute paths, `-C` with a path through a symlink into the folder; a symlink
+pointing out of the folder, and `.TIDINGS/x`, refused as outside (exit 1); a named directory
+meaning everything under it; a named deleted file committing the delete; Diverged names refused
+(exit 3) while other names go ahead; a Conflict without `sync` (exit 3, Path named, `theirs`
+written, nothing committed per `store read`) and with `sync` running; story 48 (`sync` prints
+only *caught up* after a commit); `commit` blocking on a held lock; `--json` Revisions equal to
+`store stat`; the unnamed rest keeping its Bases after a partial commit.
+
+**(a) Missing or partial:** none in the ticket. But:
+
+- **`Pending`, for the spec's owner.** The spec says `Pending` "exits 0, as `store write` does",
+  but `store write` exits 1 on `Pending` (`failure.rs:84` maps it to a plain error), so the spec's
+  premise is false. `commit` follows the ticket and README ("`Error::Pending` means the commit
+  succeeded") and exits 0. Either `store write` should change or the spec's wording should.
+
+**(b) Scope creep:**
+
+- **For the spec's owner:** `commit nope.toml`, naming nothing that exists or is recorded, exits
+  1 "no such file in the Working copy" rather than "nothing to commit". Story 47 ("running it
+  twice is harmless") still holds, since an unchanged named file gives "nothing to commit". Ticket
+  07 must adjust the message for a named *ignored* file.
+- Stricter than the spec but consistent with story 44: naming a directory holding a Diverged Path
+  refuses the whole commit.
+
+**(c) Possibly wrong:**
+
+1. **`Pending` discards reconcile events** (`:825-830`): if another Commit lands in between, a
+   Path becomes Diverged silently (`revision: null`, nothing says Diverged).
+
+The implementer's other calls were judged sound: the Conflict test's "either way" assertions with
+`sync` running, and two older tests now reconciling before committing, since a full commit is
+refused while anything is Diverged (the record stays Diverged until a reconcile, `discard` or
+`resolve`, even after the person undoes their edit, which ticket 08's `status` should make
+visible).
+
+### Summary
+
+Standards: 0 hard violations, 3 soft departures and 4 judgement calls (worst: the module
+formatting its own failure text, so `--json` gets prose). Spec: 1 possibly wrong (`Pending`
+dropping a Divergence) and 2 questions for the owner (`store write`'s `Pending` exit code;
+refusing a name that matches nothing).
+
+### Resolution
+
+Fixed in 9149597:
+
+1. **Standards (a)1, failure text built in the module:** fixed. The Diverged refusal and the
+   Conflict are structured failures (`Failure::diverged`, `Failure::conflicted`) carrying each
+   Path's outcome as data; `failure.rs` renders them as the same text as before, or with `--json`
+   as one JSON object on stderr, e.g.
+   `{"failure":"conflict","message":"Conflict: …","paths":[{"event":"diverged","path":"app.toml","message":"…","theirs":".tidings/theirs/app.toml"},{"event":"same","path":"same.toml"}]}`.
+   Exit code 3 as before.
+2. **Spec (c)1, `Pending` dropping a Divergence:** fixed. `CommitReport.events` carries what the
+   reconcile found, printed after the change lines and as `"events"` in JSON. No binary test can
+   time another Commit landing in between, so an in-process test covers the output.
+3. **Standards (a)2, the Prefix wording:** fixed.
+4. **Standards (b)1:** `Chosen` became `Selection { All, Named(Vec<NamedPath>) }`, with
+   `NamedPath { given, target }` and `Target { Folder, Under(String) }`, so the `""` sentinel is
+   gone.
+5. **Standards (b)2 and (b)3:** `commit` is split into `refuse_diverged`, `stage` and
+   `record_commit`, with the record saved in one place; the tests share `with_a_diverged_path`.
+6. **Standards (a)3, the sleep:** kept, with a comment: nothing `commit` does before it blocks on
+   the lock can be observed, and the test's checks hold either way.
+
+Fixed in ac2b59b, **a flaky test from ticket 05:** `a_divergence_clears_once_the_store_is_back_at_the_base`
+failed about one run in four. Root cause: the test made two separate Store Commits and assumed
+the first *caught up* would follow both *diverged* events; separate Commits can reach `sync` as
+two batches. Reproduced 12 of 12 under load; the code's behaviour was correct. A `wait_for_count`
+helper waits through each *caught up* until the expected events have been printed; the test still
+checks the exact sets of Paths. 35 of 35 passes under the same load. A similar loop in
+`a_theirs_that_cant_be_removed_is_an_error_and_sync_carries_on` got the same fix.
+
+Left for the spec's owner: `store write`'s `Pending` exit code, and refusing a named path that
+matches nothing (Spec (a) and (b) above).
+
+### Re-review of 9149597 and ac2b59b
+
+**Standards.** Every claimed fix is clean. Findings:
+
+1. **Mixed `--json` behaviour (soft, spec "reports and failures are added to [the output and
+   failure modules]"; README "Text for a person, or JSON with `--json`"):** now only the Conflict
+   and the Diverged refusal print JSON under `--json`; every other failure, including a
+   `store write --if-absent` Conflict, prints text. A script can't know which to expect.
+2. The in-process test at `output.rs:329` is named for reconciling but only formats a hand-built
+   report through the private `as_json`.
+3. A JSON `"same"` event, which `sync` never prints, has no `message` unlike the others.
+4. Judgement calls: `print` and `Display` in `failure.rs` switch in parallel on the structured
+   failures, as do `reconciled_json`/`reconciled_line`; `reconcile_after_commit` is a thin wrapper
+   (its doc justifies it); `files` and `changes` travel together through `stage` and
+   `record_commit`; `Failure.paths` holds outcomes, not Paths; `Failure::conflict` is still `pub`
+   with a stale doc; `TookStoresVersion` uses "version". The Conflict's text form is no longer
+   tested through the binary.
+
+**Spec.** Text for a person is unchanged from bcbab60 on both Backends (outputs diffed); only
+`--json` runs differ. Every ticket 06 probe gives the same result as before the refactor. The flake
+fix doesn't weaken its test (exact sets of Paths still checked); 8 loops under load passed; the
+old failure couldn't be reproduced in 10 runs of bcbab60 by this reviewer, so the root cause is
+plausible rather than confirmed by this probe. Minor: every commit's `--json` now has
+`"events":[]`, not only a Pending one.
+
+### Resolution of the re-review
+
+Fixed in 81754f5:
+
+1. **Mixed `--json` behaviour:** decided and fixed. **A decision for the spec's owner:** under
+   `--json`, every failure now prints one JSON object on one line on stderr,
+   `{"failure": <kind>, "message": …}`, with `"outcomes"` added for the Conflict and the Diverged
+   refusal. The kinds are `error` (exit 1), `missing` (exit 2), `conflict` (exit 3) and
+   `diverged` (exit 3). This changes what `tidings store …` commands print on failure under
+   `--json` (before, `tidings: …` text), e.g. `tidings --json store write data a.txt --contents b
+   --if-absent` now prints `{"failure":"conflict","message":"Conflict: a Precondition did not hold
+   for a.txt"}`. Text output and exit codes are unchanged. Not covered: clap usage errors, and the
+   interactive shell's `error: …` line at its prompt. README's Output bullet gained one clause.
+   Test: `with_json_a_failure_is_one_json_object_on_stderr` (a Conflict, a missing File, an
+   error).
+2. **The Conflict's text form:** tested through the binary again, alongside its JSON.
+3. **The `"same"` entry:** has a message.
+4. **The parallel switches:** one `EventParts` (name, path, message, `theirs`) renders both text
+   and JSON for events and failures.
+5. **Names:** `paths` became `outcomes`, `StoppedPaths` became `Outcomes`, `Failure::conflict` is
+   private with its doc fixed, `TookStoresVersion` became `TookStoresFile`, and the in-process test
+   is now `a_pending_commits_events_are_printed_with_it`.
+
+Not acted on: `"events":[]` on every commit's JSON (a stable shape is easier for scripts than a
+key that appears only sometimes), the `reconcile_after_commit` wrapper (documented), and the
+`files`/`changes` pair (tolerable).
