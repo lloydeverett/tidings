@@ -997,3 +997,86 @@ Fixed in c1c1157:
 
 Not acted on: `as_path` taking a path only to check UTF-8 (minor). No third review: each fix is
 narrow and tested.
+
+---
+
+## Ticket 08: `status`
+
+Reviewed: `git diff 7b95ac3...97ae483` (commit 97ae483).
+
+### Standards
+
+**(a) Documented-standard violations:** none. Every new item is documented, no line is over 100
+columns, glossary terms are used correctly, and spec 0002 is followed: `status()` returns a
+`StatusReport`, the command is thin, printing is in `output.rs`, `lock` is held for the whole run,
+and tests go through the binary on fs and SQLite. `Scan::changes` now gives `commit` and `status`
+one classification, and `EventParts::invalid` replaces an inline construction in `failure.rs`.
+
+**(b) Judgement calls:**
+
+1. **Possible Data Clump:** the Bases a scan was made with travel beside it everywhere
+   (`scan(&folder, &bases)`, `scan.changes(&bases)`, `stage(&scan, &bases, …)`), and `stage`
+   indexes `bases[path]` and `scan.files[path]` unchecked, assuming they agree.
+2. **Possible Primitive Obsession / Duplicated Code:** a `LocalName` is compared with a `Path` as
+   strings by linear search in two places, and `status` filters "not Diverged" two different ways
+   on neighbouring lines.
+3. **Possible illegal state:** `PathStatus::Diverged(SyncEvent)` can hold any `SyncEvent`, so its
+   `name()` needs a fallback.
+4. **Possible Mysterious Name:** `let diverged = diverged(record, selection);` shadows the function.
+5. **Possible Mysterious Name:** `status --json` rows are keyed `event`, though a row is a state,
+   not something that happened ("event" is also an _Avoid_ word under Change).
+6. **Possible Duplicated Code in tests:** `status_in` copies `commit_in`.
+
+### Spec
+
+Probed on fs: `status` classifies each case exactly as `commit` acts on it: modified; `touch` or
+a same-contents rewrite shows nothing; added; deleted; a new ignored file hidden; non-UTF-8
+contents, a symlink or a bad name *invalid*; a tracked file matching a pattern still *modified*
+(story 52); `Foo`→`foo` a delete and an add; a Diverged Path naming its `theirs` file, or "removed
+in the Store". With the invalid files removed, `commit` committed exactly the 7 Paths `status`
+listed. A bad ignore file, a missing Store and mismatched Store flags are refused as `commit`
+refuses them; outside a Working copy the error is clear; `-C` and walking up work; with `sync`
+running, `status` returned at once with "sync is running" and `sync` carried on.
+
+**(a) Missing or partial:** none. **(b) Scope creep:** none.
+
+**(c) Questionable:**
+
+1. **For the spec's owner: Paths from a subdirectory.** In `sub/`, `status` prints
+   `modified sub/d.txt`, while `commit d.txt` is how you'd commit it there (story 38). Area-relative
+   Paths match `sync`'s output and `--json`, but can't be pasted back into `commit` from a
+   subdirectory. (git prints paths relative to the current directory.)
+2. `status` takes `sync.lock` for an instant to learn whether `sync` runs; a `sync` starting in that
+   instant would be refused. Within the spec ("by trying it"), and not reproduced in 40 tries.
+
+**The implementer's judgement calls, assessed:** rows keyed `event` match the spec's JSON style
+for `sync` (see Standards 5 for the other view); sorted by name is fine; "nothing to commit" goes
+to stdout here but stderr in `commit`, which is defensible (it is `status`'s report) but
+inconsistent; a Diverged Path listed only as diverged matches `commit`, which refuses Diverged
+first, though it hides that the local file was deleted or is invalid; a tracked Path turned into
+a symlink is *invalid*, not *deleted*, correctly. `status` exits 0 even when it lists invalid or
+Diverged Paths; the spec doesn't say otherwise.
+
+### Summary
+
+Standards: 0 hard violations, 6 judgement calls (worst: the scan's Bases travelling beside it,
+with unchecked indexing in `stage`). Spec: nothing wrong; 1 question for the owner (Paths or
+cwd-relative paths from a subdirectory).
+
+### Resolution
+
+Fixed in 17d5266 (no behaviour change; `--json` keys unchanged):
+
+1. **The scan's Bases:** `Scan` borrows the Bases it was made with; `changes()` takes no arguments
+   and yields a `Difference` (`Added`, `Modified`, `Deleted`) carrying the contents and Base, so
+   `stage` no longer indexes unchecked.
+2. **Name vs Path matching:** `LocalName::path()` gives the Path a name spells, so both checks are
+   set lookups, and `status` checks "not Diverged" one way.
+3. **`PathStatus::Diverged`:** holds a `DivergedPath { path, theirs_file, blocked }`, which
+   `SyncEvent::Diverged` also wraps and `Failure::diverged` takes, so the fallback is gone.
+4. **Shadowing:** the function is now `diverged_paths`.
+5. **Tests:** one `run_in(subcommand, directory, args)` replaces `commit_in` and `status_in`.
+
+Not acted on: rows keyed `event` (kept, matching the spec's JSON style for `sync`). The owner
+accepted the open decisions listed across these reviews, including Area-relative Paths from a
+subdirectory. No re-review: a refactor with no behaviour change, and the tests pass.
