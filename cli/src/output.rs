@@ -8,7 +8,7 @@ use tidings::{
     Area, Change, ChangeKind, Committed, FeedItem, File, Origin, Path, Prefix, PrefixRevision, Stat,
 };
 
-use crate::working_copy::{Blocked, CommitReport, LocalChange, SyncEvent};
+use crate::working_copy::{Blocked, CommitReport, LocalChange, LocalName, SyncEvent};
 
 /// What a command gives, for [`Output`] to print.
 pub enum Report {
@@ -188,8 +188,11 @@ pub fn event_line(event: &SyncEvent) -> String {
 pub struct EventParts<'a> {
     /// Its name, as in `diverged`.
     pub name: &'static str,
-    /// The Path it is about, if any, or the name of a file in the folder that can't be one.
-    pub path: Option<&'a str>,
+    /// The Path it is about, if any.
+    pub path: Option<&'a Path>,
+    /// For an *invalid* event only: the file in the folder it is about, which may not be a valid
+    /// Path, given where a Path would be.
+    pub local_name: Option<&'a LocalName>,
     /// What else it says, if anything.
     pub message: Option<String>,
     /// For a *diverged* event only: the file with the Store's version, or `None` if the Store
@@ -200,9 +203,10 @@ pub struct EventParts<'a> {
 impl<'a> EventParts<'a> {
     /// What `event`, from `sync`, says.
     pub fn of(event: &'a SyncEvent) -> EventParts<'a> {
-        let parts = |name, path: Option<&'a Path>, message| EventParts {
+        let parts = |name, path, message| EventParts {
             name,
-            path: path.map(Path::as_str),
+            path,
+            local_name: None,
             message,
             theirs: None,
         };
@@ -229,7 +233,7 @@ impl<'a> EventParts<'a> {
     pub fn json(&self) -> Value {
         let mut object = serde_json::Map::new();
         object.insert("event".to_owned(), json!(self.name));
-        if let Some(path) = self.path {
+        if let Some(path) = self.subject() {
             object.insert("path".to_owned(), json!(path));
         }
         if let Some(message) = &self.message {
@@ -241,11 +245,16 @@ impl<'a> EventParts<'a> {
         Value::Object(object)
     }
 
+    /// What it is about, if anything: its Path, or the file in the folder.
+    fn subject(&self) -> Option<&str> {
+        self.path.map(Path::as_str).or(self.local_name.map(LocalName::as_str))
+    }
+
     /// As a line for a person, as in "diverged a: removed in the Store".
     pub fn line(&self) -> String {
         // For a person, a name is words.
         let mut line = self.name.replace('-', " ");
-        if let Some(path) = self.path {
+        if let Some(path) = self.subject() {
             line.push_str(&format!(" {path}"));
         }
         if let Some(message) = &self.message {

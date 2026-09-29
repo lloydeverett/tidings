@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use tidings::Area;
 
 use crate::output::{EventParts, area_name};
-use crate::working_copy::{InvalidFile, Reconciled, SyncEvent};
+use crate::working_copy::{InvalidEntry, Reconciled, SyncEvent};
 
 /// A command that failed: what to tell the person, and the exit code.
 #[derive(Debug)]
@@ -27,7 +27,7 @@ enum Outcomes {
     /// A Conflict, after which each Path it named was reconciled as `sync` would.
     Conflict(Vec<Reconciled>),
     /// It was refused because these files can't become Files.
-    Invalid(Vec<InvalidFile>),
+    Invalid(Vec<InvalidEntry>),
 }
 
 /// Each exit code other than success.
@@ -75,7 +75,7 @@ impl Failure {
 
     /// A Working copy's commit was refused because the files in `invalid` can't become Files,
     /// which exits with 1.
-    pub fn invalid(invalid: Vec<InvalidFile>) -> Failure {
+    pub fn invalid(invalid: Vec<InvalidEntry>) -> Failure {
         let message = "can't commit files that can't be Files: rename or remove each, or leave it \
                        out with .tidings/ignore";
         Failure {
@@ -150,10 +150,11 @@ impl Failure {
             }
             Some(Outcomes::Invalid(invalid)) => invalid
                 .iter()
-                .map(|file| EventParts {
+                .map(|entry| EventParts {
                     name: "invalid",
-                    path: Some(&file.name),
-                    message: Some(file.reason.clone()),
+                    path: None,
+                    local_name: Some(&entry.name),
+                    message: Some(entry.reason.clone()),
                     theirs: None,
                 })
                 .collect(),
@@ -167,7 +168,8 @@ fn reconciled_parts(reconciled: &Reconciled) -> EventParts<'_> {
         Reconciled::Event(event) => EventParts::of(event),
         Reconciled::TookStoresFile(path) => EventParts {
             name: "same",
-            path: Some(path.as_str()),
+            path: Some(path),
+            local_name: None,
             message: Some("the Store has the same contents, which are now its Base".to_owned()),
             theirs: None,
         },

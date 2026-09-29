@@ -1973,7 +1973,8 @@ fn empty_directories_are_never_committed() {
         fs::create_dir_all(folder.path().join("keys/empty")).unwrap();
         fs::create_dir(folder.path().join("what?")).unwrap();
         let run = commit_in(folder.path(), &[]).expect_success();
-        assert!(run.stdout.is_empty() && run.stderr.contains("nothing to commit"), "{run:?}");
+        let nothing = run.stdout.is_empty() && run.stderr.contains("nothing to commit");
+        assert!(nothing, "{backend}: {run:?}");
         let run = commit_in(folder.path(), &["keys"]).expect_code(1);
         assert!(run.stderr.contains("keys: no such file"), "{backend}: {run:?}");
     }
@@ -1998,5 +1999,88 @@ fn naming_an_ignored_file_says_it_is_ignored() {
         // A directory holding other files has nothing to commit.
         let run = commit_in(folder.path(), &["themes"]).expect_success();
         assert!(run.stderr.contains("nothing to commit"), "{backend}: {run:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_ignore_file_that_isnt_a_regular_file_refuses_the_commit() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        fs::write(folder.path().join(".x.swp"), "swap\n").unwrap();
+        // A symlink to patterns elsewhere is never followed, nor taken for no patterns.
+        let elsewhere = TempDir::new().unwrap();
+        let ignore = folder.path().join(".tidings/ignore");
+        fs::rename(&ignore, elsewhere.path().join("ignore")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path().join("ignore"), &ignore).unwrap();
+
+        let run = commit_in(folder.path(), &[".x.swp"]).expect_code(1);
+        assert!(run.stderr.contains(".tidings/ignore: is a symlink"), "{backend}: {run:?}");
+        let run = commit_in(folder.path(), &["--json"]).expect_code(1);
+        let json: serde_json::Value = serde_json::from_str(&run.stderr).unwrap();
+        assert_eq!(json["failure"], "error", "{backend}: {json}");
+        assert!(json["message"].as_str().unwrap().contains(".tidings/ignore"), "{json}");
+        location.run(&["store", "read", "config", ".x.swp"]).expect_code(2);
+
+        fs::remove_file(&ignore).unwrap();
+        fs::create_dir(&ignore).unwrap();
+        let run = commit_in(folder.path(), &[]).expect_code(1);
+        let why = ".tidings/ignore: isn't a regular file";
+        assert!(run.stderr.contains(why), "{backend}: {run:?}");
+        location.run(&["store", "read", "config", ".x.swp"]).expect_code(2);
+
+        // A missing one, as when the person removed it, leaves nothing out.
+        fs::remove_dir(&ignore).unwrap();
+        let run = commit_in(folder.path(), &[]).expect_success();
+        assert_eq!(run.stdout, "added .x.swp\n", "{backend}: {run:?}");
+    }
+}
+
+#[test]
+fn a_file_in_an_ignored_directory_is_ignored_whatever_re_includes_it() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        location.write("config", "build/tracked.txt", "t\n");
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        let ignore = folder.path().join(".tidings/ignore");
+        let patterns = "build/\n!build/keep\n*.log\n!keep.log\n";
+        fs::write(&ignore, fs::read_to_string(&ignore).unwrap() + patterns).unwrap();
+        fs::write(folder.path().join("build/keep"), "k\n").unwrap();
+        fs::write(folder.path().join("build/out.o"), "o\n").unwrap();
+        fs::write(folder.path().join("debug.log"), "d\n").unwrap();
+        fs::write(folder.path().join("keep.log"), "k\n").unwrap();
+        // A Path with a Base is committed, even in an ignored directory.
+        fs::write(folder.path().join("build/tracked.txt"), "t2\n").unwrap();
+
+        // As in git, a file can't be re-included if a directory it is in is left out, but one
+        // whose directory isn't can.
+        let run = commit_in(folder.path(), &[]).expect_success();
+        let lines: Vec<&str> = run.stdout.lines().collect();
+        assert_eq!(lines, ["modified build/tracked.txt", "added keep.log"], "{backend}: {run:?}");
+        let run = commit_in(folder.path(), &["build/keep"]).expect_code(1);
+        let why = "build/keep: is left out by .tidings/ignore";
+        assert!(run.stderr.contains(why), "{backend}: {run:?}");
+        location.run(&["store", "read", "config", "build/keep"]).expect_code(2);
+    }
+}
+
+#[test]
+fn a_malformed_pattern_refuses_the_commit_naming_its_line() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        fs::write(folder.path().join("new.txt"), "new\n").unwrap();
+        let ignore = folder.path().join(".tidings/ignore");
+        for pattern in ["[z-a]", "a{b", "\\"] {
+            fs::write(&ignore, format!("*.log\n# a comment\n{pattern}\n")).unwrap();
+            let run = commit_in(folder.path(), &[]).expect_code(1);
+            let line = format!(".tidings/ignore:3: error parsing glob '{pattern}'");
+            assert!(run.stderr.contains(&line), "{backend}: {run:?}");
+        }
+        location.run(&["store", "read", "config", "new.txt"]).expect_code(2);
     }
 }
