@@ -169,6 +169,18 @@ fn sync_finishes_a_working_copy_a_crash_left_without_a_record() {
 }
 
 #[test]
+fn sync_into_a_folder_that_isnt_empty_makes_no_store() {
+    let location = Location::empty();
+    let folder = TempDir::new().unwrap();
+    fs::write(folder.path().join("notes.txt"), "mine\n").unwrap();
+    let folder_arg = folder.path().to_str().unwrap();
+    let args = ["--backend", "fs", "--create", "sync", "config", folder_arg];
+    let run = location.run(&args).expect_code(1);
+    assert!(run.stderr.contains("isn't empty"), "{run:?}");
+    assert!(fs::read_dir(location.root()).unwrap().next().is_none(), "a Store was made");
+}
+
+#[test]
 fn a_second_commit_waiting_for_the_first_reads_the_bases_it_saved() {
     for backend in BACKENDS {
         let location = store_with_config(backend);
@@ -187,6 +199,11 @@ fn a_second_commit_waiting_for_the_first_reads_the_bases_it_saved() {
             })
             .collect();
         thread::sleep(Duration::from_millis(500));
+        // Both still wait, so that neither can have committed without the lock.
+        let mut commits = commits;
+        for commit in &mut commits {
+            assert!(commit.try_wait().unwrap().is_none(), "{backend}: a commit didn't wait");
+        }
         drop(lock);
 
         let mut runs: Vec<String> = commits

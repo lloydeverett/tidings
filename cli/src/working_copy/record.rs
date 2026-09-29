@@ -36,6 +36,7 @@ const FORMAT_NAME: &str = "tidings working-copy ";
 pub struct Record {
     /// The Store the Working copy belongs to.
     pub store: StoreAddress,
+    /// The Area whose Files the Working copy holds.
     pub area: Area,
     /// The Base of each Path that has one.
     pub bases: BTreeMap<Path, Base>,

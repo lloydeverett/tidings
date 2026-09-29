@@ -97,33 +97,38 @@ enum Local {
 }
 
 impl WorkingCopy {
+    /// Fails unless `folder` can become a Working copy: it must be missing or empty. A `.tidings/`
+    /// holding no record, as a `sync` that stopped while making the Working copy leaves, counts as
+    /// empty. [`WorkingCopy::create`] checks this again, so this is only for failing before doing
+    /// anything else, such as making a Store.
+    pub fn check_can_create(folder: &FsPath) -> Result<(), Failure> {
+        if is_missing_empty_or_unfinished(folder)? {
+            return Ok(());
+        }
+        Err(refuse_to_create(
+            folder,
+            if record::is_record(&record_file(folder)) {
+                "is a Working copy already"
+            } else {
+                "isn't empty"
+            },
+        ))
+    }
+
     /// Makes `folder`, which must be missing or empty, a Working copy of `area` in `store`, with
-    /// no Files yet. A `.tidings/` holding no record, as a `sync` that stopped while making the
-    /// Working copy leaves, counts as empty.
+    /// no Files yet, as [`WorkingCopy::check_can_create`] says.
     pub fn create(
         folder: &FsPath,
         store: StoreAddress,
         area: Area,
     ) -> Result<WorkingCopy, Failure> {
-        let refuse = |what: &str| {
-            Failure::error(format!(
-                "{} {what}: sync into an empty or missing folder",
-                folder.display()
-            ))
-        };
-        if !is_empty(folder)? {
-            return Err(refuse(if record::is_record(&record_file(folder)) {
-                "is a Working copy already"
-            } else {
-                "isn't empty"
-            }));
-        }
+        WorkingCopy::check_can_create(folder)?;
         fs::create_dir_all(folder.join(RECORD_DIRECTORY)).map_err(failed_at(folder))?;
         let working_copy = WorkingCopy { folder: folder.to_owned(), store, area };
-        let _lock = working_copy.lock_file(LOCK_FILE, true)?;
+        let _lock = working_copy.lock_waiting(LOCK_FILE)?;
         // Another `sync` may have made it a Working copy since the folder was found empty.
         if record_file(folder).exists() {
-            return Err(refuse("is a Working copy already"));
+            return Err(refuse_to_create(folder, "is a Working copy already"));
         }
         working_copy.save(&Record::new(working_copy.store.clone(), area))?;
         Ok(working_copy)
@@ -161,7 +166,7 @@ impl WorkingCopy {
 
     /// Locks `.tidings/sync.lock`, for as long as a `sync` runs.
     pub fn lock_for_sync(&self) -> Result<SyncLock, Failure> {
-        let file = self.lock_file(SYNC_LOCK_FILE, false)?;
+        let file = self.open_lock_file(SYNC_LOCK_FILE)?;
         match file.try_lock() {
             Ok(()) => Ok(SyncLock { _file: file }),
             Err(TryLockError::WouldBlock) => Err(Failure::error(format!(
@@ -372,20 +377,23 @@ impl WorkingCopy {
     /// Locks `.tidings/lock`, waiting for any other command holding it, and reads the record
     /// under it.
     fn lock(&self) -> Result<Lock, Failure> {
-        let file = self.lock_file(LOCK_FILE, true)?;
+        let file = self.lock_waiting(LOCK_FILE)?;
         let record = Record::read(&record_file(&self.folder))?;
         Ok(Lock { _file: file, record })
     }
 
-    /// Opens `.tidings/<name>`, making it if need be, and locks it if `wait`, waiting for any
-    /// other command holding it.
-    fn lock_file(&self, name: &str, wait: bool) -> Result<fs::File, Failure> {
+    /// Opens `.tidings/<name>`, making it if need be, without locking it.
+    fn open_lock_file(&self, name: &str) -> Result<fs::File, Failure> {
         let path = self.folder.join(RECORD_DIRECTORY).join(name);
         let file = fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path);
-        let file = file.map_err(failed_at(&path))?;
-        if wait {
-            file.lock().map_err(|error| self.failed("lock", error))?;
-        }
+        file.map_err(failed_at(&path))
+    }
+
+    /// Opens `.tidings/<name>`, making it if need be, and locks it, waiting for any other command
+    /// holding it.
+    fn lock_waiting(&self, name: &str) -> Result<fs::File, Failure> {
+        let file = self.open_lock_file(name)?;
+        file.lock().map_err(|error| self.failed("lock", error))?;
         Ok(file)
     }
 
@@ -410,9 +418,15 @@ fn record_file(folder: &FsPath) -> PathBuf {
     folder.join(RECORD_DIRECTORY).join(RECORD_FILE)
 }
 
-/// Whether `folder` is missing or empty, counting a `.tidings/` that holds no record, only what
-/// making a Working copy leaves before it writes one, as nothing.
-fn is_empty(folder: &FsPath) -> Result<bool, Failure> {
+/// The failure for `folder` being unable to become a Working copy because it `what`, as in "isn't
+/// empty".
+fn refuse_to_create(folder: &FsPath, what: &str) -> Failure {
+    Failure::error(format!("{} {what}: sync into an empty or missing folder", folder.display()))
+}
+
+/// Whether `folder` is missing, empty, or holds only an unfinished Working copy: a `.tidings/` that
+/// holds no record, only what making a Working copy leaves before it writes one.
+fn is_missing_empty_or_unfinished(folder: &FsPath) -> Result<bool, Failure> {
     let entries = match fs::read_dir(folder) {
         Ok(entries) => entries,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
@@ -421,10 +435,12 @@ fn is_empty(folder: &FsPath) -> Result<bool, Failure> {
     for entry in entries {
         let entry = entry.map_err(failed_at(folder))?;
         let is_directory = entry.file_type().map_err(failed_at(folder))?.is_dir();
-        if entry.file_name() != RECORD_DIRECTORY
-            || !is_directory
-            || !holds_no_record(&entry.path())?
-        {
+        // Matched as `scan` matches it, which never reads a `.tidings/` in any case as Files.
+        let is_record_directory = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(RECORD_DIRECTORY));
+        if !is_record_directory || !is_directory || !holds_no_record(&entry.path())? {
             return Ok(false);
         }
     }
@@ -433,6 +449,9 @@ fn is_empty(folder: &FsPath) -> Result<bool, Failure> {
 
 /// Whether `directory`, a `.tidings/`, holds only what making a Working copy leaves before it
 /// writes the record: the lock files, and a temporary file the record was being written to.
+///
+/// These are the only leftovers allowed, so once [`WorkingCopy::create`] makes more in `.tidings/`
+/// before writing the record (the spec's `ignore` file and `tmp/`), they must be added here.
 fn holds_no_record(directory: &FsPath) -> Result<bool, Failure> {
     let temporary = format!(".{RECORD_FILE}.");
     for entry in fs::read_dir(directory).map_err(failed_at(directory))? {

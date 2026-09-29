@@ -182,8 +182,10 @@ async fn sync(
         Some(folder) => folder,
         None => std::env::current_dir()?,
     };
-    let address = store.address().await?;
-    let opened = address.open(store.create).await?;
+    // Before the Store, which `--create` would otherwise make even for a folder that can't be a
+    // Working copy.
+    WorkingCopy::check_can_create(&folder)?;
+    let (address, opened) = store.open_with_address().await?;
     let working_copy = WorkingCopy::create(&folder, address, area.into())?;
     let _syncing = working_copy.lock_for_sync()?;
     for event in working_copy.reconcile_all(&opened.store).await? {
