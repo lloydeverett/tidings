@@ -1311,11 +1311,9 @@ fn a_theirs_that_cant_be_removed_is_an_error_and_sync_carries_on() {
         fs::write(folder.path().join("themes/dark.toml"), "mine\n").unwrap();
         location.write("config", "app.toml", "theirs\n");
         location.write("config", "themes/dark.toml", "theirs\n");
-        let mut diverged = Vec::new();
-        while diverged.len() < 2 {
-            let events = sync.wait_for("caught-up");
-            diverged.extend(paths(&events, "diverged").into_iter().map(str::to_owned));
-        }
+        let events = wait_for_count(&mut sync, "diverged", 2);
+        let diverged = sorted_paths(&events, "diverged");
+        assert_eq!(diverged, ["app.toml", "themes/dark.toml"], "{backend}: {events:?}");
         // The person puts a directory of their own in place of the `theirs` file, and the Store
         // goes back to its Base, so the Path is no longer Diverged, all the same.
         let replace_theirs = |path| {
@@ -1399,21 +1397,17 @@ fn a_divergence_clears_once_the_store_is_back_at_the_base() {
         fs::write(folder.path().join("app.toml"), "mine\n").unwrap();
         location.write("config", "n", "theirs\n");
         location.write("config", "app.toml", "theirs\n");
-        let events = sync.wait_for("caught-up");
-        assert_eq!(paths(&events, "diverged"), ["app.toml", "n"], "{backend}: {events:?}");
+        // Two Commits, which `sync` may take in one batch or two.
+        let events = wait_for_count(&mut sync, "diverged", 2);
+        assert_eq!(sorted_paths(&events, "diverged"), ["app.toml", "n"], "{backend}: {events:?}");
 
         // The Store goes back: `n` absent again, and `app.toml` holding its Base's contents, which
         // give its Base's Revision.
         location.run(&["store", "delete", "config", "n"]).expect_success();
         location.write("config", "app.toml", "a = 1\n");
-        let mut resolved = Vec::new();
-        while resolved.len() < 2 {
-            let events = sync.wait_for("caught-up");
-            assert!(paths(&events, "diverged").is_empty(), "{backend}: {events:?}");
-            resolved.extend(paths(&events, "resolved").into_iter().map(str::to_owned));
-        }
-        resolved.sort();
-        assert_eq!(resolved, ["app.toml", "n"], "{backend}");
+        let events = wait_for_count(&mut sync, "resolved", 2);
+        assert!(paths(&events, "diverged").is_empty(), "{backend}: {events:?}");
+        assert_eq!(sorted_paths(&events, "resolved"), ["app.toml", "n"], "{backend}: {events:?}");
         sync.stop();
 
         // Local edits stay local, and are changes to commit.
@@ -1457,6 +1451,26 @@ fn paths<'a>(events: &'a [serde_json::Value], name: &str) -> Vec<&'a str> {
         .filter(|event| event["event"] == name)
         .map(|event| event["path"].as_str().unwrap())
         .collect()
+}
+
+/// The Paths of the events in `events` named `name`, sorted, as when they may have come in more
+/// than one batch.
+fn sorted_paths<'a>(events: &'a [serde_json::Value], name: &str) -> Vec<&'a str> {
+    let mut paths = paths(events, name);
+    paths.sort_unstable();
+    paths
+}
+
+/// The events `sync` prints up to the first *caught-up* by which it has printed `count` events
+/// named `name`. The Changes of separate Commits can come to `sync` in one batch or in several,
+/// each reconciled and reported on its own, so waiting for one *caught-up* isn't enough.
+#[track_caller]
+fn wait_for_count(sync: &mut Sync, name: &str, count: usize) -> Vec<serde_json::Value> {
+    let mut events = Vec::new();
+    while paths(&events, name).len() < count {
+        events.extend(sync.wait_for("caught-up"));
+    }
+    events
 }
 
 /// The first event in `events` for `path`.
