@@ -467,6 +467,8 @@ fn a_path_changed_locally_and_in_the_store_is_diverged() {
         for path in diverged {
             let message = format!("the Store's version is in .tidings/theirs/{path}");
             assert_eq!(message_for(&events, path), message, "{backend}");
+            let theirs_file = format!(".tidings/theirs/{path}");
+            assert_eq!(event_for(&events, path)["theirs"], theirs_file.as_str(), "{backend}");
             assert_eq!(fs::read_to_string(theirs(folder.path(), path)).unwrap(), "theirs");
         }
         sync.stop();
@@ -491,6 +493,8 @@ fn a_path_changed_locally_and_removed_in_the_store_is_diverged_with_no_theirs() 
         let events = sync.wait_for("caught-up");
         assert_eq!(paths(&events, "diverged"), ["app.toml"], "{backend}: {events:?}");
         assert_eq!(message_for(&events, "app.toml"), "removed in the Store", "{backend}");
+        let theirs_field = event_for(&events, "app.toml").get("theirs");
+        assert_eq!(theirs_field, Some(&serde_json::Value::Null), "{backend}: {events:?}");
         assert_eq!(events.len(), 2, "{backend}: {events:?}");
         sync.stop();
 
@@ -521,7 +525,7 @@ fn the_same_change_on_both_sides_takes_the_stores_version_as_the_base_silently()
         // Every Path took the Store's version as its Base, so nothing is a change.
         let run = commit_in(folder.path(), &[]).expect_success();
         assert!(run.stderr.contains("nothing to commit"), "{backend}: {run:?}");
-        assert!(!folder.path().join(".tidings/theirs/app.toml").exists(), "{backend}");
+        assert!(!theirs(folder.path(), "app.toml").exists(), "{backend}");
     }
 }
 
@@ -579,7 +583,7 @@ fn a_divergence_clears_once_the_local_file_equals_the_stores() {
         assert_eq!(paths(&events, "resolved"), ["app.toml"], "{backend}: {events:?}");
         assert_eq!(paths(&events, "created"), ["other.toml"], "{backend}: {events:?}");
         sync.stop();
-        assert!(!folder.path().join(".tidings/theirs/app.toml").exists(), "{backend}");
+        assert!(!theirs(folder.path(), "app.toml").exists(), "{backend}");
         // The emptied directories in `theirs/` go too.
         let left = fs::read_dir(folder.path().join(".tidings/theirs")).unwrap().count();
         assert_eq!(left, 0, "{backend}");
@@ -855,19 +859,110 @@ fn a_change_under_a_local_file_to_a_path_with_a_base_is_diverged() {
 
 #[cfg(unix)]
 #[test]
-fn theirs_is_never_written_outside_the_working_copy() {
-    let location = store_with_config("fs");
-    let folder = TempDir::new().unwrap();
-    let outside = TempDir::new().unwrap();
-    synced(&location, "config", folder.path());
-    std::os::unix::fs::symlink(outside.path(), folder.path().join(".tidings/theirs")).unwrap();
-    fs::write(folder.path().join("app.toml"), "mine\n").unwrap();
-    location.write("config", "app.toml", "theirs\n");
+fn a_theirs_that_cant_be_written_is_an_error_and_sync_carries_on() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        let theirs_directory = folder.path().join(".tidings/theirs");
+        std::os::unix::fs::symlink(outside.path(), &theirs_directory).unwrap();
+        fs::write(folder.path().join("app.toml"), "mine\n").unwrap();
+        location.write("config", "app.toml", "theirs\n");
 
-    let run = location.run(&["sync", "config", folder.path().to_str().unwrap()]).expect_code(1);
-    assert!(run.stderr.contains("theirs is a symlink"), "{run:?}");
-    assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
-    assert_eq!(fs::read_to_string(folder.path().join("app.toml")).unwrap(), "mine\n");
+        // Quiet, since an error needs the person's attention.
+        let mut command = location.command(&["--json"]);
+        command.args(["sync", "--quiet", "config"]).arg(folder.path());
+        let mut sync = Sync::spawn(command);
+        let diverged: serde_json::Value = serde_json::from_str(&sync.next_line()).unwrap();
+        assert_eq!(diverged["event"], "diverged", "{backend}: {diverged}");
+        let error: serde_json::Value = serde_json::from_str(&sync.next_line()).unwrap();
+        assert_eq!(error["event"], "error", "{backend}: {error}");
+        assert_eq!(error["path"], "app.toml", "{backend}: {error}");
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains("theirs is a symlink"), "{backend}: {error}");
+
+        // `sync` carries on with the other Paths.
+        location.write("config", "later.toml", "later\n");
+        wait_until(|| folder.path().join("later.toml").exists());
+        sync.stop();
+        assert!(fs::read_dir(outside.path()).unwrap().next().is_none(), "{backend}");
+        assert_eq!(fs::read_to_string(folder.path().join("app.toml")).unwrap(), "mine\n");
+
+        // The Path was recorded Diverged, and its Base kept, so once `theirs` can be written, the
+        // next reconcile writes it without reporting the Divergence again.
+        fs::remove_file(&theirs_directory).unwrap();
+        let mut sync = Sync::start(&location, "config", folder.path());
+        let events = sync.wait_for("caught-up");
+        assert_eq!(events.len(), 1, "{backend}: {events:?}");
+        sync.stop();
+        let written = fs::read_to_string(theirs(folder.path(), "app.toml")).unwrap();
+        assert_eq!(written, "theirs\n", "{backend}");
+        let run = commit_in(folder.path(), &[]).expect_code(3);
+        assert!(run.stderr.contains("app.toml"), "{backend}: {run:?}");
+    }
+}
+
+#[test]
+fn a_missing_theirs_is_written_again() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        fs::write(folder.path().join("themes/dark.toml"), "mine\n").unwrap();
+        location.write("config", "themes/dark.toml", "theirs\n");
+        synced(&location, "config", folder.path());
+
+        // Removed while `sync` is stopped, by the person, or as a crash between removing it and
+        // saving the record leaves it.
+        fs::remove_dir_all(folder.path().join(".tidings/theirs")).unwrap();
+        let mut sync = Sync::start(&location, "config", folder.path());
+        let events = sync.wait_for("caught-up");
+        sync.stop();
+        // Diverged with the same Revision as before, so not reported again.
+        assert_eq!(events.len(), 1, "{backend}: {events:?}");
+        let written = fs::read_to_string(theirs(folder.path(), "themes/dark.toml")).unwrap();
+        assert_eq!(written, "theirs\n", "{backend}");
+    }
+}
+
+#[test]
+fn a_divergence_clears_once_the_store_is_back_at_the_base() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        let mut sync = Sync::start(&location, "config", folder.path());
+        sync.wait_for("caught-up");
+        // `n` has no Base, and `app.toml` has one.
+        fs::write(folder.path().join("n"), "mine\n").unwrap();
+        fs::write(folder.path().join("app.toml"), "mine\n").unwrap();
+        location.write("config", "n", "theirs\n");
+        location.write("config", "app.toml", "theirs\n");
+        let events = sync.wait_for("caught-up");
+        assert_eq!(paths(&events, "diverged"), ["app.toml", "n"], "{backend}: {events:?}");
+
+        // The Store goes back: `n` absent again, and `app.toml` holding its Base's contents, which
+        // give its Base's Revision.
+        location.run(&["store", "delete", "config", "n"]).expect_success();
+        location.write("config", "app.toml", "a = 1\n");
+        let mut resolved = Vec::new();
+        while resolved.len() < 2 {
+            let events = sync.wait_for("caught-up");
+            assert!(paths(&events, "diverged").is_empty(), "{backend}: {events:?}");
+            resolved.extend(paths(&events, "resolved").into_iter().map(str::to_owned));
+        }
+        resolved.sort();
+        assert_eq!(resolved, ["app.toml", "n"], "{backend}");
+        sync.stop();
+
+        // Local edits stay local, and are changes to commit.
+        assert_eq!(fs::read_to_string(folder.path().join("n")).unwrap(), "mine\n");
+        assert_eq!(fs::read_to_string(folder.path().join("app.toml")).unwrap(), "mine\n");
+        assert!(!theirs(folder.path(), "n").exists(), "{backend}");
+        assert!(!theirs(folder.path(), "app.toml").exists(), "{backend}");
+        let run = commit_in(folder.path(), &[]).expect_success();
+        assert_eq!(run.stdout, "modified app.toml\nadded n\n", "{backend}: {run:?}");
+    }
 }
 
 #[test]
@@ -884,7 +979,8 @@ fn sync_quiet_prints_a_diverged_path() {
         location.write("config", "a", "theirs");
         let message = "the Store's version is in .tidings/theirs/a";
         let expected = if json {
-            format!(r#"{{"event":"diverged","message":"{message}","path":"a"}}"#)
+            let theirs = r#""theirs":".tidings/theirs/a""#;
+            format!(r#"{{"event":"diverged","message":"{message}","path":"a",{theirs}}}"#)
         } else {
             format!("diverged a: {message}")
         };
@@ -902,11 +998,17 @@ fn paths<'a>(events: &'a [serde_json::Value], name: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// The message of the event in `events` for `path`.
+/// The first event in `events` for `path`.
+#[track_caller]
+fn event_for<'a>(events: &'a [serde_json::Value], path: &str) -> &'a serde_json::Value {
+    let event = events.iter().find(|event| event["path"] == path);
+    event.unwrap_or_else(|| panic!("no event for {path}: {events:?}"))
+}
+
+/// The message of the first event in `events` for `path`.
 #[track_caller]
 fn message_for<'a>(events: &'a [serde_json::Value], path: &str) -> &'a str {
-    let event = events.iter().find(|event| event["path"] == path);
-    event.and_then(|event| event["message"].as_str()).unwrap_or_else(|| panic!("{events:?}"))
+    event_for(events, path)["message"].as_str().unwrap_or_else(|| panic!("{events:?}"))
 }
 
 /// Where the Working copy that is `folder` keeps the Store's version of the Diverged `path`.

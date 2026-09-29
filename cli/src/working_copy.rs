@@ -76,13 +76,16 @@ pub enum SyncEvent {
         path: Path,
         /// The file holding the Store's version, relative to the folder, or `None` if the Store
         /// has no File there.
-        theirs: Option<PathBuf>,
-        /// What in the folder kept the Store's version from being applied, if anything, as in "q
-        /// isn't a directory".
-        blocked: Option<String>,
+        theirs_file: Option<PathBuf>,
+        /// What in the folder kept the Store's version from being applied, if anything.
+        blocked: Option<Blocked>,
     },
-    /// A Diverged Path's local contents came to equal the Store's, so it is no longer Diverged.
+    /// A Diverged Path's local contents came to equal the Store's, or the Store's came back to its
+    /// Base, so it is no longer Diverged.
     Resolved(Path),
+    /// The Store's version of a Diverged Path couldn't be written to its `theirs` file, for the
+    /// reason given. The Path stays Diverged, and the next reconcile tries again.
+    Error { path: Path, message: String },
     /// Changes to the Area may have been missed, so it reconciles every Path.
     Resync,
     /// It has applied everything it knows of.
@@ -123,23 +126,28 @@ enum Paths {
     Only(BTreeSet<Path>),
 }
 
-/// A directory a Path is in, in the folder, that isn't one, so the Store's version of the Path
-/// can't be applied there. Each holds the directory, relative to the folder.
-enum Blocked {
+/// What in the folder keeps the Store's version of a Path from being applied there: one of the
+/// directories the Path is in that isn't one, given relative to the folder, or a directory at the
+/// Path itself.
+#[derive(Debug)]
+pub enum Blocked {
     /// A symlink, through which something outside the folder would be reached.
     Symlink(PathBuf),
     /// A file, or anything else that isn't a directory.
     NotADirectory(PathBuf),
+    /// A directory where the File would be written.
+    Directory(Path),
 }
 
 impl Blocked {
     /// Why this blocks a Path, as in "q isn't a directory".
-    fn reason(&self) -> String {
+    pub fn reason(&self) -> String {
         match self {
             Blocked::Symlink(directory) => format!("{} is a symlink", directory.display()),
             Blocked::NotADirectory(directory) => {
                 format!("{} isn't a directory", directory.display())
             }
+            Blocked::Directory(path) => format!("{path} is a directory"),
         }
     }
 }
@@ -394,11 +402,12 @@ impl WorkingCopy {
         let mut removed = Vec::new();
         let mut written = Vec::new();
         for path in paths {
-            let theirs = store.read(self.area, &path).await?;
+            let store_file = store.read(self.area, &path).await?;
             let base = record.bases.get(&path).map(|base| base.revision);
-            if theirs.as_ref().map(File::revision) != base || record.divergences.contains_key(&path)
+            if store_file.as_ref().map(File::revision) != base
+                || record.divergences.contains_key(&path)
             {
-                match theirs {
+                match store_file {
                     None => removed.push(path),
                     Some(file) => written.push(file),
                 }
@@ -406,22 +415,24 @@ impl WorkingCopy {
         }
         let mut events = Vec::new();
         for path in removed {
-            events.extend(self.reconcile_path(record, &path, None)?);
+            self.reconcile_path(record, &path, None, &mut events)?;
         }
         for file in written {
-            events.extend(self.reconcile_path(record, file.path(), Some(&file))?);
+            self.reconcile_path(record, file.path(), Some(&file), &mut events)?;
         }
         // The folder is changed first and the record saved after.
         self.save(&lock.record)?;
         Ok(events)
     }
 
-    /// Reconciles `path` with `theirs`, what the Store holds there, which differs from its Base
-    /// in `record`, or the Path is Diverged:
-    /// - if the local contents equal `theirs` (both absent, say), `theirs` becomes the Base;
-    /// - if the local file is unchanged since its Base, or absent with no Base, `theirs` is
+    /// Reconciles `path` with `store_file`, what the Store holds there, which differs from its
+    /// Base in `record`, or the Path is Diverged, adding what it does to `events`:
+    /// - if `store_file` matches the Base (both absent, or the same Revision), the Path, which is
+    ///   Diverged, no longer is, and local edits stay local;
+    /// - if the local contents equal `store_file` (both absent, say), it becomes the Base;
+    /// - if the local file is unchanged since its Base, or absent with no Base, `store_file` is
     ///   applied to the folder and becomes the Base;
-    /// - otherwise, or if what is in the folder keeps `theirs` from being applied, the Path is
+    /// - otherwise, or if what is in the folder keeps `store_file` from being applied, the Path is
     ///   Diverged, and the local file and the Base stay as they are.
     ///
     /// A Path that is no longer Diverged has its `theirs` file removed.
@@ -429,54 +440,64 @@ impl WorkingCopy {
         &self,
         record: &mut Record,
         path: &Path,
-        theirs: Option<&File>,
-    ) -> Result<Option<SyncEvent>, Failure> {
+        store_file: Option<&File>,
+        events: &mut Vec<SyncEvent>,
+    ) -> Result<(), Failure> {
+        let base = record.bases.get(path).copied();
+        if store_file.map(File::revision) == base.map(|base| base.revision) {
+            if record.divergences.remove(path).is_some() {
+                self.remove_theirs(path)?;
+                events.push(SyncEvent::Resolved(path.clone()));
+            }
+            return Ok(());
+        }
         let blocked = self.blocking_directory(path)?;
         let local = match &blocked {
             None => self.local(path)?,
             // Nothing can be at `path` under a file.
             Some(Blocked::NotADirectory(_)) => Local::Absent,
-            // What is there is outside the folder, so it is never read, nor `theirs` applied.
-            Some(blocked @ Blocked::Symlink(_)) => {
-                return self.diverge(record, path, theirs, Some(blocked.reason()));
+            // Under a symlink, what is there is outside the folder, so it is never read, nor
+            // `store_file` applied.
+            Some(_) => {
+                return self.diverge(record, path, store_file, blocked, events);
             }
         };
-        let base = record.bases.get(path).copied();
         let unchanged = match (&local, base) {
             (Local::Absent | Local::Directory, None) => true,
             (Local::File(contents), Some(base)) => Hash::of(contents) == base.hash,
             _ => false,
         };
-        let same_as_theirs = match (&local, theirs) {
+        let same_as_store = match (&local, store_file) {
             (Local::Absent | Local::Directory, None) => true,
             (Local::File(contents), Some(file)) => contents == file.contents(),
             _ => false,
         };
-        let event = if same_as_theirs {
-            record.divergences.contains_key(path).then(|| SyncEvent::Resolved(path.clone()))
+        if same_as_store {
+            if record.divergences.contains_key(path) {
+                events.push(SyncEvent::Resolved(path.clone()));
+            }
         } else if !unchanged {
             // A local change stays as it is.
-            return self.diverge(record, path, theirs, None);
+            return self.diverge(record, path, store_file, None, events);
         } else {
             // Unchanged: the folder holds the Base at `path`, or no File where there is no Base,
-            // and `theirs` differs from it.
-            let in_the_way = match (&blocked, &local) {
-                (Some(blocked), _) => Some(blocked.reason()),
-                (None, Local::Directory) => Some(format!("{path} is a directory")),
-                (None, _) => None,
+            // and `store_file` differs from it.
+            let blocked = match (blocked, &local) {
+                (None, Local::Directory) => Some(Blocked::Directory(path.clone())),
+                (blocked, _) => blocked,
             };
-            if let Some(reason) = in_the_way {
-                return self.diverge(record, path, theirs, Some(reason));
+            if blocked.is_some() {
+                return self.diverge(record, path, store_file, blocked, events);
             }
             // Between checking the directories and applying through them, another process could
             // swap one for a symlink and so redirect the write or removal outside the folder. Only
             // a deliberate race could do that, so it isn't guarded against.
-            Some(self.apply(path, &local, theirs)?)
-        };
+            events.push(self.apply(path, &local, store_file)?);
+        }
         if record.divergences.remove(path).is_some() {
             self.remove_theirs(path)?;
         }
-        match theirs {
+        match store_file {
             Some(file) => {
                 let base = Base { revision: file.revision(), hash: Hash::of(file.contents()) };
                 record.bases.insert(path.clone(), base);
@@ -485,31 +506,47 @@ impl WorkingCopy {
                 record.bases.remove(path);
             }
         }
-        Ok(event)
+        Ok(())
     }
 
-    /// Marks `path` Diverged, with `theirs` as the Store's version, which is written to its
-    /// `theirs` file (or that file removed, if the Store has no File there), and gives the event
-    /// reporting it, unless it was Diverged with that version already. `blocked` says what in the
-    /// folder kept `theirs` from being applied, if anything. The Base stays as it is.
+    /// Marks `path` Diverged, with `store_file` as the Store's version, and adds the event
+    /// reporting it to `events`, unless it was Diverged with that Revision already. `blocked` says
+    /// what in the folder kept `store_file` from being applied, if anything. The Base stays as it
+    /// is.
+    ///
+    /// Its `theirs` file is written with `store_file` if that changed or the file is missing, as
+    /// after a crash or the person removing it, or removed if the Store has no File there. If it
+    /// can't be written, the Path is Diverged all the same, and an error event says why, so that
+    /// `sync` carries on; the next reconcile tries again.
     fn diverge(
         &self,
         record: &mut Record,
         path: &Path,
-        theirs: Option<&File>,
-        blocked: Option<String>,
-    ) -> Result<Option<SyncEvent>, Failure> {
-        let divergence = Divergence { theirs: theirs.map(File::revision) };
-        if record.divergences.get(path) == Some(&divergence) {
-            return Ok(None);
-        }
-        match theirs {
-            Some(file) => self.write_theirs(path, file.contents())?,
-            None => self.remove_theirs(path)?,
+        store_file: Option<&File>,
+        blocked: Option<Blocked>,
+        events: &mut Vec<SyncEvent>,
+    ) -> Result<(), Failure> {
+        let divergence = Divergence { theirs_revision: store_file.map(File::revision) };
+        let changed = record.divergences.get(path) != Some(&divergence);
+        let mut failed = None;
+        match store_file {
+            Some(file) => {
+                if changed || !self.has_theirs(path)? {
+                    failed = self.write_theirs(path, file.contents()).err();
+                }
+            }
+            None if changed => self.remove_theirs(path)?,
+            None => {}
         }
         record.divergences.insert(path.clone(), divergence);
-        let theirs = theirs.map(|_| theirs_file(path));
-        Ok(Some(SyncEvent::Diverged { path: path.clone(), theirs, blocked }))
+        if changed {
+            let theirs_file = store_file.map(|_| theirs_file(path));
+            events.push(SyncEvent::Diverged { path: path.clone(), theirs_file, blocked });
+        }
+        if let Some(failure) = failed {
+            events.push(SyncEvent::Error { path: path.clone(), message: failure.to_string() });
+        }
+        Ok(())
     }
 
     /// The first of the directories `path` is in, in the folder, that isn't a real directory or
@@ -543,29 +580,47 @@ impl WorkingCopy {
         }
     }
 
-    /// Writes `contents` to `path`'s file in `.tidings/theirs/`, as [`WorkingCopy::write`] does.
-    /// Fails if anything on the way there in `.tidings/` isn't a real directory, so that nothing
-    /// outside it is ever written.
-    fn write_theirs(&self, path: &Path, contents: &str) -> Result<(), Failure> {
+    /// Where `path`'s `theirs` file is, or, if anything on the way there in `.tidings/` isn't a
+    /// real directory, what, so that nothing outside `.tidings/` is ever written or removed.
+    fn theirs_at(&self, path: &Path) -> Result<Result<PathBuf, Blocked>, Failure> {
         let at = self.folder.join(theirs_file(path));
-        if let Some(blocked) = blocking_directory(&self.folder.join(RECORD_DIRECTORY), &at)? {
-            return Err(Failure::error(format!(
-                "can't write the Store's version of {path} to {}: {} in {RECORD_DIRECTORY}",
-                at.display(),
-                blocked.reason(),
-            )));
-        }
-        self.write(&at, contents)
+        Ok(match blocking_directory(&self.folder.join(RECORD_DIRECTORY), &at)? {
+            Some(blocked) => Err(blocked),
+            None => Ok(at),
+        })
     }
 
-    /// Removes `path`'s file in `.tidings/theirs/`, if there is one, then each directory in
-    /// `theirs/` that the removal emptied. Anything on the way there in `.tidings/` that isn't a
-    /// real directory means there is none, so nothing outside it is ever removed.
-    fn remove_theirs(&self, path: &Path) -> Result<(), Failure> {
-        let at = self.folder.join(theirs_file(path));
-        if blocking_directory(&self.folder.join(RECORD_DIRECTORY), &at)?.is_some() {
-            return Ok(());
+    /// Whether `path` has its `theirs` file, as a regular file.
+    fn has_theirs(&self, path: &Path) -> Result<bool, Failure> {
+        let Ok(at) = self.theirs_at(path)? else { return Ok(false) };
+        match fs::symlink_metadata(&at) {
+            Ok(metadata) => Ok(metadata.is_file()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(failed_at(&at)(error)),
         }
+    }
+
+    /// Writes `contents` to `path`'s `theirs` file, as [`WorkingCopy::write`] does. Fails if
+    /// anything on the way there in `.tidings/` isn't a real directory.
+    fn write_theirs(&self, path: &Path, contents: &str) -> Result<(), Failure> {
+        let written = match self.theirs_at(path) {
+            Ok(Ok(at)) => self.write(&at, contents),
+            Ok(Err(blocked)) => {
+                Err(Failure::error(format!("{} in {RECORD_DIRECTORY}", blocked.reason())))
+            }
+            Err(failure) => Err(failure),
+        };
+        written.map_err(|failure| {
+            let theirs_file = theirs_file(path);
+            failure.in_context(format!("can't write {}", theirs_file.display()))
+        })
+    }
+
+    /// Removes `path`'s `theirs` file, if there is one, then each directory in `theirs/` that the
+    /// removal emptied. Anything on the way there in `.tidings/` that isn't a real directory means
+    /// there is none.
+    fn remove_theirs(&self, path: &Path) -> Result<(), Failure> {
+        let Ok(at) = self.theirs_at(path)? else { return Ok(()) };
         match fs::symlink_metadata(&at) {
             Ok(_) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),

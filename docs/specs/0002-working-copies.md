@@ -310,8 +310,11 @@ Revision) and its local state `L`:
 | differs | modified / added / deleted / invalid, and the local contents equal `S` (or both absent) | `S` becomes the Base silently |
 | differs | modified / added / deleted / invalid, contents differ | Diverged: `theirs` gets `S` (or is removed if `S` is absent), the local file is untouched |
 
-- A Path already Diverged is reconciled the same way: `theirs` is refreshed when `S` changes, and
-  the Divergence is cleared if the local contents now equal `S`.
+- A Path already Diverged is reconciled the same way: `theirs` is refreshed when `S` changes, or
+  written again if it is missing, and the Divergence is cleared if the local contents now equal
+  `S`, or if `S` matches `B` again (the first row).
+- If `theirs` can't be written (`.tidings/theirs/` is a symlink, say), the Path is Diverged all the
+  same, an *error* names it and says why, and `sync` carries on; the next reconcile tries again.
 - Applying `S` writes the file in `tmp/`, forces it to disk, and renames it into place, making any
   directories it needs; or removes the file, then removes each directory the removal emptied, up to
   the folder, stopping at any that isn't empty. Within one reconcile, removals happen before
@@ -336,7 +339,8 @@ Revision) and its local state `L`:
   file, or saying the Store removed it), *resolved* (a Divergence that cleared by itself),
   *resync*, and *caught up* after each reconcile that leaves nothing pending. `--quiet` keeps only
   *diverged*, *resync* and errors. With `--json`, each is a JSON object on its own line with an
-  `event` field, in the style of `store watch`.
+  `event` field, in the style of `store watch`; a *diverged* one also has `theirs`, the `theirs`
+  file relative to the folder, or `null` if the Store removed the File.
 - Ctrl-C is only acted on between reconciles, so a reconcile always finishes and saves the record.
 - `sync` on a memory Backend is refused, since no other process could reach it.
 

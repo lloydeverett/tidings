@@ -8,7 +8,7 @@ use tidings::{
     Area, Change, ChangeKind, Committed, FeedItem, File, Origin, Path, Prefix, PrefixRevision, Stat,
 };
 
-use crate::working_copy::{CommitReport, LocalChange, SyncEvent};
+use crate::working_copy::{Blocked, CommitReport, LocalChange, SyncEvent};
 
 /// What a command gives, for [`Output`] to print.
 pub enum Report {
@@ -152,7 +152,11 @@ pub struct SyncOutput {
 impl SyncOutput {
     /// Prints what `sync` did, as one line, unless it is quiet and this needs no attention.
     pub fn print(self, event: &SyncEvent) -> io::Result<()> {
-        if self.quiet && !matches!(event, SyncEvent::Resync | SyncEvent::Diverged { .. }) {
+        let needs_attention = matches!(
+            event,
+            SyncEvent::Resync | SyncEvent::Diverged { .. } | SyncEvent::Error { .. }
+        );
+        if self.quiet && !needs_attention {
             return Ok(());
         }
         // Each event is a name, and the Path and message it has, if any.
@@ -160,12 +164,13 @@ impl SyncOutput {
             SyncEvent::Created(path) => ("created", Some(path), None),
             SyncEvent::Updated(path) => ("updated", Some(path), None),
             SyncEvent::Removed(path) => ("removed", Some(path), None),
-            SyncEvent::Diverged { path, theirs, blocked } => (
+            SyncEvent::Diverged { path, theirs_file, blocked } => (
                 "diverged",
                 Some(path),
-                Some(diverged_message(theirs.as_deref(), blocked.as_deref())),
+                Some(diverged_message(theirs_file.as_deref(), blocked.as_ref())),
             ),
             SyncEvent::Resolved(path) => ("resolved", Some(path), None),
+            SyncEvent::Error { path, message } => ("error", Some(path), Some(message.clone())),
             SyncEvent::Resync => ("resync", None, None),
             SyncEvent::CaughtUp => ("caught-up", None, None),
         };
@@ -177,6 +182,11 @@ impl SyncOutput {
             }
             if let Some(message) = message {
                 object.insert("message".to_owned(), json!(message));
+            }
+            // So that another program following the Working copy can find the Store's version.
+            if let SyncEvent::Diverged { theirs_file, .. } = event {
+                let theirs_file = theirs_file.as_ref().map(|file| file.to_string_lossy());
+                object.insert("theirs".to_owned(), json!(theirs_file));
             }
             Value::Object(object).to_string()
         } else {
@@ -196,14 +206,14 @@ impl SyncOutput {
 
 /// What a *diverged* line says: where the Store's version is, or that the Store removed it, after
 /// what in the folder kept it from being applied, if anything.
-fn diverged_message(theirs: Option<&FsPath>, blocked: Option<&str>) -> String {
-    let theirs = match theirs {
-        Some(theirs) => format!("the Store's version is in {}", theirs.display()),
+fn diverged_message(theirs_file: Option<&FsPath>, blocked: Option<&Blocked>) -> String {
+    let store_side = match theirs_file {
+        Some(theirs_file) => format!("the Store's version is in {}", theirs_file.display()),
         None => "removed in the Store".to_owned(),
     };
     match blocked {
-        Some(blocked) => format!("{blocked}; {theirs}"),
-        None => theirs,
+        Some(blocked) => format!("{}; {store_side}", blocked.reason()),
+        None => store_side,
     }
 }
 

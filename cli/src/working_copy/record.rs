@@ -53,11 +53,12 @@ pub struct Base {
     pub hash: Hash,
 }
 
-/// That a Path is Diverged, and which of the Store's versions `theirs` holds for it.
+/// That a Path is Diverged, and the Revision of the Store's File that `theirs` holds for it, if the
+/// Store has one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Divergence {
     /// The Revision of the Store's version in `theirs`, or `None` if the Store has no File there.
-    pub theirs: Option<Revision>,
+    pub theirs_revision: Option<Revision>,
 }
 
 /// The hash of a file's contents (XXH3), which tells whether a local file still holds what the
@@ -126,7 +127,7 @@ impl Record {
             line(&["base", path.as_str(), &revision, &hash]);
         }
         for (path, divergence) in &self.divergences {
-            match divergence.theirs {
+            match divergence.theirs_revision {
                 Some(revision) => line(&["diverged", path.as_str(), &revision.to_string()]),
                 None => line(&["diverged", path.as_str()]),
             }
@@ -165,11 +166,11 @@ impl Record {
                     bases.insert(parse_path(path)?, Base { revision, hash: Hash(hash) });
                 }
                 ["diverged", path] => {
-                    divergences.insert(parse_path(path)?, Divergence { theirs: None });
+                    divergences.insert(parse_path(path)?, Divergence { theirs_revision: None });
                 }
                 ["diverged", path, revision] => {
-                    let theirs = Some(parse_revision(revision)?);
-                    divergences.insert(parse_path(path)?, Divergence { theirs });
+                    let theirs_revision = Some(parse_revision(revision)?);
+                    divergences.insert(parse_path(path)?, Divergence { theirs_revision });
                 }
                 _ => return Err(format!("has a line it can't read: {line:?}")),
             }
