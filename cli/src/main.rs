@@ -189,30 +189,12 @@ async fn sync(
     folder: Option<PathBuf>,
 ) -> Result<(), Failure> {
     let ctrl_c = listen_for_ctrl_c()?;
-    if store.is_memory() {
-        return Err(Failure::error(
-            "a Working copy can't be of a Store in memory: no other process could reach it",
-        ));
-    }
     let folder = match folder {
         Some(folder) => folder,
         None => std::env::current_dir()?,
     };
-    let area = Area::from(area);
-    // Opening the Store takes the Change feed, before anything is reconciled.
-    let (working_copy, mut opened) = if WorkingCopy::exists(&folder) {
-        let working_copy = WorkingCopy::open(&folder)?;
-        working_copy.check_area(area)?;
-        let opened = working_copy.open_store(store).await?;
-        (working_copy, opened)
-    } else {
-        // Before the Store, which `--create` would otherwise make even for a folder that can't be
-        // a Working copy.
-        WorkingCopy::check_can_create(&folder)?;
-        let (address, opened) = store.open_with_address().await?;
-        (WorkingCopy::create(&folder, address, area)?, opened)
-    };
-    working_copy.sync(&opened.store, &mut opened.feed, ctrl_c, |event| output.print(event)).await
+    let report = |event: &_| output.print(event);
+    WorkingCopy::sync(&folder, Area::from(area), store, ctrl_c, report).await
 }
 
 /// `commit`: commits every local change in the Working copy. Any Store flags in `store` must

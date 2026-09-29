@@ -692,9 +692,7 @@ fn resuming_catches_up_on_what_the_store_did_meanwhile() {
             let mut sync = if with_flags {
                 Sync::start(&location, "config", folder.path())
             } else {
-                let mut command = tidings();
-                command.args(["--json", "sync", "config"]).arg(folder.path());
-                Sync::spawn(command)
+                Sync::start_with(&[], "config", folder.path())
             };
             let events = sync.wait_for("caught-up");
             sync.stop();
@@ -822,6 +820,20 @@ fn a_second_sync_of_a_working_copy_is_refused() {
         location.write("config", "new.toml", "new\n");
         let events = sync.wait_for("caught-up");
         assert_eq!(paths(&events, "created"), ["new.toml"], "{backend}: {events:?}");
+
+        // The second is refused before it opens the Store: with the Store moved away, it says the
+        // first is running, not that there is no Store, and makes nothing where the Store was.
+        let moved = TempDir::new().unwrap();
+        let moved_root = moved.path().join("store");
+        fs::rename(location.root(), &moved_root).unwrap();
+        let mut command = tidings();
+        command.args(["sync", "config"]).arg(folder.path());
+        let run = common::run(command, "");
+        let root_was_made = location.root().exists();
+        fs::rename(&moved_root, location.root()).unwrap();
+        let run = run.expect_code(1);
+        assert!(run.stderr.contains("running already"), "{backend}: {run:?}");
+        assert!(!root_was_made, "{backend}: {run:?}");
         sync.stop();
     }
 }
@@ -852,9 +864,7 @@ fn a_working_copy_keeps_working_after_its_folder_is_moved() {
         assert_eq!(location.read("config", "app.toml"), "a = 2\n", "{backend}");
 
         location.write("config", "new.toml", "new\n");
-        let mut command = tidings();
-        command.args(["--json", "sync", "config"]).arg(&moved);
-        let mut sync = Sync::spawn(command);
+        let mut sync = Sync::start_with(&[], "config", &moved);
         let events = sync.wait_for("caught-up");
         sync.stop();
         assert_eq!(paths(&events, "created"), ["new.toml"], "{backend}: {events:?}");
@@ -870,26 +880,42 @@ fn a_working_copy_whose_store_has_gone_fails_to_open() {
         let root = parent.path().join("store");
         let root_arg = root.to_str().unwrap();
         let mut command = tidings();
-        command.args(["--root", root_arg, "--backend", backend, "--create", "store", "list"]);
-        command.arg("config");
+        command.args(["--root", root_arg, "--backend", backend, "--create", "store", "write"]);
+        command.args(["config", "app.toml", "--contents", "a = 1\n"]);
         common::run(command, "").expect_success();
         let folder = parent.path().join("cfg");
-        let mut command = tidings();
-        command.args(["--root", root_arg, "--json", "sync", "config"]).arg(&folder);
-        let mut sync = Sync::spawn(command);
+        let mut sync = Sync::start_with(&["--root", root_arg], "config", &folder);
         sync.wait_for("caught-up");
         sync.stop();
         fs::remove_dir_all(&root).unwrap();
-
         fs::write(folder.join("new.toml"), "new\n").unwrap();
-        let run = commit_in(&folder, &[]).expect_code(1);
-        assert!(run.stderr.contains("no Store"), "{backend}: {run:?}");
-        let mut command = tidings();
-        command.args(["sync", "config"]).arg(&folder);
-        let run = common::run(command, "").expect_code(1);
-        assert!(run.stderr.contains("no Store"), "{backend}: {run:?}");
+
+        let folder_arg = folder.to_str().unwrap();
+        let commands = [&["commit", "-C", folder_arg][..], &["sync", "config", folder_arg]];
+        for command in commands {
+            // It says the Working copy's Store is missing, and not to make one with `--create`,
+            // which would sync the folder with an empty Store.
+            let mut run = tidings();
+            run.args(command);
+            let run = common::run(run, "").expect_code(1);
+            let label = format!("{backend} {command:?}");
+            assert!(run.stderr.contains("missing"), "{label}: {run:?}");
+            assert!(run.stderr.contains(root_arg), "{label}: {run:?}");
+            assert!(!run.stderr.contains("--create"), "{label}: {run:?}");
+
+            // `--create` is refused, alone or with the Store flags the record has.
+            let with_create: [&[&str]; 2] =
+                [&["--create"], &["--root", root_arg, "--backend", backend, "--create"]];
+            for flags in with_create {
+                let mut run = tidings();
+                run.args(flags).args(command);
+                let run = common::run(run, "").expect_code(1);
+                assert!(run.stderr.contains("--create"), "{label} {flags:?}: {run:?}");
+            }
+        }
         assert!(!root.exists(), "{backend}: a Store was made");
-        assert!(folder.join("new.toml").exists(), "{backend}");
+        assert_eq!(fs::read_to_string(folder.join("app.toml")).unwrap(), "a = 1\n", "{backend}");
+        assert_eq!(fs::read_to_string(folder.join("new.toml")).unwrap(), "new\n", "{backend}");
     }
 }
 
@@ -915,8 +941,7 @@ fn two_working_copies_of_one_area_both_follow_it() {
         // A commit from one reaches the other as a Change from the Store.
         fs::write(first.path().join("app.toml"), "a = 2\n").unwrap();
         commit_in(first.path(), &[]).expect_success();
-        let [first_sync, second_sync] = syncs;
-        let mut second_sync = second_sync;
+        let [first_sync, mut second_sync] = syncs;
         let events = second_sync.wait_for("caught-up");
         assert_eq!(paths(&events, "updated"), ["app.toml"], "{backend}: {events:?}");
         let app = fs::read_to_string(second.path().join("app.toml")).unwrap();

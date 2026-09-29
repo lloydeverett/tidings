@@ -144,8 +144,14 @@ pub struct Sync {
 impl Sync {
     /// Starts `tidings --root <root> --json sync <area> <folder>`.
     pub fn start(location: &Location, area: &str, folder: &Path) -> Sync {
-        let mut command = location.command(&["--json", "sync", area]);
-        command.arg(folder);
+        Sync::start_with(&["--root", location.root().to_str().unwrap()], area, folder)
+    }
+
+    /// Starts `tidings <flags> --json sync <area> <folder>`, as for a Working copy that knows its
+    /// Store when `flags` is empty.
+    pub fn start_with(flags: &[&str], area: &str, folder: &Path) -> Sync {
+        let mut command = tidings();
+        command.args(flags).args(["--json", "sync", area]).arg(folder);
         Sync::spawn(command)
     }
 

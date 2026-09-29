@@ -1,7 +1,8 @@
 //! Which Store a command opens: the flags that choose one, and opening it.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{self, Path, PathBuf};
 
 use clap::{Args, ValueEnum};
 use tidings::{AppIdentity, BackendKind, ChangeFeed, FsOptions, SqliteOptions, Store};
@@ -113,7 +114,7 @@ impl StoreLocation {
     }
 
     /// The Root override, if there is one.
-    fn root(&self) -> Option<&std::path::Path> {
+    fn root(&self) -> Option<&Path> {
         match self {
             StoreLocation::Root(root) => Some(root),
             StoreLocation::Identity(_) => None,
@@ -155,12 +156,12 @@ pub struct StoreAddress {
 }
 
 impl StoreAddress {
-    /// Opens the Store. `create` makes a new one where there is none.
-    pub async fn open(&self, create: bool) -> Result<Opened, Failure> {
-        if !create && self.location.detect().await?.is_none() {
-            return Err(self.location.missing());
+    /// Opens the Store, or gives `None` if there is none there: it never makes one.
+    pub async fn open(&self) -> Result<Option<Opened>, Failure> {
+        if self.location.detect().await?.is_none() {
+            return Ok(None);
         }
-        self.open_or_make().await
+        Ok(Some(self.open_or_make().await?))
     }
 
     /// Opens the Store, making a new one if there is none, without looking for it first.
@@ -212,18 +213,25 @@ impl StoreArgs {
     /// Opens the Store the flags choose. `in_shell` allows the memory Backend, which is gone as
     /// soon as the command that opened it is.
     pub async fn open(&self, in_shell: bool) -> Result<Opened, Failure> {
-        if self.backend == Some(BackendName::Memory) {
+        if self.is_memory() {
             return self.open_memory(in_shell);
         }
         Ok(self.open_located().await?.1)
     }
 
-    /// Opens the Store the flags choose, which can't be one in memory, and gives its address too.
+    /// Opens the Store the flags choose for a new Working copy, which can't be one in memory, and
+    /// gives its address too.
     pub async fn open_with_address(&self) -> Result<(StoreAddress, Opened), Failure> {
-        if self.backend == Some(BackendName::Memory) {
-            return Err(memory_outside_the_shell());
-        }
+        self.check_not_memory()?;
         self.open_located().await
+    }
+
+    /// Fails if the flags choose the memory Backend, which no Working copy can be of.
+    pub fn check_not_memory(&self) -> Result<(), Failure> {
+        if self.is_memory() {
+            return Err(memory_for_a_working_copy());
+        }
+        Ok(())
     }
 
     /// Opens the Store the flags choose, which isn't one in memory, and gives its address: on the
@@ -243,13 +251,20 @@ impl StoreArgs {
     }
 
     /// Whether the flags choose the memory Backend.
-    pub fn is_memory(&self) -> bool {
+    fn is_memory(&self) -> bool {
         self.backend == Some(BackendName::Memory)
     }
 
     /// Fails, naming the difference, unless each flag given agrees with `address`, the Store a
-    /// Working copy belongs to. A flag left out agrees with anything.
+    /// Working copy belongs to. A flag left out agrees with anything. `--create` agrees with
+    /// nothing, since the Working copy's Store is made only with the Working copy.
     pub fn check_matches(&self, address: &StoreAddress) -> Result<(), Failure> {
+        if self.create {
+            return Err(Failure::error(format!(
+                "--create makes a new Store, but the Working copy's Store is {address} already: \
+                 leave it out"
+            )));
+        }
         let mismatch = |given: String| {
             Failure::error(format!(
                 "{given} doesn't match the Working copy's Store, {address}: leave it out, since \
@@ -298,7 +313,7 @@ impl StoreArgs {
     /// `--identity`.
     pub fn location(&self) -> Result<StoreLocation, Failure> {
         match (&self.root, &self.identity) {
-            (Some(root), None) => match std::path::absolute(root) {
+            (Some(root), None) => match path::absolute(root) {
                 Ok(root) => Ok(StoreLocation::Root(root)),
                 Err(error) => {
                     Err(Failure::error(format!("can't use --root {}: {error}", root.display())))
@@ -316,11 +331,11 @@ impl StoreArgs {
 
 /// Whether `given`, as `--root` gave it, is the directory `recorded`, an absolute path: the same
 /// path once made absolute, or the same directory once symlinks are followed.
-fn same_directory(given: &std::path::Path, recorded: &std::path::Path) -> bool {
-    if std::path::absolute(given).is_ok_and(|given| given == recorded) {
+fn same_directory(given: &Path, recorded: &Path) -> bool {
+    if path::absolute(given).is_ok_and(|given| given == recorded) {
         return true;
     }
-    match (std::fs::canonicalize(given), std::fs::canonicalize(recorded)) {
+    match (fs::canonicalize(given), fs::canonicalize(recorded)) {
         (Ok(given), Ok(recorded)) => given == recorded,
         _ => false,
     }
@@ -332,4 +347,9 @@ fn memory_outside_the_shell() -> Failure {
         "the memory Backend lasts only as long as the command, so only `tidings store shell` can \
          use it",
     )
+}
+
+/// The failure for a Working copy of a Store on the memory Backend.
+fn memory_for_a_working_copy() -> Failure {
+    Failure::error("a Working copy can't be of a Store in memory: no other process could reach it")
 }

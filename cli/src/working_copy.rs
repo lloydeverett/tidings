@@ -139,11 +139,55 @@ enum Local {
 }
 
 impl WorkingCopy {
+    /// `sync`: makes `folder` a Working copy of `area` in the Store `flags` choose, or resumes the
+    /// Working copy it is, which must be of `area`, and keeps it in step with its Store until
+    /// `stop` finishes, giving each [`SyncEvent`] to `report` as it happens. `stop` is acted on only
+    /// between reconciles, so each one finishes and saves the record.
+    ///
+    /// Only one `sync` of a Working copy runs at a time: a second is refused before it opens the
+    /// Store.
+    pub async fn sync(
+        folder: &FsPath,
+        area: Area,
+        flags: &StoreArgs,
+        stop: impl Future<Output = ()>,
+        report: impl FnMut(&SyncEvent) -> io::Result<()>,
+    ) -> Result<(), Failure> {
+        let (working_copy, _syncing, mut opened) =
+            WorkingCopy::open_or_create(folder, area, flags).await?;
+        working_copy.follow(&opened.store, &mut opened.feed, stop, report).await
+    }
+
+    /// Opens the Working copy that is `folder`, or makes `folder` a new one, for `sync`, as
+    /// [`WorkingCopy::sync`] says. Gives the lock `sync` holds for as long as it runs, and the
+    /// Store, opened with its Change feed before anything is reconciled.
+    async fn open_or_create(
+        folder: &FsPath,
+        area: Area,
+        flags: &StoreArgs,
+    ) -> Result<(WorkingCopy, SyncLock, Opened), Failure> {
+        flags.check_not_memory()?;
+        if WorkingCopy::exists(folder) {
+            let working_copy = WorkingCopy::open(folder)?;
+            working_copy.check_area(area)?;
+            let syncing = working_copy.lock_for_sync()?;
+            let opened = working_copy.open_store(flags).await?;
+            return Ok((working_copy, syncing, opened));
+        }
+        // Before the Store, which `--create` would otherwise make even for a folder that can't be a
+        // Working copy.
+        WorkingCopy::check_can_create(folder)?;
+        let (address, opened) = flags.open_with_address().await?;
+        let working_copy = WorkingCopy::create(folder, address, area)?;
+        let syncing = working_copy.lock_for_sync()?;
+        Ok((working_copy, syncing, opened))
+    }
+
     /// Fails unless `folder` can become a Working copy: it must be missing or empty. A `.tidings/`
     /// holding no record, as a `sync` that stopped while making the Working copy leaves, counts as
     /// empty. [`WorkingCopy::create`] checks this again, so this is only for failing before doing
     /// anything else, such as making a Store.
-    pub fn check_can_create(folder: &FsPath) -> Result<(), Failure> {
+    fn check_can_create(folder: &FsPath) -> Result<(), Failure> {
         if is_missing_empty_or_unfinished(folder)? {
             return Ok(());
         }
@@ -159,11 +203,7 @@ impl WorkingCopy {
 
     /// Makes `folder`, which must be missing or empty, a Working copy of `area` in `store`, with
     /// no Files yet, as [`WorkingCopy::check_can_create`] says.
-    pub fn create(
-        folder: &FsPath,
-        store: StoreAddress,
-        area: Area,
-    ) -> Result<WorkingCopy, Failure> {
+    fn create(folder: &FsPath, store: StoreAddress, area: Area) -> Result<WorkingCopy, Failure> {
         WorkingCopy::check_can_create(folder)?;
         fs::create_dir_all(folder.join(RECORD_DIRECTORY)).map_err(failed_at(folder))?;
         let working_copy = WorkingCopy { folder: folder.to_owned(), store, area };
@@ -177,7 +217,7 @@ impl WorkingCopy {
     }
 
     /// Whether `folder` is a Working copy: whether it has a record, of this version or another.
-    pub fn exists(folder: &FsPath) -> bool {
+    fn exists(folder: &FsPath) -> bool {
         record::is_record(&record_file(folder))
     }
 
@@ -207,7 +247,7 @@ impl WorkingCopy {
     }
 
     /// Fails unless the Working copy is of `area`.
-    pub fn check_area(&self, area: Area) -> Result<(), Failure> {
+    fn check_area(&self, area: Area) -> Result<(), Failure> {
         if area == self.area {
             return Ok(());
         }
@@ -219,31 +259,36 @@ impl WorkingCopy {
         )))
     }
 
-    /// Opens the Store the record names. Any Store flags given in `flags` must match it, and a
-    /// new Store is made only if `flags` has `--create`.
+    /// Opens the Store the record names. Any Store flags given in `flags` must match it, and
+    /// `--create` is refused: a Working copy's Store is never made anew, since reconciling against
+    /// an empty one would remove every unchanged file from the folder.
     pub async fn open_store(&self, flags: &StoreArgs) -> Result<Opened, Failure> {
         flags.check_matches(&self.store)?;
-        self.store.open(flags.create).await.map_err(|failure| {
-            let folder = self.folder.display();
-            failure.in_context(format!("can't open the Store of the Working copy {folder}"))
-        })
+        match self.store.open().await {
+            Ok(Some(opened)) => Ok(opened),
+            Ok(None) => Err(Failure::error(format!(
+                "the Store of the Working copy {} is missing at {}",
+                self.folder.display(),
+                self.store,
+            ))),
+            Err(failure) => Err(failure.in_context(format!(
+                "can't open the Store of the Working copy {}",
+                self.folder.display()
+            ))),
+        }
     }
 
-    /// Keeps the folder in step with the Store until `stop` finishes, giving each [`SyncEvent`] to
-    /// `report` as it happens. It reconciles every Path first, then the Paths of each batch of
-    /// Changes to the Area on `feed`, and every Path again on a Resync for the Area. `feed` must
-    /// have been taken when `store` was opened, so that nothing committed since is missed.
-    ///
-    /// Only one `sync` of a Working copy runs at a time. `stop` is acted on only between
-    /// reconciles, so each one finishes and saves the record.
-    pub async fn sync(
+    /// Keeps the folder in step with the Store until `stop` finishes, as [`WorkingCopy::sync`]
+    /// says. It reconciles every Path first, then the Paths of each batch of Changes to the Area
+    /// on `feed`, and every Path again on a Resync for the Area. `feed` must have been taken when
+    /// `store` was opened, so that nothing committed since is missed.
+    async fn follow(
         &self,
         store: &Store,
         feed: &mut ChangeFeed,
         stop: impl Future<Output = ()>,
         mut report: impl FnMut(&SyncEvent) -> io::Result<()>,
     ) -> Result<(), Failure> {
-        let _syncing = self.lock_for_sync()?;
         let mut stop = pin!(stop);
         let mut next = Paths::All;
         loop {
