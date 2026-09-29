@@ -22,7 +22,7 @@ use crate::failure::Failure;
 use crate::location::{Opened, StoreAddress, StoreArgs};
 use crate::output::area_name;
 use record::{Base, Divergence, Hash, Record};
-use scan::{IGNORE_FILE, Scan, is_record_directory};
+use scan::{Difference, IGNORE_FILE, Scan, is_record_directory};
 pub use scan::{LocalName, Unfit};
 
 /// The directory in a Working copy's folder that holds its record and locks, which is never a
@@ -78,14 +78,7 @@ pub enum SyncEvent {
     /// The Path changed both locally and in the Store since its Base, or the Store's version
     /// couldn't be applied because of what is in the folder, so it is Diverged: the local file and
     /// the Base stay as they were.
-    Diverged {
-        path: Path,
-        /// The file holding the Store's version, relative to the folder, or `None` if the Store
-        /// has no File there.
-        theirs_file: Option<PathBuf>,
-        /// What in the folder kept the Store's version from being applied, if anything.
-        blocked: Option<Blocked>,
-    },
+    Diverged(DivergedPath),
     /// A Diverged Path's local contents came to equal the Store's, or the Store's came back to its
     /// Base, so it is no longer Diverged.
     Resolved(Path),
@@ -112,12 +105,23 @@ impl SyncEvent {
             SyncEvent::Created(path)
             | SyncEvent::Updated(path)
             | SyncEvent::Removed(path)
-            | SyncEvent::Diverged { path, .. }
+            | SyncEvent::Diverged(DivergedPath { path, .. })
             | SyncEvent::Resolved(path)
             | SyncEvent::Error { path, .. } => Some(path),
             SyncEvent::Resync | SyncEvent::CaughtUp => None,
         }
     }
+}
+
+/// A Diverged Path, and where the Store's version of it is.
+#[derive(Debug)]
+pub struct DivergedPath {
+    pub path: Path,
+    /// The file holding the Store's version, relative to the folder, or `None` if the Store has no
+    /// File there.
+    pub theirs_file: Option<PathBuf>,
+    /// What in the folder kept the Store's version from being applied, if anything.
+    pub blocked: Option<Blocked>,
 }
 
 /// What `commit` committed: nothing, if there were no local changes.
@@ -155,8 +159,8 @@ pub struct StatusReport {
 pub enum PathStatus {
     /// A local change `commit` would commit.
     Changed(Path, LocalChange),
-    /// A Diverged Path, as a [`SyncEvent::Diverged`], which `commit` would refuse.
-    Diverged(SyncEvent),
+    /// A Diverged Path, which `commit` would refuse.
+    Diverged(DivergedPath),
     /// A file that can't become a File, which `commit` would refuse.
     Invalid(Unfit),
 }
@@ -166,7 +170,7 @@ impl PathStatus {
     fn name(&self) -> &str {
         match self {
             PathStatus::Changed(path, _) => path.as_str(),
-            PathStatus::Diverged(event) => event.path().map_or("", Path::as_str),
+            PathStatus::Diverged(diverged) => diverged.path.as_str(),
             PathStatus::Invalid(unfit) => unfit.name.as_str(),
         }
     }
@@ -654,7 +658,9 @@ impl WorkingCopy {
                 // written; it is the only event a Diverged Path can have.
                 (Some(_), event) => {
                     let blocked = match event {
-                        Some(SyncEvent::Diverged { blocked: Some(blocked), .. }) => {
+                        Some(SyncEvent::Diverged(DivergedPath {
+                            blocked: Some(blocked), ..
+                        })) => {
                             format!("{}; ", blocked.reason())
                         }
                         _ => String::new(),
@@ -884,7 +890,7 @@ impl WorkingCopy {
         let scan = scan::scan(&self.folder, &lock.record.bases)?;
         selection.check_each_names_something(&scan, &lock.record)?;
         refuse_invalid(&scan.invalid, &selection)?;
-        let (staging, changes) = self.stage(&scan, &lock.record.bases, &selection)?;
+        let (staging, changes) = self.stage(&scan, &selection)?;
         let files = scan.files;
         if changes.is_empty() {
             return Ok(CommitReport { changes: Vec::new(), pending: false, events: Vec::new() });
@@ -923,45 +929,49 @@ impl WorkingCopy {
         let syncing = self.is_syncing()?;
         let record = &lock.record;
         let scan = scan::scan(&self.folder, &record.bases)?;
-        let diverged = diverged(record, &Selection::All);
-        let is_diverged = |name: &str| record.divergences.keys().any(|path| path.as_str() == name);
-        let changes = scan.changes(&record.bases).into_iter();
-        let changes = changes.filter(|(path, _)| !record.divergences.contains_key(path));
-        let invalid = scan.invalid.into_iter().filter(|unfit| !is_diverged(unfit.name.as_str()));
+        let is_diverged = |path: &Path| record.divergences.contains_key(path);
+        let changes = scan.changes().into_iter().filter(|(path, _)| !is_diverged(path));
+        let changes = changes.map(|(path, difference)| (path.clone(), difference.local_change()));
+        let diverged = diverged_paths(record, &Selection::All);
+        let invalid = scan
+            .invalid
+            .iter()
+            .filter(|unfit| !unfit.name.path().is_some_and(|path| is_diverged(&path)));
         let mut paths: Vec<PathStatus> = changes
             .map(|(path, change)| PathStatus::Changed(path, change))
             .chain(diverged.into_iter().map(PathStatus::Diverged))
-            .chain(invalid.map(PathStatus::Invalid))
+            .chain(invalid.cloned().map(PathStatus::Invalid))
             .collect();
         paths.sort_by(|a, b| a.name().cmp(b.name()));
         Ok(StatusReport { paths, syncing })
     }
 
-    /// Stages each local change in `scan`, made with `bases`, that `selection` covers, as
-    /// [`WorkingCopy::commit`] says, giving the Staging and each local change in it.
+    /// Stages each local change in `scan` that `selection` covers, as [`WorkingCopy::commit`]
+    /// says, giving the Staging and each local change in it.
     fn stage(
         &self,
         scan: &Scan,
-        bases: &BTreeMap<Path, Base>,
         selection: &Selection,
     ) -> Result<(Staging, Vec<(Path, LocalChange)>), Failure> {
         let mut staging = Staging::new(self.area);
-        let changes: Vec<(Path, LocalChange)> = scan
-            .changes(bases)
-            .into_iter()
-            .filter(|(path, _)| selection.covers(path.as_str()))
-            .collect();
-        for (path, change) in &changes {
-            let unchanged_since = || Precondition::UnchangedSince(bases[path].revision);
-            let precondition = match change {
-                LocalChange::Added => Precondition::Absent,
-                LocalChange::Modified => unchanged_since(),
-                LocalChange::Deleted => {
-                    staging.delete_requiring(path, unchanged_since())?;
-                    continue;
+        let mut changes = Vec::new();
+        for (path, difference) in scan.changes() {
+            if !selection.covers(path.as_str()) {
+                continue;
+            }
+            let unchanged_since = |base: &Base| Precondition::UnchangedSince(base.revision);
+            match difference {
+                Difference::Added { contents } => {
+                    staging.write_requiring(path, contents, Precondition::Absent)?;
                 }
-            };
-            staging.write_requiring(path, scan.files[path].as_str(), precondition)?;
+                Difference::Modified { contents, base } => {
+                    staging.write_requiring(path, contents, unchanged_since(base))?;
+                }
+                Difference::Deleted { base } => {
+                    staging.delete_requiring(path, unchanged_since(base))?;
+                }
+            }
+            changes.push((path.clone(), difference.local_change()));
         }
         Ok((staging, changes))
     }
@@ -1191,24 +1201,24 @@ fn diverge(
         return None;
     }
     let theirs_file = store_file.map(|_| theirs_file(path));
-    Some(SyncEvent::Diverged { path: path.clone(), theirs_file, blocked })
+    Some(SyncEvent::Diverged(DivergedPath { path: path.clone(), theirs_file, blocked }))
 }
 
 /// Fails, as a Conflict does, if `selection` covers any Path that is Diverged in `record`, naming
 /// each, since committing it would overwrite the Store's version the person hasn't merged.
 fn refuse_diverged(record: &Record, selection: &Selection) -> Result<(), Failure> {
-    let diverged = diverged(record, selection);
+    let diverged = diverged_paths(record, selection);
     if diverged.is_empty() { Ok(()) } else { Err(Failure::diverged(diverged)) }
 }
 
-/// Each Path in `record` that is Diverged and that `selection` covers, as a
-/// [`SyncEvent::Diverged`] naming its `theirs` file, or saying the Store has no File there.
-fn diverged(record: &Record, selection: &Selection) -> Vec<SyncEvent> {
+/// Each Path in `record` that is Diverged and that `selection` covers, naming its `theirs` file,
+/// or saying the Store has no File there.
+fn diverged_paths(record: &Record, selection: &Selection) -> Vec<DivergedPath> {
     record
         .divergences
         .iter()
         .filter(|(path, _)| selection.covers(path.as_str()))
-        .map(|(path, divergence)| SyncEvent::Diverged {
+        .map(|(path, divergence)| DivergedPath {
             path: path.clone(),
             theirs_file: divergence.theirs_revision.map(|_| theirs_file(path)),
             blocked: None,

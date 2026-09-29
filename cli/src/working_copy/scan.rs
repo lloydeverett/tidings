@@ -5,7 +5,7 @@
 //! one: a file in an ignored directory is ignored, whatever patterns later re-include it. It only
 //! applies to files with no Base: anything the Store holds is always synced and tracked.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, FileType};
@@ -37,9 +37,10 @@ Thumbs.db
 .#*
 ";
 
-/// What scanning the folder found, outside `.tidings/`.
-#[derive(Default)]
-pub(super) struct Scan {
+/// What scanning the folder found, outside `.tidings/`, against the Bases it was made with.
+pub(super) struct Scan<'b> {
+    /// The Base of each Path, which the scan was made with.
+    bases: &'b BTreeMap<Path, Base>,
     /// Each file that can become a File, with its contents.
     pub(super) files: BTreeMap<Path, String>,
     /// Each file that can't become a File, in order of name.
@@ -48,25 +49,51 @@ pub(super) struct Scan {
     pub(super) ignored: Vec<LocalName>,
 }
 
-impl Scan {
-    /// How each Path differs from its Base in `bases`, which the scan was made with, in order:
-    /// each file that is *added* (it has no Base) or *modified* (its contents differ from its
-    /// Base's), then each Path that is *deleted* (it has a Base but no file, not even one that
-    /// can't become a File). Unchanged Paths aren't given. This is what `commit` commits and
-    /// `status` lists.
-    pub(super) fn changes(&self, bases: &BTreeMap<Path, Base>) -> Vec<(Path, LocalChange)> {
-        let changed = self.files.iter().filter_map(|(path, contents)| match bases.get(path) {
-            None => Some((path.clone(), LocalChange::Added)),
-            Some(base) if Hash::of(contents) != base.hash => {
-                Some((path.clone(), LocalChange::Modified))
-            }
-            Some(_) => None,
+impl Scan<'_> {
+    /// How each Path differs from its Base, in order: each file that is *added* (it has no Base)
+    /// or *modified* (its contents differ from its Base's), then each Path that is *deleted* (it
+    /// has a Base but no file, not even one that can't become a File). Unchanged Paths aren't
+    /// given. This is what `commit` commits and `status` lists.
+    pub(super) fn changes(&self) -> Vec<(&Path, Difference<'_>)> {
+        let changed = self.files.iter().filter_map(|(path, contents)| {
+            let difference = match self.bases.get(path) {
+                None => Difference::Added { contents },
+                Some(base) if Hash::of(contents) != base.hash => {
+                    Difference::Modified { contents, base }
+                }
+                Some(_) => return None,
+            };
+            Some((path, difference))
         });
-        let deleted = bases.keys().filter(|path| {
-            !self.files.contains_key(*path)
-                && !self.invalid.iter().any(|unfit| unfit.name.as_str() == path.as_str())
-        });
-        changed.chain(deleted.map(|path| (path.clone(), LocalChange::Deleted))).collect()
+        let invalid: BTreeSet<Path> =
+            self.invalid.iter().filter_map(|unfit| unfit.name.path()).collect();
+        let deleted = self
+            .bases
+            .iter()
+            .filter(|(path, _)| !self.files.contains_key(*path) && !invalid.contains(*path))
+            .map(|(path, base)| (path, Difference::Deleted { base }));
+        changed.chain(deleted).collect()
+    }
+}
+
+/// How a Path differs from its Base, with what committing it takes.
+pub(super) enum Difference<'s> {
+    /// A file with no Base, holding `contents`.
+    Added { contents: &'s str },
+    /// A file holding `contents`, which differ from its Base's.
+    Modified { contents: &'s str, base: &'s Base },
+    /// A Path with a Base, but no file.
+    Deleted { base: &'s Base },
+}
+
+impl Difference<'_> {
+    /// Which local change this is.
+    pub(super) fn local_change(&self) -> LocalChange {
+        match self {
+            Difference::Added { .. } => LocalChange::Added,
+            Difference::Modified { .. } => LocalChange::Modified,
+            Difference::Deleted { .. } => LocalChange::Deleted,
+        }
     }
 }
 
@@ -101,6 +128,11 @@ impl LocalName {
     /// The name as text.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The Path the name spells, or `None` if it isn't a valid one.
+    pub(super) fn path(&self) -> Option<Path> {
+        Path::new(self.0.as_str()).ok()
     }
 }
 
@@ -141,9 +173,13 @@ pub(super) fn create_ignore_file(folder: &FsPath) -> Result<(), Failure> {
 /// Every file in `folder`, outside `.tidings/`: with its contents, if it can become a File, or
 /// else why not. A file with no Base in `bases` that the ignore file matches is only named, as
 /// ignored. Empty directories hold no files, so they are never found.
-pub(super) fn scan(folder: &FsPath, bases: &BTreeMap<Path, Base>) -> Result<Scan, Failure> {
+pub(super) fn scan<'b>(
+    folder: &FsPath,
+    bases: &'b BTreeMap<Path, Base>,
+) -> Result<Scan<'b>, Failure> {
     let ignore = read_ignore_file(folder)?;
-    let mut scanner = Scanner { folder, bases, ignore, scan: Scan::default() };
+    let scan = Scan { bases, files: BTreeMap::new(), invalid: Vec::new(), ignored: Vec::new() };
+    let mut scanner = Scanner { folder, ignore, scan };
     scanner.scan_directory(FsPath::new(""), false)?;
     let mut scan = scanner.scan;
     scan.invalid.sort_unstable_by(|a, b| a.name.cmp(&b.name));
@@ -195,18 +231,16 @@ enum AsPath {
 }
 
 /// Scans one folder, gathering what it finds.
-struct Scanner<'a> {
+struct Scanner<'f, 'b> {
     /// The folder of the Working copy being scanned.
-    folder: &'a FsPath,
-    /// The Base of each Path, which the ignore file never applies to.
-    bases: &'a BTreeMap<Path, Base>,
-    /// The ignore file, as a matcher.
+    folder: &'f FsPath,
+    /// The ignore file, as a matcher, which never applies to a Path with a Base.
     ignore: Gitignore,
-    /// What it has found so far.
-    scan: Scan,
+    /// What it has found so far, with the Bases it is made with.
+    scan: Scan<'b>,
 }
 
-impl Scanner<'_> {
+impl Scanner<'_, '_> {
     /// Adds every file under `directory`, relative to the folder, to the scan, as [`scan`] says.
     /// `ignored` says whether the ignore file leaves out `directory` or one it is in, which leaves
     /// out everything under it, as in git.
@@ -239,7 +273,8 @@ impl Scanner<'_> {
         ignored: bool,
     ) -> Result<(), Failure> {
         let as_path = as_path(relative, &name)?;
-        let has_base = matches!(&as_path, AsPath::Valid(path) if self.bases.contains_key(path));
+        let has_base =
+            matches!(&as_path, AsPath::Valid(path) if self.scan.bases.contains_key(path));
         if ignored && !has_base {
             self.scan.ignored.push(name);
             return Ok(());

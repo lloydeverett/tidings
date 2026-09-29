@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use tidings::Area;
 
 use crate::output::{EventParts, Subject, area_name};
-use crate::working_copy::{Reconciled, SyncEvent, Unfit};
+use crate::working_copy::{DivergedPath, Reconciled, Unfit};
 
 /// A command that failed: what to tell the person, and the exit code.
 #[derive(Debug)]
@@ -22,8 +22,8 @@ pub struct Failure {
 /// What was found at, or became of, each Path that stopped a Working copy's commit.
 #[derive(Debug)]
 enum Outcomes {
-    /// It was refused because these Paths are Diverged, each a [`SyncEvent::Diverged`].
-    Diverged(Vec<SyncEvent>),
+    /// It was refused because these Paths are Diverged.
+    Diverged(Vec<DivergedPath>),
     /// A Conflict, after which each Path it named was reconciled as `sync` would.
     Conflict(Vec<Reconciled>),
     /// It was refused because these files can't become Files.
@@ -54,9 +54,9 @@ impl Failure {
         Failure { kind: FailureKind::Conflict, message: message.into(), outcomes }
     }
 
-    /// A Working copy's commit was refused because the Paths in `diverged`, each a
-    /// [`SyncEvent::Diverged`], are Diverged, which exits with 3.
-    pub fn diverged(diverged: Vec<SyncEvent>) -> Failure {
+    /// A Working copy's commit was refused because the Paths in `diverged` are Diverged, which
+    /// exits with 3.
+    pub fn diverged(diverged: Vec<DivergedPath>) -> Failure {
         Failure::conflict(
             "can't commit Diverged Paths: merge each and `tidings resolve` it, or `tidings \
              discard` it, or name only other paths to commit",
@@ -144,7 +144,9 @@ impl Failure {
     fn outcome_parts(&self) -> Vec<EventParts<'_>> {
         match &self.outcomes {
             None => Vec::new(),
-            Some(Outcomes::Diverged(diverged)) => diverged.iter().map(EventParts::of).collect(),
+            Some(Outcomes::Diverged(diverged)) => {
+                diverged.iter().map(EventParts::diverged).collect()
+            }
             Some(Outcomes::Conflict(reconciled)) => {
                 reconciled.iter().map(reconciled_parts).collect()
             }

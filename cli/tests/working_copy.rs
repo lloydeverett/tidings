@@ -77,7 +77,7 @@ fn edits_additions_and_deletions_are_committed_together() {
         fs::write(folder.path().join("keys/vim.toml"), "mode = \"normal\"\n").unwrap();
         fs::remove_file(folder.path().join("themes/dark.toml")).unwrap();
         // No Store flags: the Working copy knows its Store.
-        let run = commit_in(folder.path(), &[]).expect_success();
+        let run = run_in("commit", folder.path(), &[]).expect_success();
         let lines: Vec<&str> = run.stdout.lines().collect();
         assert_eq!(
             lines,
@@ -89,7 +89,7 @@ fn edits_additions_and_deletions_are_committed_together() {
         assert_eq!(location.read("config", "keys/vim.toml"), "mode = \"normal\"\n");
         location.run(&["store", "read", "config", "themes/dark.toml"]).expect_code(2);
 
-        let run = commit_in(folder.path(), &[]).expect_success();
+        let run = run_in("commit", folder.path(), &[]).expect_success();
         assert!(run.stdout.is_empty() && run.stderr.contains("nothing to commit"), "{run:?}");
     }
 }
@@ -103,7 +103,7 @@ fn committed_revisions_become_the_bases() {
 
         fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
         fs::write(folder.path().join("new.toml"), "new\n").unwrap();
-        let run = commit_in(folder.path(), &["--json"]).expect_success();
+        let run = run_in("commit", folder.path(), &["--json"]).expect_success();
         let json: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
         let committed = json["committed"].as_array().unwrap();
         assert_eq!(committed.len(), 2, "{json}");
@@ -117,7 +117,7 @@ fn committed_revisions_become_the_bases() {
         // Committing again from the new Bases is no Conflict.
         fs::write(folder.path().join("app.toml"), "a = 3\n").unwrap();
         fs::remove_file(folder.path().join("new.toml")).unwrap();
-        let run = commit_in(folder.path(), &["--json"]).expect_success();
+        let run = run_in("commit", folder.path(), &["--json"]).expect_success();
         let json: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
         assert_eq!(json["committed"][1]["change"], "deleted", "{json}");
         assert!(json["committed"][1]["revision"].is_null(), "{json}");
@@ -152,7 +152,7 @@ fn a_conflict_commits_nothing_and_marks_each_conflicting_path_diverged_as_sync_w
     let same_message = "the Store has the same contents, which are now its Base";
     for backend in BACKENDS {
         let (_location, folder) = conflicting(backend);
-        let run = commit_in(folder.path(), &[]).expect_code(3);
+        let run = run_in("commit", folder.path(), &[]).expect_code(3);
         let lines: Vec<&str> = run.stderr.lines().collect();
         let theirs_in = |path: &str| format!("the Store's version is in .tidings/theirs/{path}");
         let diverged = |path: &str| format!("  diverged {path}: {}", theirs_in(path));
@@ -172,7 +172,7 @@ fn a_conflict_commits_nothing_and_marks_each_conflicting_path_diverged_as_sync_w
         );
 
         let (location, folder) = conflicting(backend);
-        let run = commit_in(folder.path(), &["--json"]).expect_code(3);
+        let run = run_in("commit", folder.path(), &["--json"]).expect_code(3);
         let failure: serde_json::Value = serde_json::from_str(&run.stderr).unwrap();
         let theirs_in = |path: &str| format!("the Store's version is in .tidings/theirs/{path}");
         let diverged = |path: &str| {
@@ -223,7 +223,7 @@ fn a_conflict_commits_nothing_and_marks_each_conflicting_path_diverged_as_sync_w
         assert_eq!(events.len(), 1, "{backend}: {events:?}");
         sync.stop();
         // `same.toml` took the Store's version as its Base, so it isn't a change.
-        let run = commit_in(folder.path(), &["same.toml"]).expect_success();
+        let run = run_in("commit", folder.path(), &["same.toml"]).expect_success();
         assert!(run.stderr.contains("nothing to commit"), "{backend}: {run:?}");
     }
 }
@@ -290,14 +290,14 @@ fn a_conflict_whose_theirs_cant_be_written_is_diverged_all_the_same() {
         location.write("config", "app.toml", "theirs\n");
         fs::write(folder.path().join("app.toml"), "mine\n").unwrap();
 
-        let run = commit_in(folder.path(), &[]).expect_code(3);
+        let run = run_in("commit", folder.path(), &[]).expect_code(3);
         let error = "  error app.toml: Diverged, but can't write .tidings/theirs/app.toml: \
                      theirs is a symlink in .tidings";
         assert!(run.stderr.lines().any(|line| line == error), "{backend}: {run:?}");
         assert!(fs::read_dir(outside.path()).unwrap().next().is_none(), "{backend}");
 
         // Recorded Diverged, so the next commit is refused up front.
-        let run = commit_in(folder.path(), &[]).expect_code(3);
+        let run = run_in("commit", folder.path(), &[]).expect_code(3);
         assert!(run.stderr.contains("Diverged"), "{backend}: {run:?}");
     }
 }
@@ -342,7 +342,7 @@ fn a_full_commit_while_a_path_is_diverged_is_refused() {
     with_a_diverged_path(diverge, |label, location, folder| {
         let message = "can't commit Diverged Paths: merge each and `tidings resolve` it, or \
                        `tidings discard` it, or name only other paths to commit";
-        let run = commit_in(folder, &[]).expect_code(3);
+        let run = run_in("commit", folder, &[]).expect_code(3);
         let lines: Vec<&str> = run.stderr.lines().collect();
         assert_eq!(
             lines,
@@ -352,7 +352,7 @@ fn a_full_commit_while_a_path_is_diverged_is_refused() {
             ],
             "{label}: {run:?}"
         );
-        let run = commit_in(folder, &["--json"]).expect_code(3);
+        let run = run_in("commit", folder, &["--json"]).expect_code(3);
         let failure: serde_json::Value = serde_json::from_str(&run.stderr).unwrap();
         let expected = serde_json::json!({
             "failure": "diverged",
@@ -381,7 +381,7 @@ fn naming_a_diverged_path_is_refused_and_naming_only_others_goes_ahead() {
     with_a_diverged_path(diverge, |label, location, folder| {
         // A directory holding a Diverged Path names it too.
         for named in [&["--json", "themes/dark.toml"][..], &["--json", "app.toml", "themes"]] {
-            let run = commit_in(folder, named).expect_code(3);
+            let run = run_in("commit", folder, named).expect_code(3);
             let failure: serde_json::Value = serde_json::from_str(&run.stderr).unwrap();
             assert_eq!(failure["failure"], "diverged", "{label}: {run:?}");
             let refused = failure["paths"].as_array().unwrap();
@@ -389,7 +389,7 @@ fn naming_a_diverged_path_is_refused_and_naming_only_others_goes_ahead() {
             assert_eq!(location.read("config", "app.toml"), "a = 1\n", "{label}");
         }
 
-        let run = commit_in(folder, &["app.toml", "themes/light.toml"]).expect_success();
+        let run = run_in("commit", folder, &["app.toml", "themes/light.toml"]).expect_success();
         assert_eq!(run.stdout, "modified app.toml\nadded themes/light.toml\n", "{label}");
         assert_eq!(location.read("config", "app.toml"), "a = 2\n", "{label}");
         assert_eq!(location.read("config", "themes/light.toml"), "light\n", "{label}");
@@ -412,14 +412,14 @@ fn commit_commits_only_the_paths_named_relative_to_the_current_directory() {
         let themes = folder.path().join("themes");
 
         // A deleted file can be named too.
-        let run = commit_in(&themes, &["dark.toml", "light.toml"]).expect_success();
+        let run = run_in("commit", &themes, &["dark.toml", "light.toml"]).expect_success();
         assert_eq!(run.stdout, "modified themes/dark.toml\ndeleted themes/light.toml\n");
         assert_eq!(location.read("config", "app.toml"), "a = 1\n", "{backend}");
 
         // A directory means everything under it, with or without a trailing slash.
-        let run = commit_in(&themes, &["extra/"]).expect_success();
+        let run = run_in("commit", &themes, &["extra/"]).expect_success();
         assert_eq!(run.stdout, "added themes/extra/red.toml\n", "{backend}");
-        let run = commit_in(&themes, &["../app.toml", "."]).expect_success();
+        let run = run_in("commit", &themes, &["../app.toml", "."]).expect_success();
         assert_eq!(run.stdout, "modified app.toml\n", "{backend}");
         location.run(&["store", "read", "config", "notes.toml"]).expect_code(2);
 
@@ -431,7 +431,7 @@ fn commit_commits_only_the_paths_named_relative_to_the_current_directory() {
             std::os::unix::fs::symlink(folder.path(), &link).unwrap();
             let notes = link.join("notes.toml");
             let args = ["-C", folder.path().to_str().unwrap(), notes.to_str().unwrap()];
-            let run = commit_in(links.path(), &args).expect_success();
+            let run = run_in("commit", links.path(), &args).expect_success();
             assert_eq!(run.stdout, "added notes.toml\n", "{backend}");
         }
     }
@@ -457,7 +457,7 @@ fn a_path_outside_the_working_copy_or_in_its_record_is_refused() {
             ("missing.toml", "no such file"),
         ];
         for (named, why) in refusals {
-            let run = commit_in(folder.path(), &["app.toml", named]).expect_code(1);
+            let run = run_in("commit", folder.path(), &["app.toml", named]).expect_code(1);
             assert!(run.stderr.contains(named) && run.stderr.contains(why), "{backend}: {run:?}");
         }
         // Nothing was committed.
@@ -481,7 +481,7 @@ fn a_pending_commit_updates_the_bases_says_so_and_succeeds() {
     // `commit` in the folder with `args`, while `locked` can't be changed.
     let commit_while_locked = |args: &[&str]| {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
-        let run = commit_in(folder.path(), args);
+        let run = run_in("commit", folder.path(), args);
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         run
     };
@@ -503,7 +503,7 @@ fn a_pending_commit_updates_the_bases_says_so_and_succeeds() {
 
     // The Bases were updated as on success, so nothing is left to commit, and `sync` reports
     // nothing.
-    let run = commit_in(folder.path(), &[]).expect_success();
+    let run = run_in("commit", folder.path(), &[]).expect_success();
     assert!(run.stderr.contains("nothing to commit"), "{run:?}");
     let mut sync = Sync::start(&location, "config", folder.path());
     let events = sync.wait_for("caught-up");
@@ -538,7 +538,7 @@ fn sync_finishes_a_working_copy_a_crash_left_without_a_record() {
 
         assert_eq!(fs::read_to_string(folder.path().join("app.toml")).unwrap(), "a = 1\n");
         fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
-        commit_in(folder.path(), &[]).expect_success();
+        run_in("commit", folder.path(), &[]).expect_success();
         assert_eq!(location.read("config", "app.toml"), "a = 2\n");
     }
 }
@@ -606,7 +606,7 @@ fn commit_works_while_sync_runs() {
         let mut sync = Sync::start(&location, "config", folder.path());
         sync.wait_for("caught-up");
         fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
-        commit_in(folder.path(), &[]).expect_success();
+        run_in("commit", folder.path(), &[]).expect_success();
         sync.stop();
         assert_eq!(location.read("config", "app.toml"), "a = 2\n");
     }
@@ -620,7 +620,7 @@ fn commit_finds_the_working_copy_from_a_subdirectory() {
         synced(&location, "config", folder.path());
 
         fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
-        commit_in(&folder.path().join("themes"), &[]).expect_success();
+        run_in("commit", &folder.path().join("themes"), &[]).expect_success();
         assert_eq!(location.read("config", "app.toml"), "a = 2\n");
     }
 }
@@ -635,7 +635,7 @@ fn commit_takes_the_working_copy_from_dash_c() {
         fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
         let elsewhere = TempDir::new().unwrap();
         let folder_arg = folder.path().to_str().unwrap();
-        commit_in(elsewhere.path(), &["-C", folder_arg]).expect_success();
+        run_in("commit", elsewhere.path(), &["-C", folder_arg]).expect_success();
         assert_eq!(location.read("config", "app.toml"), "a = 2\n");
     }
 }
@@ -645,17 +645,17 @@ fn commit_outside_a_working_copy_fails() {
     let elsewhere = TempDir::new().unwrap();
     // A `.tidings/` directory alone, as a filesystem Area has, isn't a Working copy.
     fs::create_dir(elsewhere.path().join(".tidings")).unwrap();
-    let run = commit_in(elsewhere.path(), &[]).expect_code(1);
+    let run = run_in("commit", elsewhere.path(), &[]).expect_code(1);
     assert!(run.stderr.contains("sync") && run.stderr.contains("-C"), "{run:?}");
 
     let folder = elsewhere.path().to_str().unwrap();
-    commit_in(elsewhere.path(), &["-C", folder]).expect_code(1);
+    run_in("commit", elsewhere.path(), &["-C", folder]).expect_code(1);
 }
 
-/// `tidings commit <args>`, with no Store flags, run in `directory`.
-fn commit_in(directory: &Path, args: &[&str]) -> common::Run {
+/// `tidings <subcommand> <args>`, with no Store flags, run in `directory`.
+fn run_in(subcommand: &str, directory: &Path, args: &[&str]) -> common::Run {
     let mut command = tidings();
-    command.arg("commit").args(args).current_dir(directory);
+    command.arg(subcommand).args(args).current_dir(directory);
     common::run(command, "")
 }
 
@@ -898,7 +898,7 @@ fn the_same_change_on_both_sides_takes_the_stores_version_as_the_base_silently()
         sync.stop();
 
         // Every Path took the Store's version as its Base, so nothing is a change.
-        let run = commit_in(folder.path(), &[]).expect_success();
+        let run = run_in("commit", folder.path(), &[]).expect_success();
         assert!(run.stderr.contains("nothing to commit"), "{backend}: {run:?}");
         assert!(!theirs(folder.path(), "app.toml").exists(), "{backend}");
     }
@@ -963,7 +963,7 @@ fn a_divergence_clears_once_the_local_file_equals_the_stores() {
         let left = fs::read_dir(folder.path().join(".tidings/theirs")).unwrap().count();
         assert_eq!(left, 0, "{backend}");
 
-        let run = commit_in(folder.path(), &[]).expect_success();
+        let run = run_in("commit", folder.path(), &[]).expect_success();
         assert!(run.stderr.contains("nothing to commit"), "{backend}: {run:?}");
     }
 }
@@ -1056,7 +1056,7 @@ fn sync_doesnt_report_the_persons_own_commit_back() {
         fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
         fs::write(folder.path().join("added.toml"), "added\n").unwrap();
         fs::remove_file(folder.path().join("themes/dark.toml")).unwrap();
-        commit_in(folder.path(), &[]).expect_success();
+        run_in("commit", folder.path(), &[]).expect_success();
         let events = sync.wait_for("caught-up");
         assert_eq!(events.len(), 1, "{backend}: {events:?}");
         sync.stop();
@@ -1106,7 +1106,7 @@ fn ctrl_c_during_a_reconcile_lets_it_finish() {
         // Every File was written, and the record saved, so nothing is an added file.
         let files = fs::read_dir(folder.path()).unwrap().count();
         assert_eq!(files, 301, "{backend}");
-        let run = commit_in(folder.path(), &[]).expect_success();
+        let run = run_in("commit", folder.path(), &[]).expect_success();
         assert!(run.stderr.contains("nothing to commit"), "{backend}: {run:?}");
     }
 }
@@ -1180,7 +1180,7 @@ fn a_path_blocked_by_a_local_file_is_diverged_and_the_rest_still_applied() {
         fs::remove_file(folder.path().join("q")).unwrap();
         synced(&location, "config", folder.path());
         assert_eq!(fs::read_to_string(folder.path().join("q/r")).unwrap(), "r", "{backend}");
-        let run = commit_in(folder.path(), &[]).expect_success();
+        let run = run_in("commit", folder.path(), &[]).expect_success();
         assert!(run.stderr.contains("nothing to commit"), "{backend}: {run:?}");
     }
 }
@@ -1209,7 +1209,7 @@ fn a_removal_under_a_local_file_needs_nothing_applied_so_takes_the_base_silently
         assert_eq!(fs::read_to_string(folder.path().join("q")).unwrap(), "mine\n", "{backend}");
 
         fs::remove_file(folder.path().join("q")).unwrap();
-        let run = commit_in(folder.path(), &[]).expect_success();
+        let run = run_in("commit", folder.path(), &[]).expect_success();
         assert!(run.stderr.contains("nothing to commit"), "{backend}: {run:?}");
     }
 }
@@ -1276,7 +1276,7 @@ fn a_theirs_that_cant_be_written_is_an_error_and_sync_carries_on() {
         sync.stop();
         let written = fs::read_to_string(theirs(folder.path(), "app.toml")).unwrap();
         assert_eq!(written, "theirs\n", "{backend}");
-        let run = commit_in(folder.path(), &[]).expect_code(3);
+        let run = run_in("commit", folder.path(), &[]).expect_code(3);
         assert!(run.stderr.contains("app.toml"), "{backend}: {run:?}");
     }
 }
@@ -1385,7 +1385,7 @@ fn a_theirs_that_cant_be_removed_is_an_error_and_sync_carries_on() {
         let events = sync.wait_for("caught-up");
         assert_eq!(events.len(), 1, "{backend}: {events:?}");
         sync.stop();
-        let run = commit_in(folder.path(), &[]).expect_code(3);
+        let run = run_in("commit", folder.path(), &[]).expect_code(3);
         assert!(run.stderr.contains("themes/dark.toml"), "{backend}: {run:?}");
         assert!(!run.stderr.contains("app.toml"), "{backend}: {run:?}");
     }
@@ -1444,7 +1444,7 @@ fn a_divergence_clears_once_the_store_is_back_at_the_base() {
         assert_eq!(fs::read_to_string(folder.path().join("app.toml")).unwrap(), "mine\n");
         assert!(!theirs(folder.path(), "n").exists(), "{backend}");
         assert!(!theirs(folder.path(), "app.toml").exists(), "{backend}");
-        let run = commit_in(folder.path(), &[]).expect_success();
+        let run = run_in("commit", folder.path(), &[]).expect_success();
         assert_eq!(run.stdout, "modified app.toml\nadded n\n", "{backend}: {run:?}");
     }
 }
@@ -1572,13 +1572,13 @@ fn resuming_catches_up_on_what_the_store_did_meanwhile() {
             sync.stop();
 
             // The local edit, against its old Base, is Diverged, so committing it is refused.
-            let run = commit_in(folder.path(), &[]).expect_code(3);
+            let run = run_in("commit", folder.path(), &[]).expect_code(3);
             assert!(run.stderr.contains("kept.toml"), "{label}: {run:?}");
             // With it undone, `sync` takes the Store's version, and nothing is a change:
             // `same.toml` has its Base.
             fs::write(folder.path().join("kept.toml"), "kept\n").unwrap();
             synced(&location, "config", folder.path());
-            let run = commit_in(folder.path(), &[]).expect_success();
+            let run = run_in("commit", folder.path(), &[]).expect_success();
             assert!(run.stderr.contains("nothing to commit"), "{label}: {run:?}");
         }
     }
@@ -1721,7 +1721,7 @@ fn a_working_copy_keeps_working_after_its_folder_is_moved() {
         fs::rename(&folder, &moved).unwrap();
 
         fs::write(moved.join("app.toml"), "a = 2\n").unwrap();
-        commit_in(&moved, &[]).expect_success();
+        run_in("commit", &moved, &[]).expect_success();
         assert_eq!(location.read("config", "app.toml"), "a = 2\n", "{backend}");
 
         location.write("config", "new.toml", "new\n");
@@ -1801,7 +1801,7 @@ fn two_working_copies_of_one_area_both_follow_it() {
 
         // A commit from one reaches the other as a Change from the Store.
         fs::write(first.path().join("app.toml"), "a = 2\n").unwrap();
-        commit_in(first.path(), &[]).expect_success();
+        run_in("commit", first.path(), &[]).expect_success();
         let [first_sync, mut second_sync] = syncs;
         let events = second_sync.wait_for("caught-up");
         assert_eq!(paths(&events, "updated"), ["app.toml"], "{backend}: {events:?}");
@@ -1831,7 +1831,7 @@ fn a_new_working_copy_ignores_editor_and_os_leftovers() {
         fs::write(folder.path().join("themes/.DS_Store"), [0]).unwrap();
         fs::write(folder.path().join("Thumbs.db"), "").unwrap();
         fs::write(folder.path().join(".#app.toml"), "").unwrap();
-        let run = commit_in(folder.path(), &[]).expect_success();
+        let run = run_in("commit", folder.path(), &[]).expect_success();
         assert_eq!(run.stdout, "modified app.toml\n", "{backend}: {run:?}");
         assert_eq!(location.read("config", "app.toml"), "a = 2\n", "{backend}");
         location.run(&["store", "read", "config", "app.toml~"]).expect_code(2);
@@ -1845,14 +1845,14 @@ fn removing_a_pattern_from_the_ignore_file_lets_a_matching_file_be_committed() {
         let folder = TempDir::new().unwrap();
         synced(&location, "config", folder.path());
         fs::write(folder.path().join(".DS_Store"), "mine\n").unwrap();
-        let run = commit_in(folder.path(), &[]).expect_success();
+        let run = run_in("commit", folder.path(), &[]).expect_success();
         assert!(run.stderr.contains("nothing to commit"), "{backend}: {run:?}");
 
         // Each command reads the ignore file afresh.
         let ignore = folder.path().join(".tidings/ignore");
         let without = fs::read_to_string(&ignore).unwrap().replace(".DS_Store\n", "");
         fs::write(&ignore, without).unwrap();
-        let run = commit_in(folder.path(), &[]).expect_success();
+        let run = run_in("commit", folder.path(), &[]).expect_success();
         assert_eq!(run.stdout, "added .DS_Store\n", "{backend}: {run:?}");
         assert_eq!(location.read("config", ".DS_Store"), "mine\n", "{backend}");
     }
@@ -1877,7 +1877,7 @@ fn a_store_file_matching_the_ignore_file_is_synced_and_its_edits_committed() {
         // Having a Base, they are tracked like any other File.
         fs::write(folder.path().join("notes.txt~"), "mine\n").unwrap();
         fs::remove_file(folder.path().join("4913")).unwrap();
-        let run = commit_in(folder.path(), &[]).expect_success();
+        let run = run_in("commit", folder.path(), &[]).expect_success();
         assert_eq!(run.stdout, "modified notes.txt~\ndeleted 4913\n", "{backend}: {run:?}");
         assert_eq!(location.read("config", "notes.txt~"), "mine\n", "{backend}");
         location.run(&["store", "read", "config", "4913"]).expect_code(2);
@@ -1899,7 +1899,7 @@ fn a_file_that_cant_be_a_file_refuses_the_commit_until_it_is_ignored() {
         let pipe = folder.path().join("themes/pipe");
         assert!(std::process::Command::new("mkfifo").arg(&pipe).status().unwrap().success());
 
-        let run = commit_in(folder.path(), &[]).expect_code(1);
+        let run = run_in("commit", folder.path(), &[]).expect_code(1);
         let listed: Vec<&str> = run.stderr.lines().skip(1).map(str::trim).collect();
         assert_eq!(
             listed,
@@ -1915,7 +1915,7 @@ fn a_file_that_cant_be_a_file_refuses_the_commit_until_it_is_ignored() {
         assert_eq!(location.read("config", "app.toml"), "a = 1\n", "{backend}");
 
         // With `--json`, the same as data.
-        let run = commit_in(folder.path(), &["--json", "themes"]).expect_code(1);
+        let run = run_in("commit", folder.path(), &["--json", "themes"]).expect_code(1);
         let json: serde_json::Value = serde_json::from_str(&run.stderr).unwrap();
         assert_eq!(json["failure"], "invalid", "{backend}: {json}");
         let names: Vec<&str> =
@@ -1923,7 +1923,7 @@ fn a_file_that_cant_be_a_file_refuses_the_commit_until_it_is_ignored() {
         assert_eq!(names, ["themes/logo.png", "themes/pipe"], "{backend}: {json}");
 
         // Only a file that would be committed refuses it.
-        let run = commit_in(folder.path(), &["app.toml"]).expect_success();
+        let run = run_in("commit", folder.path(), &["app.toml"]).expect_success();
         assert_eq!(run.stdout, "modified app.toml\n", "{backend}: {run:?}");
 
         // Ignoring them lets the commit go ahead.
@@ -1931,7 +1931,7 @@ fn a_file_that_cant_be_a_file_refuses_the_commit_until_it_is_ignored() {
         let patterns = "what?.toml\nlink.toml\n*.png\nthemes/pipe\n";
         fs::write(&ignore, fs::read_to_string(&ignore).unwrap() + patterns).unwrap();
         fs::write(folder.path().join("keys.toml"), "k\n").unwrap();
-        let run = commit_in(folder.path(), &[]).expect_success();
+        let run = run_in("commit", folder.path(), &[]).expect_success();
         assert_eq!(run.stdout, "added keys.toml\n", "{backend}: {run:?}");
     }
 }
@@ -1951,15 +1951,15 @@ fn a_tracked_path_replaced_by_a_symlink_is_invalid_not_deleted() {
         let ignore = folder.path().join(".tidings/ignore");
         fs::write(&ignore, fs::read_to_string(&ignore).unwrap() + "*.toml\n").unwrap();
 
-        let run = commit_in(folder.path(), &["themes/dark.toml"]).expect_code(1);
+        let run = run_in("commit", folder.path(), &["themes/dark.toml"]).expect_code(1);
         assert!(
             run.stderr.contains("invalid themes/dark.toml: is a symlink"),
             "{backend}: {run:?}"
         );
-        commit_in(folder.path(), &[]).expect_code(1);
+        run_in("commit", folder.path(), &[]).expect_code(1);
         assert_eq!(location.read("config", "themes/dark.toml"), "bg = \"black\"\n", "{backend}");
 
-        let run = commit_in(folder.path(), &["app.toml"]).expect_success();
+        let run = run_in("commit", folder.path(), &["app.toml"]).expect_success();
         assert_eq!(run.stdout, "modified app.toml\n", "{backend}: {run:?}");
     }
 }
@@ -1972,10 +1972,10 @@ fn empty_directories_are_never_committed() {
         synced(&location, "config", folder.path());
         fs::create_dir_all(folder.path().join("keys/empty")).unwrap();
         fs::create_dir(folder.path().join("what?")).unwrap();
-        let run = commit_in(folder.path(), &[]).expect_success();
+        let run = run_in("commit", folder.path(), &[]).expect_success();
         let nothing = run.stdout.is_empty() && run.stderr.contains("nothing to commit");
         assert!(nothing, "{backend}: {run:?}");
-        let run = commit_in(folder.path(), &["keys"]).expect_code(1);
+        let run = run_in("commit", folder.path(), &["keys"]).expect_code(1);
         assert!(run.stderr.contains("keys: no such file"), "{backend}: {run:?}");
     }
 }
@@ -1990,14 +1990,14 @@ fn naming_an_ignored_file_says_it_is_ignored() {
         fs::create_dir(folder.path().join("backup")).unwrap();
         fs::write(folder.path().join("backup/app.toml~"), "old\n").unwrap();
 
-        let run = commit_in(folder.path(), &["themes/dark.toml~"]).expect_code(1);
+        let run = run_in("commit", folder.path(), &["themes/dark.toml~"]).expect_code(1);
         let why = "themes/dark.toml~: is left out by .tidings/ignore";
         assert!(run.stderr.contains(why), "{backend}: {run:?}");
-        let run = commit_in(folder.path(), &["backup"]).expect_code(1);
+        let run = run_in("commit", folder.path(), &["backup"]).expect_code(1);
         let why = "backup: holds only files .tidings/ignore leaves out";
         assert!(run.stderr.contains(why), "{backend}: {run:?}");
         // A directory holding other files has nothing to commit.
-        let run = commit_in(folder.path(), &["themes"]).expect_success();
+        let run = run_in("commit", folder.path(), &["themes"]).expect_success();
         assert!(run.stderr.contains("nothing to commit"), "{backend}: {run:?}");
     }
 }
@@ -2016,9 +2016,9 @@ fn an_ignore_file_that_isnt_a_regular_file_refuses_the_commit() {
         fs::rename(&ignore, elsewhere.path().join("ignore")).unwrap();
         std::os::unix::fs::symlink(elsewhere.path().join("ignore"), &ignore).unwrap();
 
-        let run = commit_in(folder.path(), &[".x.swp"]).expect_code(1);
+        let run = run_in("commit", folder.path(), &[".x.swp"]).expect_code(1);
         assert!(run.stderr.contains(".tidings/ignore: is a symlink"), "{backend}: {run:?}");
-        let run = commit_in(folder.path(), &["--json"]).expect_code(1);
+        let run = run_in("commit", folder.path(), &["--json"]).expect_code(1);
         let json: serde_json::Value = serde_json::from_str(&run.stderr).unwrap();
         assert_eq!(json["failure"], "error", "{backend}: {json}");
         assert!(json["message"].as_str().unwrap().contains(".tidings/ignore"), "{json}");
@@ -2026,14 +2026,14 @@ fn an_ignore_file_that_isnt_a_regular_file_refuses_the_commit() {
 
         fs::remove_file(&ignore).unwrap();
         fs::create_dir(&ignore).unwrap();
-        let run = commit_in(folder.path(), &[]).expect_code(1);
+        let run = run_in("commit", folder.path(), &[]).expect_code(1);
         let why = ".tidings/ignore: isn't a regular file";
         assert!(run.stderr.contains(why), "{backend}: {run:?}");
         location.run(&["store", "read", "config", ".x.swp"]).expect_code(2);
 
         // A missing one, as when the person removed it, leaves nothing out.
         fs::remove_dir(&ignore).unwrap();
-        let run = commit_in(folder.path(), &[]).expect_success();
+        let run = run_in("commit", folder.path(), &[]).expect_success();
         assert_eq!(run.stdout, "added .x.swp\n", "{backend}: {run:?}");
     }
 }
@@ -2057,10 +2057,10 @@ fn a_file_in_an_ignored_directory_is_ignored_whatever_re_includes_it() {
 
         // As in git, a file can't be re-included if a directory it is in is left out, but one
         // whose directory isn't can.
-        let run = commit_in(folder.path(), &[]).expect_success();
+        let run = run_in("commit", folder.path(), &[]).expect_success();
         let lines: Vec<&str> = run.stdout.lines().collect();
         assert_eq!(lines, ["modified build/tracked.txt", "added keep.log"], "{backend}: {run:?}");
-        let run = commit_in(folder.path(), &["build/keep"]).expect_code(1);
+        let run = run_in("commit", folder.path(), &["build/keep"]).expect_code(1);
         let why = "build/keep: is left out by .tidings/ignore";
         assert!(run.stderr.contains(why), "{backend}: {run:?}");
         location.run(&["store", "read", "config", "build/keep"]).expect_code(2);
@@ -2077,7 +2077,7 @@ fn a_malformed_pattern_refuses_the_commit_naming_its_line() {
         let ignore = folder.path().join(".tidings/ignore");
         for pattern in ["[z-a]", "a{b", "\\"] {
             fs::write(&ignore, format!("*.log\n# a comment\n{pattern}\n")).unwrap();
-            let run = commit_in(folder.path(), &[]).expect_code(1);
+            let run = run_in("commit", folder.path(), &[]).expect_code(1);
             let line = format!(".tidings/ignore:3: error parsing glob '{pattern}'");
             assert!(run.stderr.contains(&line), "{backend}: {run:?}");
         }
@@ -2096,7 +2096,7 @@ fn a_byte_order_mark_doesnt_spoil_the_first_pattern() {
         // As git does, the mark some editors save is skipped, not taken as part of the pattern.
         fs::write(folder.path().join(".tidings/ignore"), "\u{feff}secret.txt\n").unwrap();
 
-        let run = commit_in(folder.path(), &[]).expect_success();
+        let run = run_in("commit", folder.path(), &[]).expect_success();
         assert_eq!(run.stdout, "added new.txt\n", "{backend}: {run:?}");
         location.run(&["store", "read", "config", "secret.txt"]).expect_code(2);
     }
@@ -2111,18 +2111,11 @@ fn an_ignore_file_that_isnt_utf8_refuses_the_commit_naming_its_line() {
         fs::write(folder.path().join("new.txt"), "new\n").unwrap();
         fs::write(folder.path().join(".tidings/ignore"), b"*.log\n\xffnew.txt\n").unwrap();
 
-        let run = commit_in(folder.path(), &[]).expect_code(1);
+        let run = run_in("commit", folder.path(), &[]).expect_code(1);
         let line = ".tidings/ignore:2: isn't UTF-8 text";
         assert!(run.stderr.contains(line), "{backend}: {run:?}");
         location.run(&["store", "read", "config", "new.txt"]).expect_code(2);
     }
-}
-
-/// `tidings status <args>`, with no Store flags, run in `directory`.
-fn status_in(directory: &Path, args: &[&str]) -> common::Run {
-    let mut command = tidings();
-    command.arg("status").args(args).current_dir(directory);
-    common::run(command, "")
 }
 
 #[test]
@@ -2133,7 +2126,7 @@ fn status_lists_what_commit_would_commit() {
         let folder = TempDir::new().unwrap();
         synced(&location, "config", folder.path());
 
-        let run = status_in(folder.path(), &[]).expect_success();
+        let run = run_in("status", folder.path(), &[]).expect_success();
         assert_eq!(run.stdout, "nothing to commit\nsync isn't running\n", "{backend}: {run:?}");
 
         fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
@@ -2142,14 +2135,14 @@ fn status_lists_what_commit_would_commit() {
         // Ignored, and an empty directory, neither of which `commit` would commit.
         fs::write(folder.path().join(".DS_Store"), "junk").unwrap();
         fs::create_dir(folder.path().join("empty")).unwrap();
-        let run = status_in(folder.path(), &[]).expect_success();
+        let run = run_in("status", folder.path(), &[]).expect_success();
         assert_eq!(
             run.stdout,
             "modified app.toml\nadded keys.toml\ndeleted themes/dark.toml\nsync isn't running\n",
             "{backend}: {run:?}"
         );
 
-        let run = status_in(folder.path(), &["--json"]).expect_success();
+        let run = run_in("status", folder.path(), &["--json"]).expect_success();
         let json: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
         let expected = serde_json::json!({
             "paths": [
@@ -2174,7 +2167,7 @@ fn status_compares_contents_not_modified_times() {
         let app = fs::File::options().write(true).open(folder.path().join("app.toml")).unwrap();
         app.set_modified(std::time::SystemTime::now() + Duration::from_secs(60)).unwrap();
         fs::write(folder.path().join("themes/dark.toml"), "bg = \"black\"\n").unwrap();
-        let run = status_in(folder.path(), &[]).expect_success();
+        let run = run_in("status", folder.path(), &[]).expect_success();
         assert_eq!(run.stdout, "nothing to commit\nsync isn't running\n", "{backend}: {run:?}");
     }
 }
@@ -2200,7 +2193,7 @@ fn status_lists_diverged_paths_and_files_that_cant_be_files() {
         std::os::unix::fs::symlink("../app.toml", &dark).unwrap();
         fs::write(folder.path().join("logo.png"), [0x89, 0x50, 0xff]).unwrap();
 
-        let run = status_in(folder.path(), &[]).expect_success();
+        let run = run_in("status", folder.path(), &[]).expect_success();
         let expected = "diverged app.toml: the Store's version is in .tidings/theirs/app.toml\n\
                         diverged gone.toml: removed in the Store\n\
                         invalid logo.png: isn't UTF-8 text\n\
@@ -2208,7 +2201,7 @@ fn status_lists_diverged_paths_and_files_that_cant_be_files() {
                         sync isn't running\n";
         assert_eq!(run.stdout, expected, "{backend}: {run:?}");
 
-        let run = status_in(folder.path(), &["--json"]).expect_success();
+        let run = run_in("status", folder.path(), &["--json"]).expect_success();
         let json: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
         let expected = serde_json::json!({
             "paths": [
@@ -2241,9 +2234,9 @@ fn status_says_whether_sync_is_running_without_disturbing_it() {
         let mut sync = Sync::start(&location, "config", folder.path());
         sync.wait_for("caught-up");
 
-        let run = status_in(folder.path(), &[]).expect_success();
+        let run = run_in("status", folder.path(), &[]).expect_success();
         assert_eq!(run.stdout, "nothing to commit\nsync is running\n", "{backend}: {run:?}");
-        let run = status_in(folder.path(), &["--json"]).expect_success();
+        let run = run_in("status", folder.path(), &["--json"]).expect_success();
         let json: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
         assert_eq!(json["syncing"], true, "{backend}: {run:?}");
         // `sync` still runs, and still follows the Store.
@@ -2252,7 +2245,7 @@ fn status_says_whether_sync_is_running_without_disturbing_it() {
         assert_eq!(paths(&events, "created"), ["new.toml"], "{backend}: {events:?}");
         sync.stop();
 
-        let run = status_in(folder.path(), &[]).expect_success();
+        let run = run_in("status", folder.path(), &[]).expect_success();
         assert_eq!(run.stdout, "nothing to commit\nsync isn't running\n", "{backend}: {run:?}");
         // Nor does `status` keep a `sync` from starting.
         synced(&location, "config", folder.path());
@@ -2293,24 +2286,24 @@ fn status_finds_the_working_copy_by_walking_up_or_from_dash_c() {
         fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
         let expected = "modified app.toml\nsync isn't running\n";
 
-        let run = status_in(&folder.path().join("themes"), &[]).expect_success();
+        let run = run_in("status", &folder.path().join("themes"), &[]).expect_success();
         assert_eq!(run.stdout, expected, "{backend}: {run:?}");
         let elsewhere = TempDir::new().unwrap();
-        let run = status_in(elsewhere.path(), &["-C", folder.path().to_str().unwrap()]);
+        let run = run_in("status", elsewhere.path(), &["-C", folder.path().to_str().unwrap()]);
         assert_eq!(run.expect_success().stdout, expected, "{backend}");
 
         // Store flags given must match the record.
         let other = elsewhere.path().to_str().unwrap();
-        let run = status_in(folder.path(), &["--root", other]).expect_code(1);
+        let run = run_in("status", folder.path(), &["--root", other]).expect_code(1);
         assert!(run.stderr.contains(other), "{backend}: {run:?}");
     }
 
     let elsewhere = TempDir::new().unwrap();
     // A `.tidings/` directory alone, as a filesystem Area has, isn't a Working copy.
     fs::create_dir(elsewhere.path().join(".tidings")).unwrap();
-    let run = status_in(elsewhere.path(), &[]).expect_code(1);
+    let run = run_in("status", elsewhere.path(), &[]).expect_code(1);
     assert!(run.stderr.contains("sync") && run.stderr.contains("-C"), "{run:?}");
-    let run = status_in(elsewhere.path(), &["--json"]).expect_code(1);
+    let run = run_in("status", elsewhere.path(), &["--json"]).expect_code(1);
     let failure: serde_json::Value = serde_json::from_str(&run.stderr).unwrap();
     assert_eq!(failure["failure"], "error", "{run:?}");
 }
@@ -2324,9 +2317,9 @@ fn status_refuses_a_malformed_ignore_file_as_commit_does() {
         let ignore = folder.path().join(".tidings/ignore");
         fs::write(&ignore, "*.bak\na{b\n").unwrap();
 
-        let run = status_in(folder.path(), &[]).expect_code(1);
+        let run = run_in("status", folder.path(), &[]).expect_code(1);
         assert!(run.stderr.contains(".tidings/ignore:2: "), "{backend}: {run:?}");
-        let run = status_in(folder.path(), &["--json"]).expect_code(1);
+        let run = run_in("status", folder.path(), &["--json"]).expect_code(1);
         let failure: serde_json::Value = serde_json::from_str(&run.stderr).unwrap();
         assert_eq!(failure["failure"], "error", "{backend}: {run:?}");
     }

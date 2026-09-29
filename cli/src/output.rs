@@ -9,7 +9,8 @@ use tidings::{
 };
 
 use crate::working_copy::{
-    Blocked, CommitReport, LocalChange, LocalName, PathStatus, StatusReport, SyncEvent, Unfit,
+    Blocked, CommitReport, DivergedPath, LocalChange, LocalName, PathStatus, StatusReport,
+    SyncEvent, Unfit,
 };
 
 /// What a command gives, for [`Output`] to print.
@@ -176,10 +177,8 @@ pub struct SyncOutput {
 impl SyncOutput {
     /// Prints what `sync` did, as one line, unless it is quiet and this needs no attention.
     pub fn print(self, event: &SyncEvent) -> io::Result<()> {
-        let needs_attention = matches!(
-            event,
-            SyncEvent::Resync | SyncEvent::Diverged { .. } | SyncEvent::Error { .. }
-        );
+        let needs_attention =
+            matches!(event, SyncEvent::Resync | SyncEvent::Diverged(_) | SyncEvent::Error { .. });
         if self.quiet && !needs_attention {
             return Ok(());
         }
@@ -225,18 +224,22 @@ impl<'a> EventParts<'a> {
             SyncEvent::Created(path) => parts("created", Some(path), None),
             SyncEvent::Updated(path) => parts("updated", Some(path), None),
             SyncEvent::Removed(path) => parts("removed", Some(path), None),
-            SyncEvent::Diverged { path, theirs_file, blocked } => EventParts {
-                theirs: Some(theirs_file.as_deref()),
-                ..parts(
-                    "diverged",
-                    Some(path),
-                    Some(diverged_message(theirs_file.as_deref(), blocked.as_ref())),
-                )
-            },
+            SyncEvent::Diverged(diverged) => EventParts::diverged(diverged),
             SyncEvent::Resolved(path) => parts("resolved", Some(path), None),
             SyncEvent::Error { path, message } => parts("error", Some(path), Some(message.clone())),
             SyncEvent::Resync => parts("resync", None, None),
             SyncEvent::CaughtUp => parts("caught-up", None, None),
+        }
+    }
+
+    /// What a *diverged* event says about `diverged`, a Diverged Path.
+    pub fn diverged(diverged: &'a DivergedPath) -> EventParts<'a> {
+        let DivergedPath { path, theirs_file, blocked } = diverged;
+        EventParts {
+            name: "diverged",
+            subject: Some(Subject::Path(path)),
+            message: Some(diverged_message(theirs_file.as_deref(), blocked.as_ref())),
+            theirs: Some(theirs_file.as_deref()),
         }
     }
 
@@ -323,7 +326,7 @@ fn status_parts(status: &PathStatus) -> EventParts<'_> {
             message: None,
             theirs: None,
         },
-        PathStatus::Diverged(event) => EventParts::of(event),
+        PathStatus::Diverged(diverged) => EventParts::diverged(diverged),
         PathStatus::Invalid(unfit) => EventParts::invalid(unfit),
     }
 }
@@ -429,11 +432,11 @@ mod tests {
                 revision: None,
             }],
             pending: true,
-            events: vec![SyncEvent::Diverged {
+            events: vec![SyncEvent::Diverged(DivergedPath {
                 path,
                 theirs_file: Some(".tidings/theirs/app.toml".into()),
                 blocked: None,
-            }],
+            })],
         };
         assert_eq!(
             as_json(&Report::WorkingCopyCommit(report)),
