@@ -242,6 +242,42 @@ impl StoreArgs {
         Ok((address, opened))
     }
 
+    /// Whether the flags choose the memory Backend.
+    pub fn is_memory(&self) -> bool {
+        self.backend == Some(BackendName::Memory)
+    }
+
+    /// Fails, naming the difference, unless each flag given agrees with `address`, the Store a
+    /// Working copy belongs to. A flag left out agrees with anything.
+    pub fn check_matches(&self, address: &StoreAddress) -> Result<(), Failure> {
+        let mismatch = |given: String| {
+            Failure::error(format!(
+                "{given} doesn't match the Working copy's Store, {address}: leave it out, since \
+                 the Working copy knows its Store"
+            ))
+        };
+        if let Some(root) = &self.root {
+            let same = match &address.location {
+                StoreLocation::Root(recorded) => same_directory(root, recorded),
+                StoreLocation::Identity(_) => false,
+            };
+            if !same {
+                return Err(mismatch(format!("--root (or TIDINGS_ROOT) {}", root.display())));
+            }
+        }
+        if let Some(identity) = &self.identity
+            && address.location != StoreLocation::Identity(identity.clone())
+        {
+            return Err(mismatch(format!("--identity (or TIDINGS_IDENTITY) {identity}")));
+        }
+        if let Some(backend) = self.backend
+            && backend != address.backend
+        {
+            return Err(mismatch(format!("--backend (or TIDINGS_BACKEND) {backend}")));
+        }
+        Ok(())
+    }
+
     /// Opens a Store on the memory Backend, if `in_shell`, and nothing says where it is.
     fn open_memory(&self, in_shell: bool) -> Result<Opened, Failure> {
         if !in_shell {
@@ -275,6 +311,18 @@ impl StoreArgs {
                  TIDINGS_IDENTITY)",
             )),
         }
+    }
+}
+
+/// Whether `given`, as `--root` gave it, is the directory `recorded`, an absolute path: the same
+/// path once made absolute, or the same directory once symlinks are followed.
+fn same_directory(given: &std::path::Path, recorded: &std::path::Path) -> bool {
+    if std::path::absolute(given).is_ok_and(|given| given == recorded) {
+        return true;
+    }
+    match (std::fs::canonicalize(given), std::fs::canonicalize(recorded)) {
+        (Ok(given), Ok(recorded)) => given == recorded,
+        _ => false,
     }
 }
 

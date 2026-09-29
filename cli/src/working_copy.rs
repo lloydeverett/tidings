@@ -15,7 +15,8 @@ use std::pin::{Pin, pin};
 use tidings::{Area, ChangeFeed, FeedItem, File, Path, Precondition, Revision, Staging, Store};
 
 use crate::failure::Failure;
-use crate::location::{Opened, StoreAddress};
+use crate::location::{Opened, StoreAddress, StoreArgs};
+use crate::output::area_name;
 use record::{Base, Hash, Record};
 
 /// The directory in a Working copy's folder that holds its record and locks, which is never a
@@ -175,6 +176,11 @@ impl WorkingCopy {
         Ok(working_copy)
     }
 
+    /// Whether `folder` is a Working copy: whether it has a record, of this version or another.
+    pub fn exists(folder: &FsPath) -> bool {
+        record::is_record(&record_file(folder))
+    }
+
     /// Opens the Working copy that is `folder`, reading which Store and Area it belongs to.
     pub fn open(folder: &FsPath) -> Result<WorkingCopy, Failure> {
         let file = record_file(folder);
@@ -200,9 +206,27 @@ impl WorkingCopy {
         }
     }
 
-    /// Opens the Store the record names.
-    pub async fn open_store(&self) -> Result<Opened, Failure> {
-        self.store.open(false).await
+    /// Fails unless the Working copy is of `area`.
+    pub fn check_area(&self, area: Area) -> Result<(), Failure> {
+        if area == self.area {
+            return Ok(());
+        }
+        Err(Failure::error(format!(
+            "{} is a Working copy of the {} Area, not {}",
+            self.folder.display(),
+            area_name(self.area),
+            area_name(area),
+        )))
+    }
+
+    /// Opens the Store the record names. Any Store flags given in `flags` must match it, and a
+    /// new Store is made only if `flags` has `--create`.
+    pub async fn open_store(&self, flags: &StoreArgs) -> Result<Opened, Failure> {
+        flags.check_matches(&self.store)?;
+        self.store.open(flags.create).await.map_err(|failure| {
+            let folder = self.folder.display();
+            failure.in_context(format!("can't open the Store of the Working copy {folder}"))
+        })
     }
 
     /// Keeps the folder in step with the Store until `stop` finishes, giving each [`SyncEvent`] to

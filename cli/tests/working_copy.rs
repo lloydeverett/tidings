@@ -668,3 +668,260 @@ fn paths<'a>(events: &'a [serde_json::Value], name: &str) -> Vec<&'a str> {
 fn clear_the_cache_directory(location: &Location) {
     fs::remove_dir_all(location.root().join("cache")).unwrap();
 }
+
+#[test]
+fn resuming_catches_up_on_what_the_store_did_meanwhile() {
+    for backend in BACKENDS {
+        for with_flags in [true, false] {
+            let label = format!("{backend}, with Store flags: {with_flags}");
+            let location = store_with_config(backend);
+            location.write("config", "kept.toml", "kept\n");
+            let folder = TempDir::new().unwrap();
+            synced(&location, "config", folder.path());
+
+            location.write("config", "app.toml", "a = 2\n");
+            location.write("config", "kept.toml", "theirs\n");
+            location.write("config", "new.toml", "new\n");
+            location.run(&["store", "delete", "config", "themes/dark.toml"]).expect_success();
+            location.write("config", "same.toml", "same\n");
+            fs::write(folder.path().join("kept.toml"), "mine\n").unwrap();
+            // A file with no Base holding what the Store has, as a reconcile that stopped partway
+            // leaves, silently takes the Store's version as its Base.
+            fs::write(folder.path().join("same.toml"), "same\n").unwrap();
+
+            let mut sync = if with_flags {
+                Sync::start(&location, "config", folder.path())
+            } else {
+                let mut command = tidings();
+                command.args(["--json", "sync", "config"]).arg(folder.path());
+                Sync::spawn(command)
+            };
+            let events = sync.wait_for("caught-up");
+            sync.stop();
+            assert_eq!(paths(&events, "created"), ["new.toml"], "{label}: {events:?}");
+            assert_eq!(paths(&events, "updated"), ["app.toml"], "{label}: {events:?}");
+            assert_eq!(paths(&events, "removed"), ["themes/dark.toml"], "{label}: {events:?}");
+            assert_eq!(events.len(), 4, "{label}: {events:?}");
+            assert_eq!(fs::read_to_string(folder.path().join("app.toml")).unwrap(), "a = 2\n");
+            assert_eq!(fs::read_to_string(folder.path().join("kept.toml")).unwrap(), "mine\n");
+            assert!(!folder.path().join("themes").exists(), "{label}");
+
+            // It follows the Store again.
+            let mut sync = Sync::start(&location, "config", folder.path());
+            sync.wait_for("caught-up");
+            location.write("config", "later.toml", "later\n");
+            let events = sync.wait_for("caught-up");
+            assert_eq!(paths(&events, "created"), ["later.toml"], "{label}: {events:?}");
+            sync.stop();
+
+            // The local edit, against its old Base, is a Conflict.
+            let run = commit_in(folder.path(), &[]).expect_code(3);
+            assert!(run.stderr.contains("kept.toml"), "{label}: {run:?}");
+            // With it undone, nothing is a change: `same.toml` has its Base.
+            fs::write(folder.path().join("kept.toml"), "kept\n").unwrap();
+            let run = commit_in(folder.path(), &[]).expect_success();
+            assert!(run.stderr.contains("nothing to commit"), "{label}: {run:?}");
+        }
+    }
+}
+
+#[test]
+fn store_flags_that_dont_match_the_record_are_refused() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let other = Location::with_store(backend);
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
+        let folder_arg = folder.path().to_str().unwrap();
+        let other_root = other.root().to_str().unwrap();
+        let other_backend = if backend == "fs" { "sqlite" } else { "fs" };
+
+        // Each a flag, or the environment variable standing in for one, and its value.
+        let mismatches = [
+            ("--root", other_root),
+            ("--identity", "com.example.app"),
+            ("--backend", other_backend),
+            ("TIDINGS_ROOT", other_root),
+            ("TIDINGS_BACKEND", other_backend),
+        ];
+        for (name, value) in mismatches {
+            for command in [&["sync", "config", folder_arg][..], &["commit", "-C", folder_arg]] {
+                let mut tidings = tidings();
+                if name.starts_with("--") {
+                    tidings.args([name, value]);
+                } else {
+                    tidings.env(name, value);
+                }
+                tidings.args(command);
+                let run = common::run(tidings, "").expect_code(1);
+                let label = format!("{backend} {name} {value} {command:?}");
+                // Both sides of the difference are named.
+                assert!(run.stderr.contains(value), "{label}: {run:?}");
+                assert!(run.stderr.contains(location.root().to_str().unwrap()), "{label}: {run:?}");
+            }
+        }
+        // Nothing was committed, and the folder is as it was.
+        assert_eq!(location.read("config", "app.toml"), "a = 1\n", "{backend}");
+        assert_eq!(other.run(&["store", "list", "config"]).expect_success().stdout, "");
+        assert_eq!(fs::read_to_string(folder.path().join("app.toml")).unwrap(), "a = 2\n");
+
+        // Flags that match are fine, for `commit` as for `sync`.
+        let root = location.root().to_str().unwrap();
+        let mut command = tidings();
+        command.args(["--root", root, "--backend", backend, "commit", "-C", folder_arg]);
+        common::run(command, "").expect_success();
+        assert_eq!(location.read("config", "app.toml"), "a = 2\n", "{backend}");
+    }
+}
+
+#[test]
+fn sync_for_a_different_area_is_refused() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        location.write("data", "d.txt", "d\n");
+
+        let folder_arg = folder.path().to_str().unwrap();
+        let run = location.run(&["sync", "data", folder_arg]).expect_code(1);
+        assert!(run.stderr.contains("config") && run.stderr.contains("data"), "{run:?}");
+        assert!(!folder.path().join("d.txt").exists(), "{backend}");
+    }
+}
+
+#[test]
+fn sync_into_a_folder_that_isnt_empty_changes_nothing_in_it() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        fs::write(folder.path().join("notes.txt"), "mine\n").unwrap();
+        let folder_arg = folder.path().to_str().unwrap();
+        let run = location.run(&["sync", "config", folder_arg]).expect_code(1);
+        assert!(run.stderr.contains("isn't empty"), "{backend}: {run:?}");
+        let names: Vec<_> =
+            fs::read_dir(folder.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["notes.txt"], "{backend}");
+        assert_eq!(fs::read_to_string(folder.path().join("notes.txt")).unwrap(), "mine\n");
+    }
+}
+
+#[test]
+fn a_second_sync_of_a_working_copy_is_refused() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        let mut sync = Sync::start(&location, "config", folder.path());
+        sync.wait_for("caught-up");
+
+        let folder_arg = folder.path().to_str().unwrap();
+        let run = location.run(&["sync", "config", folder_arg]).expect_code(1);
+        assert!(run.stderr.contains("running"), "{backend}: {run:?}");
+
+        // The first keeps running.
+        location.write("config", "new.toml", "new\n");
+        let events = sync.wait_for("caught-up");
+        assert_eq!(paths(&events, "created"), ["new.toml"], "{backend}: {events:?}");
+        sync.stop();
+    }
+}
+
+#[test]
+fn sync_on_a_memory_store_is_refused() {
+    let parent = TempDir::new().unwrap();
+    let folder = parent.path().join("cfg");
+    let mut command = tidings();
+    command.args(["--backend", "memory", "sync", "config"]).arg(&folder);
+    let run = common::run(command, "").expect_code(1);
+    assert!(run.stderr.contains("no other process"), "{run:?}");
+    assert!(!folder.exists());
+}
+
+#[test]
+fn a_working_copy_keeps_working_after_its_folder_is_moved() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let parent = TempDir::new().unwrap();
+        let folder = parent.path().join("cfg");
+        synced(&location, "config", &folder);
+        let moved = parent.path().join("moved");
+        fs::rename(&folder, &moved).unwrap();
+
+        fs::write(moved.join("app.toml"), "a = 2\n").unwrap();
+        commit_in(&moved, &[]).expect_success();
+        assert_eq!(location.read("config", "app.toml"), "a = 2\n", "{backend}");
+
+        location.write("config", "new.toml", "new\n");
+        let mut command = tidings();
+        command.args(["--json", "sync", "config"]).arg(&moved);
+        let mut sync = Sync::spawn(command);
+        let events = sync.wait_for("caught-up");
+        sync.stop();
+        assert_eq!(paths(&events, "created"), ["new.toml"], "{backend}: {events:?}");
+        assert_eq!(events.len(), 2, "{backend}: {events:?}");
+        assert!(!folder.exists(), "{backend}");
+    }
+}
+
+#[test]
+fn a_working_copy_whose_store_has_gone_fails_to_open() {
+    for backend in BACKENDS {
+        let parent = TempDir::new().unwrap();
+        let root = parent.path().join("store");
+        let root_arg = root.to_str().unwrap();
+        let mut command = tidings();
+        command.args(["--root", root_arg, "--backend", backend, "--create", "store", "list"]);
+        command.arg("config");
+        common::run(command, "").expect_success();
+        let folder = parent.path().join("cfg");
+        let mut command = tidings();
+        command.args(["--root", root_arg, "--json", "sync", "config"]).arg(&folder);
+        let mut sync = Sync::spawn(command);
+        sync.wait_for("caught-up");
+        sync.stop();
+        fs::remove_dir_all(&root).unwrap();
+
+        fs::write(folder.join("new.toml"), "new\n").unwrap();
+        let run = commit_in(&folder, &[]).expect_code(1);
+        assert!(run.stderr.contains("no Store"), "{backend}: {run:?}");
+        let mut command = tidings();
+        command.args(["sync", "config"]).arg(&folder);
+        let run = common::run(command, "").expect_code(1);
+        assert!(run.stderr.contains("no Store"), "{backend}: {run:?}");
+        assert!(!root.exists(), "{backend}: a Store was made");
+        assert!(folder.join("new.toml").exists(), "{backend}");
+    }
+}
+
+#[test]
+fn two_working_copies_of_one_area_both_follow_it() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let (first, second) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let mut syncs = [
+            Sync::start(&location, "config", first.path()),
+            Sync::start(&location, "config", second.path()),
+        ];
+        for sync in &mut syncs {
+            sync.wait_for("caught-up");
+        }
+
+        location.write("config", "new.toml", "new\n");
+        for sync in &mut syncs {
+            let events = sync.wait_for("caught-up");
+            assert_eq!(paths(&events, "created"), ["new.toml"], "{backend}: {events:?}");
+        }
+
+        // A commit from one reaches the other as a Change from the Store.
+        fs::write(first.path().join("app.toml"), "a = 2\n").unwrap();
+        commit_in(first.path(), &[]).expect_success();
+        let [first_sync, second_sync] = syncs;
+        let mut second_sync = second_sync;
+        let events = second_sync.wait_for("caught-up");
+        assert_eq!(paths(&events, "updated"), ["app.toml"], "{backend}: {events:?}");
+        let app = fs::read_to_string(second.path().join("app.toml")).unwrap();
+        assert_eq!(app, "a = 2\n", "{backend}");
+        first_sync.stop();
+        second_sync.stop();
+    }
+}

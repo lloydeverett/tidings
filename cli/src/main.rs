@@ -44,8 +44,10 @@ struct Cli {
 enum Command {
     /// Make a folder a Working copy of an Area, and keep it in step with the Store until Ctrl-C
     ///
-    /// The folder must be empty or missing. Files the Store adds, changes or removes appear in it,
-    /// but a file changed locally is left alone. Nothing in it reaches the Store until `commit`.
+    /// The folder must be empty or missing, or a Working copy of the Area, which is resumed: the
+    /// Store flags are needed only to make a new one. Files the Store adds, changes or removes
+    /// appear in it, but a file changed locally is left alone. Nothing in it reaches the Store
+    /// until `commit`.
     Sync {
         area: AreaName,
         /// The folder. The current directory if left out.
@@ -128,7 +130,9 @@ fn main() -> ExitCode {
             let output = SyncOutput { output, quiet };
             runtime.block_on(sync(&cli.store, output, area, folder))
         }
-        Command::Commit { working_copy } => runtime.block_on(commit(output, &working_copy)),
+        Command::Commit { working_copy } => {
+            runtime.block_on(commit(&cli.store, output, &working_copy))
+        }
         Command::Store(StoreSubcommand::Shell) => shell::run(&runtime, &cli.store, cli.json),
         Command::Store(StoreSubcommand::OneShot(command)) => {
             runtime.block_on(one_shot(&cli.store, cli.json, command))
@@ -176,8 +180,8 @@ async fn one_shot(store: &StoreArgs, json: bool, command: OneShot) -> Result<(),
     }
 }
 
-/// `sync`: makes `folder` a Working copy of `area`, and keeps it in step with the Store until
-/// Ctrl-C.
+/// `sync`: makes `folder` a Working copy of `area`, or resumes the one it is, and keeps it in step
+/// with the Store until Ctrl-C.
 async fn sync(
     store: &StoreArgs,
     output: SyncOutput,
@@ -185,23 +189,41 @@ async fn sync(
     folder: Option<PathBuf>,
 ) -> Result<(), Failure> {
     let ctrl_c = listen_for_ctrl_c()?;
+    if store.is_memory() {
+        return Err(Failure::error(
+            "a Working copy can't be of a Store in memory: no other process could reach it",
+        ));
+    }
     let folder = match folder {
         Some(folder) => folder,
         None => std::env::current_dir()?,
     };
-    // Before the Store, which `--create` would otherwise make even for a folder that can't be a
-    // Working copy.
-    WorkingCopy::check_can_create(&folder)?;
+    let area = Area::from(area);
     // Opening the Store takes the Change feed, before anything is reconciled.
-    let (address, mut opened) = store.open_with_address().await?;
-    let working_copy = WorkingCopy::create(&folder, address, area.into())?;
+    let (working_copy, mut opened) = if WorkingCopy::exists(&folder) {
+        let working_copy = WorkingCopy::open(&folder)?;
+        working_copy.check_area(area)?;
+        let opened = working_copy.open_store(store).await?;
+        (working_copy, opened)
+    } else {
+        // Before the Store, which `--create` would otherwise make even for a folder that can't be
+        // a Working copy.
+        WorkingCopy::check_can_create(&folder)?;
+        let (address, opened) = store.open_with_address().await?;
+        (WorkingCopy::create(&folder, address, area)?, opened)
+    };
     working_copy.sync(&opened.store, &mut opened.feed, ctrl_c, |event| output.print(event)).await
 }
 
-/// `commit`: commits every local change in the Working copy.
-async fn commit(output: Output, working_copy: &WorkingCopyArgs) -> Result<(), Failure> {
+/// `commit`: commits every local change in the Working copy. Any Store flags in `store` must
+/// match its record.
+async fn commit(
+    store: &StoreArgs,
+    output: Output,
+    working_copy: &WorkingCopyArgs,
+) -> Result<(), Failure> {
     let working_copy = working_copy.open()?;
-    let opened = working_copy.open_store().await?;
+    let opened = working_copy.open_store(store).await?;
     let report = working_copy.commit(&opened.store).await?;
     Ok(output.print(&Report::WorkingCopyCommit(report))?)
 }
