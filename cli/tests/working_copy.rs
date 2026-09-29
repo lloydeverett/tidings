@@ -2084,3 +2084,36 @@ fn a_malformed_pattern_refuses_the_commit_naming_its_line() {
         location.run(&["store", "read", "config", "new.txt"]).expect_code(2);
     }
 }
+
+#[test]
+fn a_byte_order_mark_doesnt_spoil_the_first_pattern() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        fs::write(folder.path().join("secret.txt"), "s\n").unwrap();
+        fs::write(folder.path().join("new.txt"), "new\n").unwrap();
+        // As git does, the mark some editors save is skipped, not taken as part of the pattern.
+        fs::write(folder.path().join(".tidings/ignore"), "\u{feff}secret.txt\n").unwrap();
+
+        let run = commit_in(folder.path(), &[]).expect_success();
+        assert_eq!(run.stdout, "added new.txt\n", "{backend}: {run:?}");
+        location.run(&["store", "read", "config", "secret.txt"]).expect_code(2);
+    }
+}
+
+#[test]
+fn an_ignore_file_that_isnt_utf8_refuses_the_commit_naming_its_line() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        fs::write(folder.path().join("new.txt"), "new\n").unwrap();
+        fs::write(folder.path().join(".tidings/ignore"), b"*.log\n\xffnew.txt\n").unwrap();
+
+        let run = commit_in(folder.path(), &[]).expect_code(1);
+        let line = ".tidings/ignore:2: isn't UTF-8 text";
+        assert!(run.stderr.contains(line), "{backend}: {run:?}");
+        location.run(&["store", "read", "config", "new.txt"]).expect_code(2);
+    }
+}

@@ -188,11 +188,8 @@ pub fn event_line(event: &SyncEvent) -> String {
 pub struct EventParts<'a> {
     /// Its name, as in `diverged`.
     pub name: &'static str,
-    /// The Path it is about, if any.
-    pub path: Option<&'a Path>,
-    /// For an *invalid* event only: the file in the folder it is about, which may not be a valid
-    /// Path, given where a Path would be.
-    pub local_name: Option<&'a LocalName>,
+    /// What it is about, if anything.
+    pub subject: Option<Subject<'a>>,
     /// What else it says, if anything.
     pub message: Option<String>,
     /// For a *diverged* event only: the file with the Store's version, or `None` if the Store
@@ -203,10 +200,9 @@ pub struct EventParts<'a> {
 impl<'a> EventParts<'a> {
     /// What `event`, from `sync`, says.
     pub fn of(event: &'a SyncEvent) -> EventParts<'a> {
-        let parts = |name, path, message| EventParts {
+        let parts = |name, path: Option<&'a Path>, message| EventParts {
             name,
-            path,
-            local_name: None,
+            subject: path.map(Subject::Path),
             message,
             theirs: None,
         };
@@ -233,8 +229,8 @@ impl<'a> EventParts<'a> {
     pub fn json(&self) -> Value {
         let mut object = serde_json::Map::new();
         object.insert("event".to_owned(), json!(self.name));
-        if let Some(path) = self.subject() {
-            object.insert("path".to_owned(), json!(path));
+        if let Some(subject) = self.subject {
+            object.insert("path".to_owned(), json!(subject.as_str()));
         }
         if let Some(message) = &self.message {
             object.insert("message".to_owned(), json!(message));
@@ -245,22 +241,37 @@ impl<'a> EventParts<'a> {
         Value::Object(object)
     }
 
-    /// What it is about, if anything: its Path, or the file in the folder.
-    fn subject(&self) -> Option<&str> {
-        self.path.map(Path::as_str).or(self.local_name.map(LocalName::as_str))
-    }
-
     /// As a line for a person, as in "diverged a: removed in the Store".
     pub fn line(&self) -> String {
         // For a person, a name is words.
         let mut line = self.name.replace('-', " ");
-        if let Some(path) = self.subject() {
-            line.push_str(&format!(" {path}"));
+        if let Some(subject) = self.subject {
+            line.push_str(&format!(" {}", subject.as_str()));
         }
         if let Some(message) = &self.message {
             line.push_str(&format!(": {message}"));
         }
         line
+    }
+}
+
+/// What an event is about.
+#[derive(Clone, Copy)]
+pub enum Subject<'a> {
+    /// A Path.
+    Path(&'a Path),
+    /// For an *invalid* event only: a file in the folder, which may not be a valid Path, given
+    /// where a Path would be.
+    Local(&'a LocalName),
+}
+
+impl Subject<'_> {
+    /// The Path, or the file's name in the folder, as text.
+    fn as_str(&self) -> &str {
+        match self {
+            Subject::Path(path) => path.as_str(),
+            Subject::Local(name) => name.as_str(),
+        }
     }
 }
 

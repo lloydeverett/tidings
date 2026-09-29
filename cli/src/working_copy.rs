@@ -22,7 +22,7 @@ use crate::location::{Opened, StoreAddress, StoreArgs};
 use crate::output::area_name;
 use record::{Base, Divergence, Hash, Record};
 use scan::{IGNORE_FILE, Scan, is_record_directory};
-pub use scan::{InvalidEntry, LocalName};
+pub use scan::{LocalName, Unfit};
 
 /// The directory in a Working copy's folder that holds its record and locks, which is never a
 /// File.
@@ -189,21 +189,12 @@ enum Selection {
 }
 
 impl Selection {
-    /// Whether this covers `path`.
-    fn covers(&self, path: &Path) -> bool {
-        self.covers_str(path.as_str())
-    }
-
-    /// Whether this covers `name`, a file in the folder, which may not be a valid Path.
-    fn covers_name(&self, name: &LocalName) -> bool {
-        self.covers_str(name.as_str())
-    }
-
-    /// Whether this covers what `name` spells: a Path, or a file in the folder.
-    fn covers_str(&self, name: &str) -> bool {
+    /// Whether this covers what `name` spells: a Path, or a file in the folder, which may not be a
+    /// valid Path.
+    fn covers(&self, name: &str) -> bool {
         match self {
             Selection::All => true,
-            Selection::Named(named) => named.iter().any(|named| named.target.covers_str(name)),
+            Selection::Named(named) => named.iter().any(|named| named.target.covers(name)),
         }
     }
 
@@ -213,12 +204,12 @@ impl Selection {
     fn check_each_names_something(&self, scan: &Scan, record: &Record) -> Result<(), Failure> {
         let Selection::Named(named) = self else { return Ok(()) };
         let paths = scan.files.keys().chain(record.bases.keys()).chain(record.divergences.keys());
-        let invalid = scan.invalid.iter().map(|entry| &entry.name);
+        let invalid = scan.invalid.iter().map(|unfit| &unfit.name);
         for NamedPath { given, target } in named {
             // The whole folder names something even if it is empty.
             if matches!(target, Target::Folder)
-                || paths.clone().any(|path| target.covers(path))
-                || invalid.clone().any(|name| target.covers_name(name))
+                || paths.clone().any(|path| target.covers(path.as_str()))
+                || invalid.clone().any(|name| target.covers(name.as_str()))
             {
                 continue;
             }
@@ -227,7 +218,7 @@ impl Selection {
                     "is left out by {RECORD_DIRECTORY}/{IGNORE_FILE}: remove the pattern that \
                      matches it there to commit it"
                 )
-            } else if scan.ignored.iter().any(|name| target.covers_name(name)) {
+            } else if scan.ignored.iter().any(|name| target.covers(name.as_str())) {
                 format!("holds only files {RECORD_DIRECTORY}/{IGNORE_FILE} leaves out")
             } else {
                 "no such file in the Working copy".to_owned()
@@ -255,18 +246,9 @@ enum Target {
 }
 
 impl Target {
-    /// Whether this covers `path`.
-    fn covers(&self, path: &Path) -> bool {
-        self.covers_str(path.as_str())
-    }
-
-    /// Whether this covers `name`, a file in the folder, which may not be a valid Path.
-    fn covers_name(&self, name: &LocalName) -> bool {
-        self.covers_str(name.as_str())
-    }
-
-    /// Whether this covers what `name` spells: a Path, or a file in the folder.
-    fn covers_str(&self, name: &str) -> bool {
+    /// Whether this covers what `name` spells: a Path, or a file in the folder, which may not be a
+    /// valid Path.
+    fn covers(&self, name: &str) -> bool {
         match self {
             Target::Folder => true,
             Target::Under(target) => name
@@ -892,7 +874,7 @@ impl WorkingCopy {
     ) -> Result<(Staging, Vec<(Path, LocalChange)>), Failure> {
         let mut staging = Staging::new(self.area);
         let mut changes = Vec::new();
-        for (path, contents) in files.iter().filter(|(path, _)| selection.covers(path)) {
+        for (path, contents) in files.iter().filter(|(path, _)| selection.covers(path.as_str())) {
             let (change, precondition) = match bases.get(path) {
                 None => (LocalChange::Added, Precondition::Absent),
                 Some(base) if Hash::of(contents) != base.hash => {
@@ -903,7 +885,7 @@ impl WorkingCopy {
             staging.write_requiring(path, contents.as_str(), precondition)?;
             changes.push((path.clone(), change));
         }
-        for (path, base) in bases.iter().filter(|(path, _)| selection.covers(path)) {
+        for (path, base) in bases.iter().filter(|(path, _)| selection.covers(path.as_str())) {
             if !files.contains_key(path) {
                 staging.delete_requiring(path, Precondition::UnchangedSince(base.revision))?;
                 changes.push((path.clone(), LocalChange::Deleted));
@@ -1146,7 +1128,7 @@ fn refuse_diverged(record: &Record, selection: &Selection) -> Result<(), Failure
     let diverged: Vec<SyncEvent> = record
         .divergences
         .iter()
-        .filter(|(path, _)| selection.covers(path))
+        .filter(|(path, _)| selection.covers(path.as_str()))
         .map(|(path, divergence)| SyncEvent::Diverged {
             path: path.clone(),
             theirs_file: divergence.theirs_revision.map(|_| theirs_file(path)),
@@ -1158,9 +1140,9 @@ fn refuse_diverged(record: &Record, selection: &Selection) -> Result<(), Failure
 
 /// Fails, naming each, if `selection` covers any of `invalid`, files that can't become Files, since
 /// an all-or-nothing commit mustn't silently leave them out.
-fn refuse_invalid(invalid: Vec<InvalidEntry>, selection: &Selection) -> Result<(), Failure> {
-    let invalid: Vec<InvalidEntry> =
-        invalid.into_iter().filter(|entry| selection.covers_name(&entry.name)).collect();
+fn refuse_invalid(invalid: Vec<Unfit>, selection: &Selection) -> Result<(), Failure> {
+    let invalid: Vec<Unfit> =
+        invalid.into_iter().filter(|unfit| selection.covers(unfit.name.as_str())).collect();
     if invalid.is_empty() { Ok(()) } else { Err(Failure::invalid(invalid)) }
 }
 

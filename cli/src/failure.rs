@@ -6,8 +6,8 @@ use std::process::ExitCode;
 use serde_json::{Value, json};
 use tidings::Area;
 
-use crate::output::{EventParts, area_name};
-use crate::working_copy::{InvalidEntry, Reconciled, SyncEvent};
+use crate::output::{EventParts, Subject, area_name};
+use crate::working_copy::{Reconciled, SyncEvent, Unfit};
 
 /// A command that failed: what to tell the person, and the exit code.
 #[derive(Debug)]
@@ -27,7 +27,7 @@ enum Outcomes {
     /// A Conflict, after which each Path it named was reconciled as `sync` would.
     Conflict(Vec<Reconciled>),
     /// It was refused because these files can't become Files.
-    Invalid(Vec<InvalidEntry>),
+    Invalid(Vec<Unfit>),
 }
 
 /// Each exit code other than success.
@@ -75,7 +75,7 @@ impl Failure {
 
     /// A Working copy's commit was refused because the files in `invalid` can't become Files,
     /// which exits with 1.
-    pub fn invalid(invalid: Vec<InvalidEntry>) -> Failure {
+    pub fn invalid(invalid: Vec<Unfit>) -> Failure {
         let message = "can't commit files that can't be Files: rename or remove each, or leave it \
                        out with .tidings/ignore";
         Failure {
@@ -150,11 +150,10 @@ impl Failure {
             }
             Some(Outcomes::Invalid(invalid)) => invalid
                 .iter()
-                .map(|entry| EventParts {
+                .map(|unfit| EventParts {
                     name: "invalid",
-                    path: None,
-                    local_name: Some(&entry.name),
-                    message: Some(entry.reason.clone()),
+                    subject: Some(Subject::Local(&unfit.name)),
+                    message: Some(unfit.reason.clone()),
                     theirs: None,
                 })
                 .collect(),
@@ -168,8 +167,7 @@ fn reconciled_parts(reconciled: &Reconciled) -> EventParts<'_> {
         Reconciled::Event(event) => EventParts::of(event),
         Reconciled::TookStoresFile(path) => EventParts {
             name: "same",
-            path: Some(path),
-            local_name: None,
+            subject: Some(Subject::Path(path)),
             message: Some("the Store has the same contents, which are now its Base".to_owned()),
             theirs: None,
         },
