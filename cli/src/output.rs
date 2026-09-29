@@ -188,8 +188,8 @@ pub fn event_line(event: &SyncEvent) -> String {
 pub struct EventParts<'a> {
     /// Its name, as in `diverged`.
     pub name: &'static str,
-    /// The Path it is about, if any.
-    pub path: Option<&'a Path>,
+    /// The Path it is about, if any, or the name of a file in the folder that can't be one.
+    pub path: Option<&'a str>,
     /// What else it says, if anything.
     pub message: Option<String>,
     /// For a *diverged* event only: the file with the Store's version, or `None` if the Store
@@ -200,7 +200,12 @@ pub struct EventParts<'a> {
 impl<'a> EventParts<'a> {
     /// What `event`, from `sync`, says.
     pub fn of(event: &'a SyncEvent) -> EventParts<'a> {
-        let parts = |name, path, message| EventParts { name, path, message, theirs: None };
+        let parts = |name, path: Option<&'a Path>, message| EventParts {
+            name,
+            path: path.map(Path::as_str),
+            message,
+            theirs: None,
+        };
         match event {
             SyncEvent::Created(path) => parts("created", Some(path), None),
             SyncEvent::Updated(path) => parts("updated", Some(path), None),
@@ -225,7 +230,7 @@ impl<'a> EventParts<'a> {
         let mut object = serde_json::Map::new();
         object.insert("event".to_owned(), json!(self.name));
         if let Some(path) = self.path {
-            object.insert("path".to_owned(), json!(path.as_str()));
+            object.insert("path".to_owned(), json!(path));
         }
         if let Some(message) = &self.message {
             object.insert("message".to_owned(), json!(message));

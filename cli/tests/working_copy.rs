@@ -524,13 +524,17 @@ fn sync_finishes_a_working_copy_a_crash_left_without_a_record() {
     for backend in BACKENDS {
         let location = store_with_config(backend);
         let folder = TempDir::new().unwrap();
-        // What a `sync` that stopped before writing the record leaves: `.tidings/` with its lock
-        // and part of a record.
+        // What a `sync` that stopped before writing the record leaves: `.tidings/` with its lock,
+        // its ignore file and part of a record.
         let tidings = folder.path().join(".tidings");
         fs::create_dir(&tidings).unwrap();
         fs::write(tidings.join("lock"), "").unwrap();
+        fs::write(tidings.join("ignore"), "*.log\n").unwrap();
+        fs::write(tidings.join(".ignore.d4E5f6"), "*.l").unwrap();
         fs::write(tidings.join(".working-copy.a1B2c3"), "tidings work").unwrap();
         synced(&location, "config", folder.path());
+        // Written whole, so it is kept.
+        assert_eq!(fs::read_to_string(tidings.join("ignore")).unwrap(), "*.log\n");
 
         assert_eq!(fs::read_to_string(folder.path().join("app.toml")).unwrap(), "a = 1\n");
         fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
@@ -1805,5 +1809,194 @@ fn two_working_copies_of_one_area_both_follow_it() {
         assert_eq!(app, "a = 2\n", "{backend}");
         first_sync.stop();
         second_sync.stop();
+    }
+}
+
+#[test]
+fn a_new_working_copy_ignores_editor_and_os_leftovers() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        let ignore = fs::read_to_string(folder.path().join(".tidings/ignore")).unwrap();
+        let patterns: Vec<&str> =
+            ignore.lines().filter(|line| !line.is_empty() && !line.starts_with('#')).collect();
+        assert_eq!(patterns, [".*.sw?", "*~", "4913", ".DS_Store", "Thumbs.db", ".#*"]);
+
+        // What vim leaves behind while saving, and what macOS and Windows drop into folders.
+        fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
+        fs::write(folder.path().join(".app.toml.swp"), [0xff, 0xfe]).unwrap();
+        fs::write(folder.path().join("app.toml~"), "a = 1\n").unwrap();
+        fs::write(folder.path().join("themes/4913"), "").unwrap();
+        fs::write(folder.path().join("themes/.DS_Store"), [0]).unwrap();
+        fs::write(folder.path().join("Thumbs.db"), "").unwrap();
+        fs::write(folder.path().join(".#app.toml"), "").unwrap();
+        let run = commit_in(folder.path(), &[]).expect_success();
+        assert_eq!(run.stdout, "modified app.toml\n", "{backend}: {run:?}");
+        assert_eq!(location.read("config", "app.toml"), "a = 2\n", "{backend}");
+        location.run(&["store", "read", "config", "app.toml~"]).expect_code(2);
+    }
+}
+
+#[test]
+fn removing_a_pattern_from_the_ignore_file_lets_a_matching_file_be_committed() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        fs::write(folder.path().join(".DS_Store"), "mine\n").unwrap();
+        let run = commit_in(folder.path(), &[]).expect_success();
+        assert!(run.stderr.contains("nothing to commit"), "{backend}: {run:?}");
+
+        // Each command reads the ignore file afresh.
+        let ignore = folder.path().join(".tidings/ignore");
+        let without = fs::read_to_string(&ignore).unwrap().replace(".DS_Store\n", "");
+        fs::write(&ignore, without).unwrap();
+        let run = commit_in(folder.path(), &[]).expect_success();
+        assert_eq!(run.stdout, "added .DS_Store\n", "{backend}: {run:?}");
+        assert_eq!(location.read("config", ".DS_Store"), "mine\n", "{backend}");
+    }
+}
+
+#[test]
+fn a_store_file_matching_the_ignore_file_is_synced_and_its_edits_committed() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        location.write("config", "notes.txt~", "theirs\n");
+        let folder = TempDir::new().unwrap();
+        let mut sync = Sync::start(&location, "config", folder.path());
+        let events = sync.wait_for("caught-up");
+        assert!(paths(&events, "created").contains(&"notes.txt~"), "{backend}: {events:?}");
+
+        location.write("config", "4913", "four\n");
+        let events = sync.wait_for("caught-up");
+        assert_eq!(paths(&events, "created"), ["4913"], "{backend}: {events:?}");
+        sync.stop();
+        assert_eq!(fs::read_to_string(folder.path().join("4913")).unwrap(), "four\n");
+
+        // Having a Base, they are tracked like any other File.
+        fs::write(folder.path().join("notes.txt~"), "mine\n").unwrap();
+        fs::remove_file(folder.path().join("4913")).unwrap();
+        let run = commit_in(folder.path(), &[]).expect_success();
+        assert_eq!(run.stdout, "modified notes.txt~\ndeleted 4913\n", "{backend}: {run:?}");
+        assert_eq!(location.read("config", "notes.txt~"), "mine\n", "{backend}");
+        location.run(&["store", "read", "config", "4913"]).expect_code(2);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_that_cant_be_a_file_refuses_the_commit_until_it_is_ignored() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
+        // A name Windows can't hold, contents that aren't text, a symlink and a named pipe.
+        fs::write(folder.path().join("what?.toml"), "q\n").unwrap();
+        fs::write(folder.path().join("themes/logo.png"), [0x89, 0x50, 0xff]).unwrap();
+        std::os::unix::fs::symlink("app.toml", folder.path().join("link.toml")).unwrap();
+        let pipe = folder.path().join("themes/pipe");
+        assert!(std::process::Command::new("mkfifo").arg(&pipe).status().unwrap().success());
+
+        let run = commit_in(folder.path(), &[]).expect_code(1);
+        let listed: Vec<&str> = run.stderr.lines().skip(1).map(str::trim).collect();
+        assert_eq!(
+            listed,
+            [
+                "invalid link.toml: is a symlink",
+                "invalid themes/logo.png: isn't UTF-8 text",
+                "invalid themes/pipe: isn't a regular file",
+                "invalid what?.toml: isn't a valid Path: a segment is not a name every platform \
+                 accepts",
+            ],
+            "{backend}: {run:?}"
+        );
+        assert_eq!(location.read("config", "app.toml"), "a = 1\n", "{backend}");
+
+        // With `--json`, the same as data.
+        let run = commit_in(folder.path(), &["--json", "themes"]).expect_code(1);
+        let json: serde_json::Value = serde_json::from_str(&run.stderr).unwrap();
+        assert_eq!(json["failure"], "invalid", "{backend}: {json}");
+        let names: Vec<&str> =
+            json["paths"].as_array().unwrap().iter().map(|p| p["path"].as_str().unwrap()).collect();
+        assert_eq!(names, ["themes/logo.png", "themes/pipe"], "{backend}: {json}");
+
+        // Only a file that would be committed refuses it.
+        let run = commit_in(folder.path(), &["app.toml"]).expect_success();
+        assert_eq!(run.stdout, "modified app.toml\n", "{backend}: {run:?}");
+
+        // Ignoring them lets the commit go ahead.
+        let ignore = folder.path().join(".tidings/ignore");
+        let patterns = "what?.toml\nlink.toml\n*.png\nthemes/pipe\n";
+        fs::write(&ignore, fs::read_to_string(&ignore).unwrap() + patterns).unwrap();
+        fs::write(folder.path().join("keys.toml"), "k\n").unwrap();
+        let run = commit_in(folder.path(), &[]).expect_success();
+        assert_eq!(run.stdout, "added keys.toml\n", "{backend}: {run:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_tracked_path_replaced_by_a_symlink_is_invalid_not_deleted() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        let dark = folder.path().join("themes/dark.toml");
+        fs::remove_file(&dark).unwrap();
+        std::os::unix::fs::symlink("../app.toml", &dark).unwrap();
+        fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
+        // Even a pattern matching it doesn't leave out a Path with a Base.
+        let ignore = folder.path().join(".tidings/ignore");
+        fs::write(&ignore, fs::read_to_string(&ignore).unwrap() + "*.toml\n").unwrap();
+
+        let run = commit_in(folder.path(), &["themes/dark.toml"]).expect_code(1);
+        assert!(
+            run.stderr.contains("invalid themes/dark.toml: is a symlink"),
+            "{backend}: {run:?}"
+        );
+        commit_in(folder.path(), &[]).expect_code(1);
+        assert_eq!(location.read("config", "themes/dark.toml"), "bg = \"black\"\n", "{backend}");
+
+        let run = commit_in(folder.path(), &["app.toml"]).expect_success();
+        assert_eq!(run.stdout, "modified app.toml\n", "{backend}: {run:?}");
+    }
+}
+
+#[test]
+fn empty_directories_are_never_committed() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        fs::create_dir_all(folder.path().join("keys/empty")).unwrap();
+        fs::create_dir(folder.path().join("what?")).unwrap();
+        let run = commit_in(folder.path(), &[]).expect_success();
+        assert!(run.stdout.is_empty() && run.stderr.contains("nothing to commit"), "{run:?}");
+        let run = commit_in(folder.path(), &["keys"]).expect_code(1);
+        assert!(run.stderr.contains("keys: no such file"), "{backend}: {run:?}");
+    }
+}
+
+#[test]
+fn naming_an_ignored_file_says_it_is_ignored() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        fs::write(folder.path().join("themes/dark.toml~"), "old\n").unwrap();
+        fs::create_dir(folder.path().join("backup")).unwrap();
+        fs::write(folder.path().join("backup/app.toml~"), "old\n").unwrap();
+
+        let run = commit_in(folder.path(), &["themes/dark.toml~"]).expect_code(1);
+        let why = "themes/dark.toml~: is left out by .tidings/ignore";
+        assert!(run.stderr.contains(why), "{backend}: {run:?}");
+        let run = commit_in(folder.path(), &["backup"]).expect_code(1);
+        let why = "backup: holds only files .tidings/ignore leaves out";
+        assert!(run.stderr.contains(why), "{backend}: {run:?}");
+        // A directory holding other files has nothing to commit.
+        let run = commit_in(folder.path(), &["themes"]).expect_success();
+        assert!(run.stderr.contains("nothing to commit"), "{backend}: {run:?}");
     }
 }

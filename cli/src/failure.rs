@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use tidings::Area;
 
 use crate::output::{EventParts, area_name};
-use crate::working_copy::{Reconciled, SyncEvent};
+use crate::working_copy::{InvalidFile, Reconciled, SyncEvent};
 
 /// A command that failed: what to tell the person, and the exit code.
 #[derive(Debug)]
@@ -26,6 +26,8 @@ enum Outcomes {
     Diverged(Vec<SyncEvent>),
     /// A Conflict, after which each Path it named was reconciled as `sync` would.
     Conflict(Vec<Reconciled>),
+    /// It was refused because these files can't become Files.
+    Invalid(Vec<InvalidFile>),
 }
 
 /// Each exit code other than success.
@@ -71,6 +73,18 @@ impl Failure {
         )
     }
 
+    /// A Working copy's commit was refused because the files in `invalid` can't become Files,
+    /// which exits with 1.
+    pub fn invalid(invalid: Vec<InvalidFile>) -> Failure {
+        let message = "can't commit files that can't be Files: rename or remove each, or leave it \
+                       out with .tidings/ignore";
+        Failure {
+            kind: FailureKind::Error,
+            message: message.to_owned(),
+            outcomes: Some(Outcomes::Invalid(invalid)),
+        }
+    }
+
     /// There is no File at `path` in `area`.
     pub fn missing(area: Area, path: &str) -> Failure {
         let message = format!("no File at {} {path}", area_name(area));
@@ -100,10 +114,12 @@ impl Failure {
 
     /// Prints this on stderr: for a person, or, with `json`, as one JSON object on one line, as in
     /// `{"failure": "missing", "message": "no File at data a.txt"}`. The failure is `error`,
-    /// `missing` or `conflict`, as [`FailureKind`] says, or `diverged` for a commit refused
-    /// because of Diverged Paths. A Working copy's commit stopped by Paths also gives
-    /// `"paths": […]`, each as `sync --json` gives an event, or, for one that took the Store's
-    /// version as its Base, as `{"event": "same", "path": "…", "message": "…"}`.
+    /// `missing` or `conflict`, as [`FailureKind`] says, or `diverged` or `invalid` for a commit
+    /// refused because of Diverged Paths or files that can't be Files. A Working copy's commit
+    /// stopped by Paths also gives `"paths": […]`, each as `sync --json` gives an event, or, for
+    /// one that took the Store's version as its Base, as `{"event": "same", "path": "…",
+    /// "message": "…"}`, or for a file that can't be a File, as `{"event": "invalid", "path":
+    /// "…", "message": "is a symlink"}`.
     pub fn print(&self, json: bool) {
         if !json {
             eprintln!("tidings: {self}");
@@ -111,6 +127,7 @@ impl Failure {
         }
         let failure = match (self.kind, &self.outcomes) {
             (_, Some(Outcomes::Diverged(_))) => "diverged",
+            (_, Some(Outcomes::Invalid(_))) => "invalid",
             (FailureKind::Error, _) => "error",
             (FailureKind::Missing, _) => "missing",
             (FailureKind::Conflict, _) => "conflict",
@@ -131,6 +148,15 @@ impl Failure {
             Some(Outcomes::Conflict(reconciled)) => {
                 reconciled.iter().map(reconciled_parts).collect()
             }
+            Some(Outcomes::Invalid(invalid)) => invalid
+                .iter()
+                .map(|file| EventParts {
+                    name: "invalid",
+                    path: Some(&file.name),
+                    message: Some(file.reason.clone()),
+                    theirs: None,
+                })
+                .collect(),
         }
     }
 }
@@ -141,7 +167,7 @@ fn reconciled_parts(reconciled: &Reconciled) -> EventParts<'_> {
         Reconciled::Event(event) => EventParts::of(event),
         Reconciled::TookStoresFile(path) => EventParts {
             name: "same",
-            path: Some(path),
+            path: Some(path.as_str()),
             message: Some("the Store has the same contents, which are now its Base".to_owned()),
             theirs: None,
         },

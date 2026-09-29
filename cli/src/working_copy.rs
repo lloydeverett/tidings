@@ -12,6 +12,8 @@ use std::io::{self, ErrorKind, Write};
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::pin::{Pin, pin};
 
+use atomic_write_file::AtomicWriteFile;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use tidings::{
     Area, ChangeFeed, Committed, FeedItem, File, Path, Precondition, Revision, Staging, Store,
 };
@@ -41,6 +43,23 @@ const TMP_DIRECTORY: &str = "tmp";
 /// The directory in [`RECORD_DIRECTORY`] that holds the Store's version of each Diverged Path, at
 /// its Path.
 const THEIRS_DIRECTORY: &str = "theirs";
+
+/// The ignore file in [`RECORD_DIRECTORY`], in `.gitignore` syntax: a file with no Base that
+/// matches it is left out of a commit.
+const IGNORE_FILE: &str = "ignore";
+
+/// What the ignore file of a new Working copy holds: the files editors and operating systems leave
+/// in a folder.
+const DEFAULT_IGNORE: &str = "\
+# Files with no Base that match a pattern here, in .gitignore syntax, are left out of
+# `tidings commit`. A File the Store holds is always synced and committed, even if it matches.
+.*.sw?
+*~
+4913
+.DS_Store
+Thumbs.db
+.#*
+";
 
 /// A folder that is a Working copy, and the Store and Area its record names, which never change.
 /// Its Bases are read from the record only under [`Lock`], since another command may change them.
@@ -186,34 +205,36 @@ enum Selection {
 }
 
 impl Selection {
-    /// Whether this covers `path`.
-    fn covers(&self, path: &Path) -> bool {
+    /// Whether this covers `name`: a Path, or the name of a file in the folder relative to it.
+    fn covers(&self, name: &str) -> bool {
         match self {
             Selection::All => true,
-            Selection::Named(named) => named.iter().any(|named| named.target.covers(path)),
+            Selection::Named(named) => named.iter().any(|named| named.target.covers(name)),
         }
     }
 
-    /// Fails unless each named path covers a file in `files` or a Path in `record`, so that a
-    /// mistyped one isn't taken for one with nothing to commit.
-    fn check_each_names_something(
-        &self,
-        files: &BTreeMap<Path, String>,
-        record: &Record,
-    ) -> Result<(), Failure> {
+    /// Fails unless each named path covers a file in `scan` or a Path in `record`, so that a
+    /// mistyped one isn't taken for one with nothing to commit, nor an ignored one for one that
+    /// would be committed.
+    fn check_each_names_something(&self, scan: &Scan, record: &Record) -> Result<(), Failure> {
         let Selection::Named(named) = self else { return Ok(()) };
-        let known = files.keys().chain(record.bases.keys()).chain(record.divergences.keys());
+        let paths = scan.files.keys().chain(record.bases.keys()).chain(record.divergences.keys());
+        let known = paths.map(Path::as_str).chain(scan.invalid.iter().map(|file| &*file.name));
         for NamedPath { given, target } in named {
-            let names_something = match target {
-                Target::Folder => true,
-                Target::Under(_) => known.clone().any(|path| target.covers(path)),
-            };
-            if !names_something {
-                return Err(Failure::error(format!(
-                    "{}: no such file in the Working copy",
-                    given.display()
-                )));
+            if target.covers_any(known.clone()) {
+                continue;
             }
+            let why = if matches!(target, Target::Under(name) if scan.ignored.contains(name)) {
+                format!(
+                    "is left out by {RECORD_DIRECTORY}/{IGNORE_FILE}: remove the pattern that \
+                     matches it there to commit it"
+                )
+            } else if target.covers_any(scan.ignored.iter().map(String::as_str)) {
+                format!("holds only files {RECORD_DIRECTORY}/{IGNORE_FILE} leaves out")
+            } else {
+                "no such file in the Working copy".to_owned()
+            };
+            return Err(Failure::error(format!("{}: {why}", given.display())));
         }
         Ok(())
     }
@@ -236,16 +257,46 @@ enum Target {
 }
 
 impl Target {
-    /// Whether this covers `path`.
-    fn covers(&self, path: &Path) -> bool {
+    /// Whether this covers `name`: a Path, or the name of a file in the folder relative to it.
+    fn covers(&self, name: &str) -> bool {
         match self {
             Target::Folder => true,
-            Target::Under(name) => path
-                .as_str()
-                .strip_prefix(name.as_str())
+            Target::Under(target) => name
+                .strip_prefix(target.as_str())
                 .is_some_and(|rest| rest.is_empty() || rest.starts_with('/')),
         }
     }
+
+    /// Whether this names something among `names`, each a Path or the name of a file relative to
+    /// the folder: whether it covers any of them, or is the whole folder, even if that is empty.
+    fn covers_any<'a>(&self, mut names: impl Iterator<Item = &'a str>) -> bool {
+        match self {
+            Target::Folder => true,
+            Target::Under(_) => names.any(|name| self.covers(name)),
+        }
+    }
+}
+
+/// What scanning the folder found, outside `.tidings/`.
+#[derive(Default)]
+struct Scan {
+    /// Each file that can become a File, with its contents.
+    files: BTreeMap<Path, String>,
+    /// Each file that can't become a File, in order of name.
+    invalid: Vec<InvalidFile>,
+    /// The name of each file with no Base that the ignore file leaves out, relative to the folder
+    /// as [`InvalidFile::name`] is, in order.
+    ignored: Vec<String>,
+}
+
+/// A file in the folder that can't become a File.
+#[derive(Debug)]
+pub struct InvalidFile {
+    /// Its name relative to the folder, with `/` between names, as in `themes/dark.toml`, and any
+    /// part that isn't UTF-8 shown with U+FFFD.
+    pub name: String,
+    /// Why it can't become a File, as in "is a symlink".
+    pub reason: String,
 }
 
 /// What in the folder keeps the Store's version of a Path from being applied there: one of the
@@ -353,10 +404,22 @@ impl WorkingCopy {
         ))
     }
 
-    /// Saves the record of a new Working copy, with no Files yet, once
-    /// [`WorkingCopy::check_can_create`] has passed the folder under the [`SyncLock`].
+    /// Saves the ignore file of a new Working copy, holding [`DEFAULT_IGNORE`], then its record,
+    /// with no Files yet, once [`WorkingCopy::check_can_create`] has passed the folder under the
+    /// [`SyncLock`]. An ignore file already there, which only a `sync` that stopped before saving
+    /// the record, or the person, could have written, is kept.
     fn save_new_record(&self) -> Result<(), Failure> {
         let _lock = self.lock_waiting(LOCK_FILE)?;
+        let ignore = self.folder.join(RECORD_DIRECTORY).join(IGNORE_FILE);
+        if fs::symlink_metadata(&ignore).is_err() {
+            // Whole or not at all, so that it never holds only some of the patterns.
+            let write = || -> io::Result<()> {
+                let mut file = AtomicWriteFile::open(&ignore)?;
+                file.write_all(DEFAULT_IGNORE.as_bytes())?;
+                file.commit()
+            };
+            write().map_err(failed_at(&ignore))?;
+        }
         self.save(&Record::new(self.store.clone(), self.area))
     }
 
@@ -807,10 +870,11 @@ impl WorkingCopy {
     /// is unchanged since its Base. The committed Revisions become the new Bases, as they do when
     /// the Commit gives [`tidings::Error::Pending`], which the report says.
     ///
-    /// Refused, exiting with 3, if any Path it would commit is Diverged. On a Conflict, nothing is
-    /// committed: each Path it names is reconciled as `sync` would, which makes it Diverged, or
-    /// gives it the new Base if the local contents turn out the same as the Store's, and the
-    /// failure says which.
+    /// Files with no Base that the ignore file matches are left out. Refused, exiting with 3, if
+    /// any Path it would commit is Diverged, and with 1 if any file it would commit can't become a
+    /// File, naming each. On a Conflict, nothing is committed: each Path it names is reconciled as
+    /// `sync` would, which makes it Diverged, or gives it the new Base if the local contents turn
+    /// out the same as the Store's, and the failure says which.
     pub async fn commit(
         &self,
         store: &Store,
@@ -820,8 +884,10 @@ impl WorkingCopy {
         let mut lock = self.lock()?;
         let selection = self.select(named, current)?;
         refuse_diverged(&lock.record, &selection)?;
-        let files = self.scan()?;
-        selection.check_each_names_something(&files, &lock.record)?;
+        let scan = self.scan(&lock.record.bases)?;
+        selection.check_each_names_something(&scan, &lock.record)?;
+        refuse_invalid(scan.invalid, &selection)?;
+        let files = scan.files;
         let (staging, changes) = self.stage(&files, &lock.record.bases, &selection)?;
         if changes.is_empty() {
             return Ok(CommitReport { changes: Vec::new(), pending: false, events: Vec::new() });
@@ -859,7 +925,7 @@ impl WorkingCopy {
     ) -> Result<(Staging, Vec<(Path, LocalChange)>), Failure> {
         let mut staging = Staging::new(self.area);
         let mut changes = Vec::new();
-        for (path, contents) in files.iter().filter(|(path, _)| selection.covers(path)) {
+        for (path, contents) in files.iter().filter(|(path, _)| selection.covers(path.as_str())) {
             let (change, precondition) = match bases.get(path) {
                 None => (LocalChange::Added, Precondition::Absent),
                 Some(base) if Hash::of(contents) != base.hash => {
@@ -870,7 +936,7 @@ impl WorkingCopy {
             staging.write_requiring(path, contents.as_str(), precondition)?;
             changes.push((path.clone(), change));
         }
-        for (path, base) in bases.iter().filter(|(path, _)| selection.covers(path)) {
+        for (path, base) in bases.iter().filter(|(path, _)| selection.covers(path.as_str())) {
             if !files.contains_key(path) {
                 staging.delete_requiring(path, Precondition::UnchangedSince(base.revision))?;
                 changes.push((path.clone(), LocalChange::Deleted));
@@ -997,46 +1063,98 @@ impl WorkingCopy {
         }
     }
 
-    /// Every file in the folder, outside `.tidings/`, with its contents.
-    fn scan(&self) -> Result<BTreeMap<Path, String>, Failure> {
-        let mut files = BTreeMap::new();
-        self.scan_directory(&self.folder, "", &mut files)?;
-        Ok(files)
+    /// Every file in the folder, outside `.tidings/`: with its contents, if it can become a File,
+    /// or else why not. A file with no Base in `bases` that the ignore file matches is only named,
+    /// as ignored. Empty directories hold no files, so they are never found.
+    fn scan(&self, bases: &BTreeMap<Path, Base>) -> Result<Scan, Failure> {
+        let mut scan = Scan::default();
+        let ignore = self.read_ignore_file()?;
+        self.scan_directory(FsPath::new(""), bases, &ignore, &mut scan)?;
+        scan.invalid.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        scan.ignored.sort_unstable();
+        Ok(scan)
     }
 
-    /// Adds every file under `directory`, whose Prefix is `prefix`, to `files`.
+    /// Adds every file under `directory`, relative to the folder, to `scan`, as
+    /// [`WorkingCopy::scan`] says.
     fn scan_directory(
         &self,
         directory: &FsPath,
-        prefix: &str,
-        files: &mut BTreeMap<Path, String>,
+        bases: &BTreeMap<Path, Base>,
+        ignore: &Gitignore,
+        scan: &mut Scan,
     ) -> Result<(), Failure> {
-        let in_directory = failed_at(directory);
-        for entry in fs::read_dir(directory).map_err(in_directory)? {
+        let in_folder = self.folder.join(directory);
+        let in_directory = failed_at(&in_folder);
+        for entry in fs::read_dir(&in_folder).map_err(in_directory)? {
             let entry = entry.map_err(in_directory)?;
-            let at = entry.path();
-            let invalid = |why: &str| Failure::error(format!("{} {why}", at.display()));
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                return Err(invalid("has a name that isn't UTF-8"));
-            };
-            if prefix.is_empty() && name.eq_ignore_ascii_case(RECORD_DIRECTORY) {
+            let file_name = entry.file_name();
+            if directory.as_os_str().is_empty()
+                && file_name
+                    .to_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(RECORD_DIRECTORY))
+            {
                 continue;
             }
+            let relative = directory.join(&file_name);
             let file_type = entry.file_type().map_err(in_directory)?;
             if file_type.is_dir() {
-                self.scan_directory(&at, &format!("{prefix}{name}/"), files)?;
-            } else if file_type.is_file() {
-                let path = Path::new(format!("{prefix}{name}"))?;
-                let contents = fs::read_to_string(&at).map_err(|error| match error.kind() {
-                    ErrorKind::InvalidData => invalid("isn't UTF-8 text"),
-                    _ => failed_at(&at)(error),
-                })?;
-                files.insert(path, contents);
-            } else {
-                return Err(invalid("isn't a regular file"));
+                self.scan_directory(&relative, bases, ignore, scan)?;
+                continue;
             }
+            let name = relative
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            let path = match relative.to_str() {
+                Some(_) => Path::new(name.as_str()).map_err(Some),
+                None => Err(None),
+            };
+            let has_base = path.as_ref().is_ok_and(|path| bases.contains_key(path));
+            let at = self.folder.join(&relative);
+            if !has_base && ignore.matched_path_or_any_parents(&at, false).is_ignore() {
+                scan.ignored.push(name);
+                continue;
+            }
+            let reason = match path {
+                Err(None) => "has a name that isn't UTF-8".to_owned(),
+                Err(Some(tidings::Error::InvalidPath { reason, .. })) => {
+                    format!("isn't a valid Path: {reason}")
+                }
+                Err(Some(error)) => return Err(Failure::from(error).in_context(name)),
+                Ok(_) if file_type.is_symlink() => "is a symlink".to_owned(),
+                Ok(_) if !file_type.is_file() => "isn't a regular file".to_owned(),
+                Ok(path) => match fs::read_to_string(&at) {
+                    Ok(contents) => {
+                        scan.files.insert(path, contents);
+                        continue;
+                    }
+                    Err(error) if error.kind() == ErrorKind::InvalidData => {
+                        "isn't UTF-8 text".to_owned()
+                    }
+                    Err(error) => return Err(failed_at(&at)(error)),
+                },
+            };
+            scan.invalid.push(InvalidFile { name, reason });
         }
         Ok(())
+    }
+
+    /// The ignore file, read afresh, as a matcher for files anywhere in the folder. A missing one
+    /// matches nothing, as does anything there that isn't a regular file, which isn't followed.
+    fn read_ignore_file(&self) -> Result<Gitignore, Failure> {
+        let file = self.folder.join(RECORD_DIRECTORY).join(IGNORE_FILE);
+        let mut builder = GitignoreBuilder::new(&self.folder);
+        if fs::symlink_metadata(&file).is_ok_and(|metadata| metadata.is_file()) {
+            let text = fs::read_to_string(&file).map_err(failed_at(&file))?;
+            for line in text.lines() {
+                builder
+                    .add_line(None, line)
+                    .map_err(|error| Failure::error(format!("{}: {error}", file.display())))?;
+            }
+        }
+        builder.build().map_err(|error| Failure::error(format!("{}: {error}", file.display())))
     }
 
     /// Locks `.tidings/lock`, waiting for any other command holding it, and reads the record
@@ -1156,7 +1274,7 @@ fn refuse_diverged(record: &Record, selection: &Selection) -> Result<(), Failure
     let diverged: Vec<SyncEvent> = record
         .divergences
         .iter()
-        .filter(|(path, _)| selection.covers(path))
+        .filter(|(path, _)| selection.covers(path.as_str()))
         .map(|(path, divergence)| SyncEvent::Diverged {
             path: path.clone(),
             theirs_file: divergence.theirs_revision.map(|_| theirs_file(path)),
@@ -1164,6 +1282,14 @@ fn refuse_diverged(record: &Record, selection: &Selection) -> Result<(), Failure
         })
         .collect();
     if diverged.is_empty() { Ok(()) } else { Err(Failure::diverged(diverged)) }
+}
+
+/// Fails, naming each, if `selection` covers any of `invalid`, files that can't become Files, since
+/// an all-or-nothing commit mustn't silently leave them out.
+fn refuse_invalid(invalid: Vec<InvalidFile>, selection: &Selection) -> Result<(), Failure> {
+    let invalid: Vec<InvalidFile> =
+        invalid.into_iter().filter(|file| selection.covers(&file.name)).collect();
+    if invalid.is_empty() { Ok(()) } else { Err(Failure::invalid(invalid)) }
 }
 
 /// What became of each of `paths`, which a Conflict named, given the `events` reconciling them
@@ -1222,17 +1348,20 @@ fn is_missing_empty_or_unfinished(folder: &FsPath) -> Result<bool, Failure> {
 }
 
 /// Whether `directory`, a `.tidings/`, holds only what making a Working copy leaves before it
-/// writes the record: the lock files, and a temporary file the record was being written to.
+/// writes the record: the lock files, the ignore file, and a temporary file the ignore file or the
+/// record was being written to.
 ///
-/// These are the only leftovers allowed, so once [`WorkingCopy::open_or_create`] makes more in
-/// `.tidings/` before writing the record (the spec's `ignore` file and `tmp/`), they must be added
-/// here.
+/// These are the only leftovers allowed, so if [`WorkingCopy::open_or_create`] makes more in
+/// `.tidings/` before writing the record, they must be added here.
 fn holds_no_record(directory: &FsPath) -> Result<bool, Failure> {
-    let temporary = format!(".{RECORD_FILE}.");
+    // As `atomic-write-file` names them, which it doesn't document.
+    let temporary = [format!(".{RECORD_FILE}."), format!(".{IGNORE_FILE}.")];
     for entry in fs::read_dir(directory).map_err(failed_at(directory))? {
         let name = entry.map_err(failed_at(directory))?.file_name();
         let name = name.to_string_lossy();
-        if name != LOCK_FILE && name != SYNC_LOCK_FILE && !name.starts_with(&temporary) {
+        let allowed = [LOCK_FILE, SYNC_LOCK_FILE, IGNORE_FILE].contains(&&*name)
+            || temporary.iter().any(|prefix| name.starts_with(prefix.as_str()));
+        if !allowed {
             return Ok(false);
         }
     }
