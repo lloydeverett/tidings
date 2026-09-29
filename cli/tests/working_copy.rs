@@ -874,13 +874,13 @@ fn a_theirs_that_cant_be_written_is_an_error_and_sync_carries_on() {
         let mut command = location.command(&["--json"]);
         command.args(["sync", "--quiet", "config"]).arg(folder.path());
         let mut sync = Sync::spawn(command);
-        let diverged: serde_json::Value = serde_json::from_str(&sync.next_line()).unwrap();
-        assert_eq!(diverged["event"], "diverged", "{backend}: {diverged}");
+        // Only the error, since a *diverged* line would name a `theirs` file that wasn't written.
         let error: serde_json::Value = serde_json::from_str(&sync.next_line()).unwrap();
         assert_eq!(error["event"], "error", "{backend}: {error}");
         assert_eq!(error["path"], "app.toml", "{backend}: {error}");
-        let message = error["message"].as_str().unwrap();
-        assert!(message.contains("theirs is a symlink"), "{backend}: {error}");
+        let message = "Diverged, but can't write .tidings/theirs/app.toml: \
+                       theirs is a symlink in .tidings";
+        assert_eq!(error["message"], message, "{backend}: {error}");
 
         // `sync` carries on with the other Paths.
         location.write("config", "later.toml", "later\n");
@@ -900,6 +900,118 @@ fn a_theirs_that_cant_be_written_is_an_error_and_sync_carries_on() {
         assert_eq!(written, "theirs\n", "{backend}");
         let run = commit_in(folder.path(), &[]).expect_code(3);
         assert!(run.stderr.contains("app.toml"), "{backend}: {run:?}");
+    }
+}
+
+#[test]
+fn a_theirs_that_cant_be_written_is_reported_once_until_the_divergence_changes() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        let mut sync = Sync::start(&location, "config", folder.path());
+        sync.wait_for("caught-up");
+        // A directory of the person's where `theirs` would be written.
+        let theirs_directory = theirs(folder.path(), "app.toml");
+        fs::create_dir_all(&theirs_directory).unwrap();
+        fs::write(theirs_directory.join("keep"), "keep\n").unwrap();
+        fs::write(folder.path().join("app.toml"), "mine\n").unwrap();
+
+        location.write("config", "app.toml", "theirs 1\n");
+        let events = sync.wait_for("caught-up");
+        let names: Vec<&str> =
+            events.iter().map(|event| event["event"].as_str().unwrap()).collect();
+        assert_eq!(names, ["error", "caught-up"], "{backend}: {events:?}");
+        let message = message_for(&events, "app.toml");
+        let why = message.strip_prefix("Diverged, but can't write .tidings/theirs/app.toml: ");
+        // Naming the file once, relative to the folder.
+        assert!(why.is_some_and(|why| !why.contains('/')), "{backend}: {message}");
+
+        // Tried again on every reconcile, but not reported again.
+        location.write("config", "other.toml", "other\n");
+        let events = sync.wait_for("caught-up");
+        assert_eq!(paths(&events, "created"), ["other.toml"], "{backend}: {events:?}");
+        assert_eq!(events.len(), 2, "{backend}: {events:?}");
+
+        // Until the Divergence changes.
+        location.write("config", "app.toml", "theirs 2\n");
+        let events = sync.wait_for("caught-up");
+        assert_eq!(paths(&events, "error"), ["app.toml"], "{backend}: {events:?}");
+        assert_eq!(events.len(), 2, "{backend}: {events:?}");
+
+        // Once the directory is gone, the next reconcile writes `theirs`, silently.
+        fs::remove_dir_all(&theirs_directory).unwrap();
+        location.write("config", "another.toml", "another\n");
+        let events = sync.wait_for("caught-up");
+        assert_eq!(paths(&events, "created"), ["another.toml"], "{backend}: {events:?}");
+        assert_eq!(events.len(), 2, "{backend}: {events:?}");
+        sync.stop();
+        let written = fs::read_to_string(theirs(folder.path(), "app.toml")).unwrap();
+        assert_eq!(written, "theirs 2\n", "{backend}");
+        assert_eq!(fs::read_to_string(folder.path().join("app.toml")).unwrap(), "mine\n");
+    }
+}
+
+#[test]
+fn a_theirs_that_cant_be_removed_is_an_error_and_sync_carries_on() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        let mut sync = Sync::start(&location, "config", folder.path());
+        sync.wait_for("caught-up");
+        fs::write(folder.path().join("app.toml"), "mine\n").unwrap();
+        fs::write(folder.path().join("themes/dark.toml"), "mine\n").unwrap();
+        location.write("config", "app.toml", "theirs\n");
+        location.write("config", "themes/dark.toml", "theirs\n");
+        let mut diverged = Vec::new();
+        while diverged.len() < 2 {
+            let events = sync.wait_for("caught-up");
+            diverged.extend(paths(&events, "diverged").into_iter().map(str::to_owned));
+        }
+        // The person puts a directory of their own in place of the `theirs` file, and the Store
+        // goes back to its Base, so the Path is no longer Diverged, all the same.
+        let replace_theirs = |path| {
+            let theirs_file = theirs(folder.path(), path);
+            fs::remove_file(&theirs_file).unwrap();
+            fs::create_dir(&theirs_file).unwrap();
+            fs::write(theirs_file.join("keep"), "keep\n").unwrap();
+        };
+        replace_theirs("app.toml");
+        location.write("config", "app.toml", "a = 1\n");
+        let events = sync.wait_for("caught-up");
+        assert_eq!(paths(&events, "resolved"), ["app.toml"], "{backend}: {events:?}");
+        assert_eq!(paths(&events, "error"), ["app.toml"], "{backend}: {events:?}");
+        let error = events.iter().find(|event| event["event"] == "error").unwrap();
+        let message = error["message"].as_str().unwrap();
+        let why = message.strip_prefix("can't remove .tidings/theirs/app.toml: ");
+        assert!(why.is_some_and(|why| !why.contains('/')), "{backend}: {message}");
+
+        // Likewise, but removed in the Store, so Diverged with no `theirs`.
+        replace_theirs("themes/dark.toml");
+        location.run(&["store", "delete", "config", "themes/dark.toml"]).expect_success();
+        let events = sync.wait_for("caught-up");
+        let message = message_for(&events, "themes/dark.toml");
+        assert_eq!(message, "removed in the Store", "{backend}: {events:?}");
+        assert_eq!(paths(&events, "error"), ["themes/dark.toml"], "{backend}: {events:?}");
+
+        // `sync` carries on, trying again without reporting either again.
+        location.write("config", "other.toml", "other\n");
+        let events = sync.wait_for("caught-up");
+        assert_eq!(paths(&events, "created"), ["other.toml"], "{backend}: {events:?}");
+        assert_eq!(events.len(), 2, "{backend}: {events:?}");
+        sync.stop();
+        for path in ["app.toml", "themes/dark.toml"] {
+            let kept = fs::read_to_string(theirs(folder.path(), path).join("keep")).unwrap();
+            assert_eq!(kept, "keep\n", "{backend}");
+        }
+
+        // The record was saved: restarting reports neither Path again.
+        let mut sync = Sync::start(&location, "config", folder.path());
+        let events = sync.wait_for("caught-up");
+        assert_eq!(events.len(), 1, "{backend}: {events:?}");
+        sync.stop();
+        let run = commit_in(folder.path(), &[]).expect_code(3);
+        assert!(run.stderr.contains("themes/dark.toml"), "{backend}: {run:?}");
+        assert!(!run.stderr.contains("app.toml"), "{backend}: {run:?}");
     }
 }
 

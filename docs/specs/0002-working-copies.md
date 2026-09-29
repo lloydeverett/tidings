@@ -313,8 +313,12 @@ Revision) and its local state `L`:
 - A Path already Diverged is reconciled the same way: `theirs` is refreshed when `S` changes, or
   written again if it is missing, and the Divergence is cleared if the local contents now equal
   `S`, or if `S` matches `B` again (the first row).
-- If `theirs` can't be written (`.tidings/theirs/` is a symlink, say), the Path is Diverged all the
-  same, an *error* names it and says why, and `sync` carries on; the next reconcile tries again.
+- If `theirs` can't be written or removed (`.tidings/theirs/` is a symlink, or the person put a
+  directory where the file goes, say), the Path is Diverged, or no longer Diverged, all the same,
+  and `sync` carries on. An *error* names the Path and says why, in place of the *diverged* line if
+  `theirs` wasn't written. Each later reconcile tries again, silently: the *error* is reported
+  once while `sync` runs, unless the Path's Divergence changes. Nothing outside `.tidings/theirs/`
+  is written or removed, and no symlink followed.
 - Applying `S` writes the file in `tmp/`, forces it to disk, and renames it into place, making any
   directories it needs; or removes the file, then removes each directory the removal emptied, up to
   the folder, stopping at any that isn't empty. Within one reconcile, removals happen before
