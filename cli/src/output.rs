@@ -8,7 +8,9 @@ use tidings::{
     Area, Change, ChangeKind, Committed, FeedItem, File, Origin, Path, Prefix, PrefixRevision, Stat,
 };
 
-use crate::working_copy::{Blocked, CommitReport, LocalChange, LocalName, SyncEvent};
+use crate::working_copy::{
+    Blocked, CommitReport, LocalChange, LocalName, PathStatus, StatusReport, SyncEvent, Unfit,
+};
 
 /// What a command gives, for [`Output`] to print.
 pub enum Report {
@@ -32,6 +34,8 @@ pub enum Report {
     Cancelled,
     /// What `commit` committed from a Working copy.
     WorkingCopyCommit(CommitReport),
+    /// What `status` found in a Working copy.
+    WorkingCopyStatus(StatusReport),
 }
 
 /// How to print.
@@ -108,6 +112,17 @@ impl Output {
                     eprintln!("{PENDING_NOTE}");
                 }
                 Ok(())
+            }
+            // Each Path, then whether `sync` is running.
+            Report::WorkingCopyStatus(report) => {
+                let mut lines: Vec<String> =
+                    report.paths.iter().map(|path| status_parts(path).line()).collect();
+                if lines.is_empty() {
+                    lines.push("nothing to commit".to_owned());
+                }
+                let sync = if report.syncing { "sync is running" } else { "sync isn't running" };
+                lines.push(sync.to_owned());
+                print_stdout(&lines.iter().map(|line| format!("{line}\n")).collect::<String>())
             }
         }
     }
@@ -225,6 +240,16 @@ impl<'a> EventParts<'a> {
         }
     }
 
+    /// What an *invalid* event says about `unfit`, a file that can't become a File.
+    pub fn invalid(unfit: &'a Unfit) -> EventParts<'a> {
+        EventParts {
+            name: "invalid",
+            subject: Some(Subject::Local(&unfit.name)),
+            message: Some(unfit.reason.clone()),
+            theirs: None,
+        }
+    }
+
     /// As a JSON object, as in `{"event": "created", "path": "a"}`.
     pub fn json(&self) -> Value {
         let mut object = serde_json::Map::new();
@@ -288,6 +313,21 @@ fn diverged_message(theirs_file: Option<&FsPath>, blocked: Option<&Blocked>) -> 
     }
 }
 
+/// What `status` says about one Path, or one file in the folder, as `sync` gives an event: named
+/// `modified`, `added`, `deleted`, `diverged` or `invalid`.
+fn status_parts(status: &PathStatus) -> EventParts<'_> {
+    match status {
+        PathStatus::Changed(path, change) => EventParts {
+            name: change_name(*change),
+            subject: Some(Subject::Path(path)),
+            message: None,
+            theirs: None,
+        },
+        PathStatus::Diverged(event) => EventParts::of(event),
+        PathStatus::Invalid(unfit) => EventParts::invalid(unfit),
+    }
+}
+
 /// `report` as JSON, or `None` if it has nothing to show.
 fn as_json(report: &Report) -> Option<Value> {
     Some(match report {
@@ -334,6 +374,10 @@ fn as_json(report: &Report) -> Option<Value> {
                 .collect::<Vec<_>>(),
             "pending": report.pending,
             "events": report.events.iter().map(event_json).collect::<Vec<_>>(),
+        }),
+        Report::WorkingCopyStatus(report) => json!({
+            "paths": report.paths.iter().map(|path| status_parts(path).json()).collect::<Vec<_>>(),
+            "syncing": report.syncing,
         }),
     })
 }

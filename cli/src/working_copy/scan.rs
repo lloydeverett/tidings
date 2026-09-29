@@ -16,8 +16,8 @@ use atomic_write_file::AtomicWriteFile;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use tidings::{InvalidPathReason, Path};
 
-use super::record::Base;
-use super::{RECORD_DIRECTORY, failed_at};
+use super::record::{Base, Hash};
+use super::{LocalChange, RECORD_DIRECTORY, failed_at};
 use crate::failure::Failure;
 
 /// The ignore file in [`RECORD_DIRECTORY`], in `.gitignore` syntax: a file with no Base that
@@ -48,9 +48,31 @@ pub(super) struct Scan {
     pub(super) ignored: Vec<LocalName>,
 }
 
+impl Scan {
+    /// How each Path differs from its Base in `bases`, which the scan was made with, in order:
+    /// each file that is *added* (it has no Base) or *modified* (its contents differ from its
+    /// Base's), then each Path that is *deleted* (it has a Base but no file, not even one that
+    /// can't become a File). Unchanged Paths aren't given. This is what `commit` commits and
+    /// `status` lists.
+    pub(super) fn changes(&self, bases: &BTreeMap<Path, Base>) -> Vec<(Path, LocalChange)> {
+        let changed = self.files.iter().filter_map(|(path, contents)| match bases.get(path) {
+            None => Some((path.clone(), LocalChange::Added)),
+            Some(base) if Hash::of(contents) != base.hash => {
+                Some((path.clone(), LocalChange::Modified))
+            }
+            Some(_) => None,
+        });
+        let deleted = bases.keys().filter(|path| {
+            !self.files.contains_key(*path)
+                && !self.invalid.iter().any(|unfit| unfit.name.as_str() == path.as_str())
+        });
+        changed.chain(deleted.map(|path| (path.clone(), LocalChange::Deleted))).collect()
+    }
+}
+
 /// Something in the folder that can't become a File: a file whose name or contents can't be a
 /// File's, a symlink, or a special file.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Unfit {
     /// Its name in the folder.
     pub name: LocalName,

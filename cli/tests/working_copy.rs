@@ -2117,3 +2117,217 @@ fn an_ignore_file_that_isnt_utf8_refuses_the_commit_naming_its_line() {
         location.run(&["store", "read", "config", "new.txt"]).expect_code(2);
     }
 }
+
+/// `tidings status <args>`, with no Store flags, run in `directory`.
+fn status_in(directory: &Path, args: &[&str]) -> common::Run {
+    let mut command = tidings();
+    command.arg("status").args(args).current_dir(directory);
+    common::run(command, "")
+}
+
+#[test]
+fn status_lists_what_commit_would_commit() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        location.write("config", "keep.toml", "keep\n");
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+
+        let run = status_in(folder.path(), &[]).expect_success();
+        assert_eq!(run.stdout, "nothing to commit\nsync isn't running\n", "{backend}: {run:?}");
+
+        fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
+        fs::write(folder.path().join("keys.toml"), "k\n").unwrap();
+        fs::remove_file(folder.path().join("themes/dark.toml")).unwrap();
+        // Ignored, and an empty directory, neither of which `commit` would commit.
+        fs::write(folder.path().join(".DS_Store"), "junk").unwrap();
+        fs::create_dir(folder.path().join("empty")).unwrap();
+        let run = status_in(folder.path(), &[]).expect_success();
+        assert_eq!(
+            run.stdout,
+            "modified app.toml\nadded keys.toml\ndeleted themes/dark.toml\nsync isn't running\n",
+            "{backend}: {run:?}"
+        );
+
+        let run = status_in(folder.path(), &["--json"]).expect_success();
+        let json: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+        let expected = serde_json::json!({
+            "paths": [
+                {"event": "modified", "path": "app.toml"},
+                {"event": "added", "path": "keys.toml"},
+                {"event": "deleted", "path": "themes/dark.toml"},
+            ],
+            "syncing": false,
+        });
+        assert_eq!(json, expected, "{backend}: {run:?}");
+    }
+}
+
+#[test]
+fn status_compares_contents_not_modified_times() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+
+        // As `touch` does, and as an editor that writes the same text again does.
+        let app = fs::File::options().write(true).open(folder.path().join("app.toml")).unwrap();
+        app.set_modified(std::time::SystemTime::now() + Duration::from_secs(60)).unwrap();
+        fs::write(folder.path().join("themes/dark.toml"), "bg = \"black\"\n").unwrap();
+        let run = status_in(folder.path(), &[]).expect_success();
+        assert_eq!(run.stdout, "nothing to commit\nsync isn't running\n", "{backend}: {run:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn status_lists_diverged_paths_and_files_that_cant_be_files() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        location.write("config", "gone.toml", "gone\n");
+        let folder = TempDir::new().unwrap();
+        let mut sync = Sync::start(&location, "config", folder.path());
+        sync.wait_for("caught-up");
+        fs::write(folder.path().join("app.toml"), "mine\n").unwrap();
+        fs::write(folder.path().join("gone.toml"), "mine\n").unwrap();
+        location.write("config", "app.toml", "theirs\n");
+        location.run(&["store", "delete", "config", "gone.toml"]).expect_success();
+        wait_for_count(&mut sync, "diverged", 2);
+        sync.stop();
+        // A tracked Path made a symlink is invalid, not deleted, and so is a file that isn't text.
+        let dark = folder.path().join("themes/dark.toml");
+        fs::remove_file(&dark).unwrap();
+        std::os::unix::fs::symlink("../app.toml", &dark).unwrap();
+        fs::write(folder.path().join("logo.png"), [0x89, 0x50, 0xff]).unwrap();
+
+        let run = status_in(folder.path(), &[]).expect_success();
+        let expected = "diverged app.toml: the Store's version is in .tidings/theirs/app.toml\n\
+                        diverged gone.toml: removed in the Store\n\
+                        invalid logo.png: isn't UTF-8 text\n\
+                        invalid themes/dark.toml: is a symlink\n\
+                        sync isn't running\n";
+        assert_eq!(run.stdout, expected, "{backend}: {run:?}");
+
+        let run = status_in(folder.path(), &["--json"]).expect_success();
+        let json: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+        let expected = serde_json::json!({
+            "paths": [
+                {
+                    "event": "diverged",
+                    "path": "app.toml",
+                    "message": "the Store's version is in .tidings/theirs/app.toml",
+                    "theirs": ".tidings/theirs/app.toml",
+                },
+                {
+                    "event": "diverged",
+                    "path": "gone.toml",
+                    "message": "removed in the Store",
+                    "theirs": null,
+                },
+                {"event": "invalid", "path": "logo.png", "message": "isn't UTF-8 text"},
+                {"event": "invalid", "path": "themes/dark.toml", "message": "is a symlink"},
+            ],
+            "syncing": false,
+        });
+        assert_eq!(json, expected, "{backend}: {run:?}");
+    }
+}
+
+#[test]
+fn status_says_whether_sync_is_running_without_disturbing_it() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        let mut sync = Sync::start(&location, "config", folder.path());
+        sync.wait_for("caught-up");
+
+        let run = status_in(folder.path(), &[]).expect_success();
+        assert_eq!(run.stdout, "nothing to commit\nsync is running\n", "{backend}: {run:?}");
+        let run = status_in(folder.path(), &["--json"]).expect_success();
+        let json: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+        assert_eq!(json["syncing"], true, "{backend}: {run:?}");
+        // `sync` still runs, and still follows the Store.
+        location.write("config", "new.toml", "new\n");
+        let events = sync.wait_for("caught-up");
+        assert_eq!(paths(&events, "created"), ["new.toml"], "{backend}: {events:?}");
+        sync.stop();
+
+        let run = status_in(folder.path(), &[]).expect_success();
+        assert_eq!(run.stdout, "nothing to commit\nsync isn't running\n", "{backend}: {run:?}");
+        // Nor does `status` keep a `sync` from starting.
+        synced(&location, "config", folder.path());
+    }
+}
+
+#[test]
+fn status_waits_for_the_working_copys_lock() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
+
+        // As when `sync` is halfway through a reconcile.
+        let lock = fs::File::create(folder.path().join(".tidings/lock")).unwrap();
+        lock.lock().unwrap();
+        let mut command = tidings();
+        command.arg("status").current_dir(folder.path());
+        let mut status = common::spawn(&mut command);
+        thread::sleep(Duration::from_millis(500));
+        assert!(status.try_wait().unwrap().is_none(), "{backend}: status didn't wait");
+        drop(lock);
+
+        let output = status.wait_with_output().unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(0), "{backend}: {stdout}");
+        assert_eq!(stdout, "modified app.toml\nsync isn't running\n", "{backend}");
+    }
+}
+
+#[test]
+fn status_finds_the_working_copy_by_walking_up_or_from_dash_c() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
+        let expected = "modified app.toml\nsync isn't running\n";
+
+        let run = status_in(&folder.path().join("themes"), &[]).expect_success();
+        assert_eq!(run.stdout, expected, "{backend}: {run:?}");
+        let elsewhere = TempDir::new().unwrap();
+        let run = status_in(elsewhere.path(), &["-C", folder.path().to_str().unwrap()]);
+        assert_eq!(run.expect_success().stdout, expected, "{backend}");
+
+        // Store flags given must match the record.
+        let other = elsewhere.path().to_str().unwrap();
+        let run = status_in(folder.path(), &["--root", other]).expect_code(1);
+        assert!(run.stderr.contains(other), "{backend}: {run:?}");
+    }
+
+    let elsewhere = TempDir::new().unwrap();
+    // A `.tidings/` directory alone, as a filesystem Area has, isn't a Working copy.
+    fs::create_dir(elsewhere.path().join(".tidings")).unwrap();
+    let run = status_in(elsewhere.path(), &[]).expect_code(1);
+    assert!(run.stderr.contains("sync") && run.stderr.contains("-C"), "{run:?}");
+    let run = status_in(elsewhere.path(), &["--json"]).expect_code(1);
+    let failure: serde_json::Value = serde_json::from_str(&run.stderr).unwrap();
+    assert_eq!(failure["failure"], "error", "{run:?}");
+}
+
+#[test]
+fn status_refuses_a_malformed_ignore_file_as_commit_does() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        let ignore = folder.path().join(".tidings/ignore");
+        fs::write(&ignore, "*.bak\na{b\n").unwrap();
+
+        let run = status_in(folder.path(), &[]).expect_code(1);
+        assert!(run.stderr.contains(".tidings/ignore:2: "), "{backend}: {run:?}");
+        let run = status_in(folder.path(), &["--json"]).expect_code(1);
+        let failure: serde_json::Value = serde_json::from_str(&run.stderr).unwrap();
+        assert_eq!(failure["failure"], "error", "{backend}: {run:?}");
+    }
+}

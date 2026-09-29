@@ -71,6 +71,16 @@ enum Command {
         /// current directory.
         paths: Vec<PathBuf>,
     },
+    /// Show what `commit` would do in a Working copy, and whether `sync` is running on it
+    ///
+    /// Lists each Path that differs from what the Working copy last took from, or committed to,
+    /// the Store, comparing contents, as modified, added or deleted; each Diverged Path; and each
+    /// file that can't be a File. Unchanged files, and files `.tidings/ignore` leaves out, aren't
+    /// listed. It doesn't ask the Store what changed there: that is what `sync` does.
+    Status {
+        #[command(flatten)]
+        working_copy: WorkingCopyArgs,
+    },
     /// Work on the Store directly: read, write and watch its Files, or keep it open in a shell
     #[command(subcommand)]
     Store(StoreSubcommand),
@@ -140,6 +150,9 @@ fn main() -> ExitCode {
         }
         Command::Commit { working_copy, paths } => {
             runtime.block_on(commit(&cli.store, output, &working_copy, &paths))
+        }
+        Command::Status { working_copy } => {
+            runtime.block_on(status(&cli.store, output, &working_copy))
         }
         Command::Store(StoreSubcommand::Shell) => shell::run(&runtime, &cli.store, cli.json),
         Command::Store(StoreSubcommand::OneShot(command)) => {
@@ -217,6 +230,19 @@ async fn commit(
     let opened = working_copy.open_store(store).await?;
     let report = working_copy.commit(&opened.store, paths, &std::env::current_dir()?).await?;
     Ok(output.print(&Report::WorkingCopyCommit(report))?)
+}
+
+/// `status`: what `commit` would do in the Working copy, and whether `sync` is running on it. Any
+/// Store flags in `store` must match its record, and the Store must still be there.
+async fn status(
+    store: &StoreArgs,
+    output: Output,
+    working_copy: &WorkingCopyArgs,
+) -> Result<(), Failure> {
+    let working_copy = working_copy.open()?;
+    working_copy.open_store(store).await?;
+    let report = working_copy.status()?;
+    Ok(output.print(&Report::WorkingCopyStatus(report))?)
 }
 
 /// Starts listening for Ctrl-C now, and gives what finishes once it is pressed. Until it is, Ctrl-C

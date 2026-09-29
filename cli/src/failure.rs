@@ -148,15 +148,7 @@ impl Failure {
             Some(Outcomes::Conflict(reconciled)) => {
                 reconciled.iter().map(reconciled_parts).collect()
             }
-            Some(Outcomes::Invalid(invalid)) => invalid
-                .iter()
-                .map(|unfit| EventParts {
-                    name: "invalid",
-                    subject: Some(Subject::Local(&unfit.name)),
-                    message: Some(unfit.reason.clone()),
-                    theirs: None,
-                })
-                .collect(),
+            Some(Outcomes::Invalid(invalid)) => invalid.iter().map(EventParts::invalid).collect(),
         }
     }
 }

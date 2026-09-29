@@ -303,7 +303,7 @@ fn help_lists_the_commands_where_they_live() {
     let top = String::from_utf8(top.stdout).unwrap();
     assert!(top.contains("store"), "{top}");
     for command in STORE_COMMANDS {
-        let listed = top.lines().any(|line| line.trim_start().starts_with(command));
+        let listed = top.lines().any(|line| line.split_whitespace().next() == Some(command));
         assert!(!listed, "{command} is listed at the top level: {top}");
     }
 
@@ -311,7 +311,7 @@ fn help_lists_the_commands_where_they_live() {
     assert!(store.status.success());
     let store = String::from_utf8(store.stdout).unwrap();
     for command in STORE_COMMANDS {
-        let listed = store.lines().any(|line| line.trim_start().starts_with(command));
+        let listed = store.lines().any(|line| line.split_whitespace().next() == Some(command));
         assert!(listed, "{command} isn't listed under store: {store}");
     }
 }

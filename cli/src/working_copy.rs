@@ -1,7 +1,8 @@
 //! A Working copy: a folder holding one Area's Files as ordinary files, with its record in
 //! `.tidings/` (ADR 0008). It owns everything about the folder and the record: creating and
-//! opening one, locking it, reading the folder, reconciling Paths against the Store, and
-//! committing local changes. Each operation gives a report for the output module to print.
+//! opening one, locking it, reading the folder, reconciling Paths against the Store, committing
+//! local changes, and reporting how the folder stands. Each operation gives a report for the
+//! output module to print.
 
 mod record;
 mod scan;
@@ -138,6 +139,37 @@ pub struct CommittedChange {
     pub change: LocalChange,
     /// The File's new Revision, or `None` if it was deleted.
     pub revision: Option<Revision>,
+}
+
+/// What `status` found: how the folder differs from the record, and whether a `sync` is running.
+#[derive(Debug)]
+pub struct StatusReport {
+    /// Each Path that isn't unchanged, and each file that can't become a File, in order of name.
+    pub paths: Vec<PathStatus>,
+    /// Whether a `sync` of the Working copy is running.
+    pub syncing: bool,
+}
+
+/// How one Path, or one file in the folder, stands, as `status` lists it.
+#[derive(Debug)]
+pub enum PathStatus {
+    /// A local change `commit` would commit.
+    Changed(Path, LocalChange),
+    /// A Diverged Path, as a [`SyncEvent::Diverged`], which `commit` would refuse.
+    Diverged(SyncEvent),
+    /// A file that can't become a File, which `commit` would refuse.
+    Invalid(Unfit),
+}
+
+impl PathStatus {
+    /// The Path, or the file's name in the folder, as text.
+    fn name(&self) -> &str {
+        match self {
+            PathStatus::Changed(path, _) => path.as_str(),
+            PathStatus::Diverged(event) => event.path().map_or("", Path::as_str),
+            PathStatus::Invalid(unfit) => unfit.name.as_str(),
+        }
+    }
 }
 
 /// How a Path in the folder differs from its Base.
@@ -506,13 +538,29 @@ impl WorkingCopy {
 
     /// Locks `.tidings/sync.lock`, for as long as a `sync` runs.
     fn lock_for_sync(&self) -> Result<SyncLock, Failure> {
-        let file = self.open_lock_file(SYNC_LOCK_FILE)?;
-        match file.try_lock() {
-            Ok(()) => Ok(SyncLock { _file: file }),
-            Err(TryLockError::WouldBlock) => Err(Failure::error(format!(
+        match self.try_lock_for_sync()? {
+            Some(file) => Ok(SyncLock { _file: file }),
+            None => Err(Failure::error(format!(
                 "a `tidings sync` of {} is running already",
                 self.folder.display()
             ))),
+        }
+    }
+
+    /// Whether a `sync` of the Working copy is running: whether `.tidings/sync.lock` is held. The
+    /// lock is tried without waiting, and let go straight away, so that this neither waits for a
+    /// running `sync` nor keeps one from starting, but for that moment.
+    fn is_syncing(&self) -> Result<bool, Failure> {
+        Ok(self.try_lock_for_sync()?.is_none())
+    }
+
+    /// Locks `.tidings/sync.lock`, giving the file that holds the lock, or `None` if a `sync` holds
+    /// it already.
+    fn try_lock_for_sync(&self) -> Result<Option<fs::File>, Failure> {
+        let file = self.open_lock_file(SYNC_LOCK_FILE)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(file)),
+            Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(error)) => Err(self.failed("lock", error)),
         }
     }
@@ -835,9 +883,9 @@ impl WorkingCopy {
         refuse_diverged(&lock.record, &selection)?;
         let scan = scan::scan(&self.folder, &lock.record.bases)?;
         selection.check_each_names_something(&scan, &lock.record)?;
-        refuse_invalid(scan.invalid, &selection)?;
+        refuse_invalid(&scan.invalid, &selection)?;
+        let (staging, changes) = self.stage(&scan, &lock.record.bases, &selection)?;
         let files = scan.files;
-        let (staging, changes) = self.stage(&files, &lock.record.bases, &selection)?;
         if changes.is_empty() {
             return Ok(CommitReport { changes: Vec::new(), pending: false, events: Vec::new() });
         }
@@ -863,33 +911,57 @@ impl WorkingCopy {
         Ok(CommitReport { changes, pending, events })
     }
 
-    /// Stages each of `files`, the folder's, and each Path in `bases` that has no file, that
-    /// `selection` covers and that differs from its Base, as [`WorkingCopy::commit`] says, giving
-    /// the Staging and each local change in it.
+    /// What `commit` would do, without doing it: each Path that isn't unchanged since its Base, as
+    /// *added*, *modified* or *deleted*, or as *diverged* if the record says it is, and each file
+    /// that can't become a File, as `commit` would find them, the ignore file included. Contents
+    /// are compared, not modified times. Also whether a `sync` is running.
+    ///
+    /// It holds [`Lock`] throughout, so that it never reports a reconcile half-applied, and reads
+    /// the Store not at all: it reports the folder against the record.
+    pub fn status(&self) -> Result<StatusReport, Failure> {
+        let lock = self.lock()?;
+        let syncing = self.is_syncing()?;
+        let record = &lock.record;
+        let scan = scan::scan(&self.folder, &record.bases)?;
+        let diverged = diverged(record, &Selection::All);
+        let is_diverged = |name: &str| record.divergences.keys().any(|path| path.as_str() == name);
+        let changes = scan.changes(&record.bases).into_iter();
+        let changes = changes.filter(|(path, _)| !record.divergences.contains_key(path));
+        let invalid = scan.invalid.into_iter().filter(|unfit| !is_diverged(unfit.name.as_str()));
+        let mut paths: Vec<PathStatus> = changes
+            .map(|(path, change)| PathStatus::Changed(path, change))
+            .chain(diverged.into_iter().map(PathStatus::Diverged))
+            .chain(invalid.map(PathStatus::Invalid))
+            .collect();
+        paths.sort_by(|a, b| a.name().cmp(b.name()));
+        Ok(StatusReport { paths, syncing })
+    }
+
+    /// Stages each local change in `scan`, made with `bases`, that `selection` covers, as
+    /// [`WorkingCopy::commit`] says, giving the Staging and each local change in it.
     fn stage(
         &self,
-        files: &BTreeMap<Path, String>,
+        scan: &Scan,
         bases: &BTreeMap<Path, Base>,
         selection: &Selection,
     ) -> Result<(Staging, Vec<(Path, LocalChange)>), Failure> {
         let mut staging = Staging::new(self.area);
-        let mut changes = Vec::new();
-        for (path, contents) in files.iter().filter(|(path, _)| selection.covers(path.as_str())) {
-            let (change, precondition) = match bases.get(path) {
-                None => (LocalChange::Added, Precondition::Absent),
-                Some(base) if Hash::of(contents) != base.hash => {
-                    (LocalChange::Modified, Precondition::UnchangedSince(base.revision))
+        let changes: Vec<(Path, LocalChange)> = scan
+            .changes(bases)
+            .into_iter()
+            .filter(|(path, _)| selection.covers(path.as_str()))
+            .collect();
+        for (path, change) in &changes {
+            let unchanged_since = || Precondition::UnchangedSince(bases[path].revision);
+            let precondition = match change {
+                LocalChange::Added => Precondition::Absent,
+                LocalChange::Modified => unchanged_since(),
+                LocalChange::Deleted => {
+                    staging.delete_requiring(path, unchanged_since())?;
+                    continue;
                 }
-                Some(_) => continue,
             };
-            staging.write_requiring(path, contents.as_str(), precondition)?;
-            changes.push((path.clone(), change));
-        }
-        for (path, base) in bases.iter().filter(|(path, _)| selection.covers(path.as_str())) {
-            if !files.contains_key(path) {
-                staging.delete_requiring(path, Precondition::UnchangedSince(base.revision))?;
-                changes.push((path.clone(), LocalChange::Deleted));
-            }
+            staging.write_requiring(path, scan.files[path].as_str(), precondition)?;
         }
         Ok((staging, changes))
     }
@@ -1125,7 +1197,14 @@ fn diverge(
 /// Fails, as a Conflict does, if `selection` covers any Path that is Diverged in `record`, naming
 /// each, since committing it would overwrite the Store's version the person hasn't merged.
 fn refuse_diverged(record: &Record, selection: &Selection) -> Result<(), Failure> {
-    let diverged: Vec<SyncEvent> = record
+    let diverged = diverged(record, selection);
+    if diverged.is_empty() { Ok(()) } else { Err(Failure::diverged(diverged)) }
+}
+
+/// Each Path in `record` that is Diverged and that `selection` covers, as a
+/// [`SyncEvent::Diverged`] naming its `theirs` file, or saying the Store has no File there.
+fn diverged(record: &Record, selection: &Selection) -> Vec<SyncEvent> {
+    record
         .divergences
         .iter()
         .filter(|(path, _)| selection.covers(path.as_str()))
@@ -1134,15 +1213,14 @@ fn refuse_diverged(record: &Record, selection: &Selection) -> Result<(), Failure
             theirs_file: divergence.theirs_revision.map(|_| theirs_file(path)),
             blocked: None,
         })
-        .collect();
-    if diverged.is_empty() { Ok(()) } else { Err(Failure::diverged(diverged)) }
+        .collect()
 }
 
 /// Fails, naming each, if `selection` covers any of `invalid`, files that can't become Files, since
 /// an all-or-nothing commit mustn't silently leave them out.
-fn refuse_invalid(invalid: Vec<Unfit>, selection: &Selection) -> Result<(), Failure> {
+fn refuse_invalid(invalid: &[Unfit], selection: &Selection) -> Result<(), Failure> {
     let invalid: Vec<Unfit> =
-        invalid.into_iter().filter(|unfit| selection.covers(unfit.name.as_str())).collect();
+        invalid.iter().filter(|unfit| selection.covers(unfit.name.as_str())).cloned().collect();
     if invalid.is_empty() { Ok(()) } else { Err(Failure::invalid(invalid)) }
 }
 

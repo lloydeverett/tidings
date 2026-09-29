@@ -8,15 +8,15 @@ against the record, and says whether a `sync` is running on the Working copy.
 
 **Blocked by:** 05, 07
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Each classification appears for the Paths it applies to, and unchanged and ignored files
+- [x] Each classification appears for the Paths it applies to, and unchanged and ignored files
       don't appear.
-- [ ] Contents are compared, not modified times: `touch`ing a file, or rewriting the same text,
+- [x] Contents are compared, not modified times: `touch`ing a file, or rewriting the same text,
       shows nothing.
-- [ ] A Diverged Path names its `theirs` file, or says the Store removed it.
-- [ ] It says whether a `sync` is running, found by whether `.tidings/sync.lock` is held.
-- [ ] It holds `.tidings/lock`, so it never reports a half-applied reconcile.
-- [ ] `--json` gives the same as one JSON object.
-- [ ] It finds the Working copy by walking up, or takes `-C`.
-- [ ] Tests, through the binary.
+- [x] A Diverged Path names its `theirs` file, or says the Store removed it.
+- [x] It says whether a `sync` is running, found by whether `.tidings/sync.lock` is held.
+- [x] It holds `.tidings/lock`, so it never reports a half-applied reconcile.
+- [x] `--json` gives the same as one JSON object.
+- [x] It finds the Working copy by walking up, or takes `-C`.
+- [x] Tests, through the binary.
