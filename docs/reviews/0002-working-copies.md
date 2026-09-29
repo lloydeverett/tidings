@@ -234,3 +234,161 @@ prefix coupling is documented rather than removed, since `atomic-write-file` off
 Note: one library test, `an_area_directory_removed_while_running_is_made_again_with_a_resync`,
 failed once during this run and passed on rerun. The change doesn't touch the library; it may be
 a timing-sensitive test worth watching.
+
+---
+
+## Ticket 03: `sync` follows the Store
+
+Reviewed: `git diff 41b0992...17da6f2` (commit 17da6f2).
+
+### Standards
+
+**(a) Documented-standard violations:** none hard. No line over 100 columns, every new item is
+documented, tests run through the binary on fs and SQLite. Soft departures from spec 0002:
+
+1. **Interface shape, `working_copy.rs:190, 257`:** the spec names `reconcile(paths | all)` as
+   the module's interface; the diff makes `reconcile` private and exposes
+   `sync(store, feed, stop, report)`. That makes the module deeper and settles ticket 02's
+   Standards item 1, but the spec's "Implementation Decisions" no longer describe it exactly.
+2. **"Tests wait on what `sync` says rather than sleeping":** `sync_quiet_prints_only_what_needs_attention`
+   polls with `wait_until` (unavoidable under `--quiet`); `ctrl_c_during_a_reconcile_lets_it_finish`
+   spin-sleeps; `wait_until` sets its own 400×50 ms timeout, duplicating `EVENT_TIMEOUT` outside
+   the shared harness.
+3. `tests/working_copy.rs:313` reads `.tidings/tmp`: internal layout, not the record's format, so
+   allowed, but coupling.
+
+**(b) Judgement calls:**
+
+1. **Possible Mysterious Name, `output.rs:144-146`:** `SyncOutput { pub output: Output }` is
+   documented as "Whether to print JSON", which describes a field of `Output`, not this one.
+2. **Possible Duplicated Code:** folder writes use `tempfile` + `sync_all` + `persist`
+   (`working_copy.rs:357`), the record uses `AtomicWriteFile` (`record.rs:88`). Allowed by the
+   spec, but one idea built twice.
+3. **Inconsistent error seam, `working_copy.rs:340` vs `:348`:** `write` returns `io::Result`
+   mapped by the caller, `remove` returns `Failure`.
+4. **Possible Duplicated Code in tests:** the Resync trigger and its setup repeat at `:422` and
+   `:506`.
+5. **Possible Repeated Switches, `output.rs:154`:** the `--quiet` filter and the name mapping both
+   switch on `SyncEvent`; ticket 05's *diverged* must edit both. Tolerable.
+6. **Readability, `working_copy.rs:190-236`:** the nested `loop { select! … }` is dense.
+
+### Spec
+
+The reviewer probed the binary on fs and SQLite: live *created*/*updated*/*removed* lines each
+followed by *caught up*; a directory holding a user file is kept; a File replacing a directory and
+the reverse; a commit during `sync` gives no *updated* line; local edits are left alone. The feed
+is taken at Store open, before the first reconcile; the record is reread under `lock` on every
+reconcile; Ctrl-C is polled only between reconciles.
+
+**(a) Missing or partial:** none. The Resync test runs on fs only, since SQLite sends one only
+after a 10-minute lag.
+
+**(b) Scope creep (minor):** new files get 0666 before the umask, and a replaced file keeps its
+permissions (reasonable: tempfile's 0600 would be a regression). The `--quiet` help says "only
+resyncs and errors", which ticket 05 must extend with *diverged*.
+
+**(c) Implemented but wrong**
+
+1. **Writes and deletes escape the folder through a symlinked directory.** Spec: "a symlinked
+   directory on the way … the Path is Diverged instead"; story 16: "`sync` never deletes anything
+   it didn't put there". Probe: with `wc/a` replaced by a symlink to `ext/a`, a Store change to
+   `a/c` and delete of `a/b` made `sync` write `ext/a/c` and delete `ext/a/b`, outside the Working
+   copy, then die with "Not a directory". `local()` (`:440-459`) checks only the last component;
+   `write`/`remove` follow symlinks in parent directories.
+2. **One blocked apply ends `sync` and skips the record save.** Spec: "If applying fails because
+   of what is in the folder … `sync` carries on". Probe: an untracked local file `q`, then the
+   Store writes `q/r`: `sync` exits 1, and the `?` in the apply loop (`:282-287`) returns before
+   `save`, so Paths already applied aren't recorded (the self-heal covers it next run).
+
+### Summary
+
+Standards: 0 hard violations, 3 soft departures and 6 judgement calls (worst: the misdescribed
+`SyncOutput` field). Spec: 2 wrong (worst: writes and deletes outside the folder through a
+symlinked directory).
+
+### Resolution
+
+Fixed in 3943030:
+
+1. **Spec (c)1, writes and deletes through a symlinked directory:** fixed. Before anything reads,
+   writes, removes or cleans up for a Path, every directory from below the folder down to it must
+   be a real directory or missing; a symlink or a file on the way blocks the Path. Test:
+   `nothing_outside_the_folder_is_changed_through_a_symlinked_directory` (unix).
+2. **Spec (c)2, a blocked apply ending `sync`:** fixed. A new `SyncEvent::Blocked` leaves the
+   Path's Base as it was, the other Paths are still applied, the record is saved and `sync` keeps
+   running. It prints as `error <path>: <reason>` (JSON `{"event":"error",…}`), even with
+   `--quiet`. It is a stand-in for ticket 05, which makes such a Path Diverged. Tests:
+   `a_path_blocked_by_a_local_file_is_reported_and_the_rest_still_applied`,
+   `sync_quiet_prints_a_blocked_path`.
+3. **Standards (b)1, the `SyncOutput.output` doc:** fixed.
+4. **Standards (b)3, the error seam:** `write` returns `Failure`, like `remove`.
+5. **Standards (a)2 and (b)4, test waits and setup:** `wait_until` moved to the harness and uses
+   `EVENT_TIMEOUT`; the Resync trigger is the helper `clear_the_cache_directory`.
+6. **Standards (b)6, the dense loop:** the feed-waiting part is now `wait_for_paths`.
+
+All three new tests fail on 17da6f2.
+
+Not acted on:
+- **Standards (a)1, the interface shape:** kept. `sync(store, feed, stop, report)` is deeper than
+  the spec's `reconcile(paths | all)`, as ticket 02's review asked. **For the spec's owner:** the
+  "Where it lives" bullet in spec 0002 could be updated to match.
+- **Standards (b)2, two atomic-write mechanisms:** the spec places folder writes in `.tidings/tmp/`,
+  which `atomic-write-file` (it writes next to the target) doesn't do.
+- **Standards (a)3, a test reading `.tidings/tmp`:** it checks that no temporary file is left over,
+  which a person can see.
+
+Note: one library test, `fs::blocking::a_prefix_delete_removes_what_is_under_the_prefix_when_committed`,
+failed once in this run and passed on rerun, a second timing-sensitive library test.
+
+### Re-review of 3943030
+
+**Standards.** No hard violations; all claimed fixes are in. Judgement calls:
+
+1. **Possible Repeated Switches, getting worse (`output.rs:157-175`):** the output match grew to a
+   three-part tuple with 7 arms, two of which silently drop a message.
+2. `check_directories` returns `Result<Result<(), Blocked>, Failure>` beside a private
+   `struct Blocked(String)` and `SyncEvent::Blocked`; and it re-splits the Path by hand next to
+   `path_in_folder`.
+3. `write` became a one-line wrapper around `write_io`, while `remove` maps inline.
+4. `wait_for_paths` also reports *caught up* and *resync*; documented, acceptable.
+5. The blocked-path test only checks `contains('q')` on the message.
+
+**Spec.** Probes confirm nothing outside the folder is touched: symlinked directories at depth 1
+and 2, a leaf symlink to a directory or file outside, a folder named through a symlink or as `.`,
+and cleanup walking only approved directories. Findings:
+
+1. **Regression, a stale Base.** Spec row 3: "`S` becomes the Base silently". The directory check
+   runs before the table's rows are decided, so when directory `q` is replaced by a local file and
+   the Store deletes `q/r`, `sync` reports an error and keeps the Base although both sides are
+   absent; after `rm q`, `commit` exits 3 with a Conflict. Before the fix it said nothing to
+   commit.
+2. A window between checking the directories and using them: a concurrent process deliberately
+   swapping a directory for a symlink could still redirect a write. Not a realistic concern.
+3. A leaf that isn't a regular file (`Local::Other`) where the Store changed is left alone and
+   prints nothing, while a blocked directory prints `error`. Inconsistent until ticket 05.
+
+### Resolution of the re-review
+
+Fixed in a180fc3:
+
+- **The stale Base regression:** fixed. `reconcile_path` decides the table's rows first and only
+  refuses an actual apply. A file where a directory should be means the Path is locally absent, so
+  a Store removal becomes the Base silently (row 3). Under a symlinked directory nothing is read
+  and the Path is still reported. Test:
+  `a_removal_under_a_local_file_needs_nothing_applied_so_takes_the_base_silently` (fs and SQLite),
+  which fails on 3943030.
+- **The output switch:** each event now maps to a name, a Path and a message, from which both the
+  JSON object and the text line are built, so ticket 05's *diverged* adds one arm.
+- **The nested Result:** the check is now `blocking_directory`, returning
+  `Result<Option<Blocked>, Failure>`, with `Blocked` an enum (`Symlink`, `NotADirectory`); the
+  walk uses `path_in_folder(path).ancestors()`.
+- **`write`/`write_io`:** `write_io` is gone; `write` maps its errors inline, like `remove`.
+- **The weak test assertion:** it checks the exact message and labels the Backend.
+- **The check-then-use window:** documented at the `apply` call as accepted.
+
+Not acted on: a leaf that isn't a regular file prints nothing while a blocked directory prints an
+error (re-review Spec 3). Ticket 05 reports both as Diverged. A related change for ticket 05 to
+pick up: with a local file where a directory should be, a Path with a Base that the Store changes
+is now left alone silently (it is row 4, Diverged) where 3943030 reported an error.
+
+No second re-review: these fixes are narrow and each has a test.
