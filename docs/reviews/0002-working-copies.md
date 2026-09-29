@@ -392,3 +392,142 @@ pick up: with a local file where a directory should be, a Path with a Base that 
 is now left alone silently (it is row 4, Diverged) where 3943030 reported an error.
 
 No second re-review: these fixes are narrow and each has a test.
+
+---
+
+## Ticket 04: Resuming a Working copy, and refusing the wrong folder or Store
+
+Reviewed: `git diff 0fa4b53...51c97f5` (commit 51c97f5).
+
+### Standards
+
+**(a) Documented-standard violations:** none. No line over 100 columns; every new item documented;
+the _Avoid_ words present ("version" for the record's format, `same_directory` for a directory on
+disk, "updated" as an event name) are uses earlier reviews allowed. Tests go through the binary on
+fs and SQLite without reading the record's format.
+
+**(b) Judgement calls:**
+
+1. **Command not thin, `main.rs:192-213`:** `sync` holds the Working copy lifecycle (the memory
+   refusal, `exists`, then `open` + `check_area` + `open_store`, or `check_can_create` +
+   `open_with_address` + `create`). The spec's "Where it lives" gives opening and creating to the
+   module; this also widens its interface with `exists` and `check_area`.
+2. **Possible Duplicated Code, `location.rs:246`:** `is_memory()` exists, but the same test is
+   still written inline at `:215` and `:223`.
+3. **Possible Duplicated Code:** the memory refusal message is built in `main.rs:193-195`, apart
+   from `location.rs`'s `memory_outside_the_shell()`.
+4. **Possible Feature Envy, `location.rs:252-279`:** `StoreArgs::check_matches` mostly inspects
+   the address. Tolerable, same module.
+5. **Possible Duplicated Code in tests:** the shape `tidings()` + `--json sync config <folder>` +
+   `Sync::spawn` repeats five times.
+6. `let [first_sync, second_sync] = syncs; let mut second_sync = second_sync;` could be one
+   pattern.
+7. `std::path::Path` and `std::fs` written out in full at `location.rs:319-321`.
+
+### Spec
+
+Probed on fs and SQLite. Working as asked: resuming after Store changes while stopped (a local edit
+left alone), after SIGKILL, and after moving or renaming the folder; a stale `TIDINGS_ROOT` refused
+for `sync` and `commit`, naming the path; `--root` as a relative path, with a trailing slash or
+through a symlink accepted; `--identity` against a Root record and a `--backend` mismatch refused,
+naming the difference; the wrong Area refused before the Store is opened; memory refused; a
+non-empty folder refused and untouched; a Store that has gone refused, with nothing created.
+
+**(a) Missing or partial:** none. (A resumed Path that diverged printed nothing: ticket 05.)
+
+**(b) Scope creep:** none of substance.
+
+**(c) Implemented but wrong**
+
+1. **`--create` on a Working copy whose Store has gone wipes the folder.** Story 76: "never
+   corrupts my Working copy". `open_store` passes `--create` through (`working_copy.rs:225`), so
+   `tidings --create sync config wc` made an empty Store, printed `removed …`, and deleted every
+   unchanged file; only a locally edited file survived. The error just before invites exactly that
+   command ("there is no Store at …: pass --create and --backend to make one"). The ticket's
+   "never creates a new Store without `--create`" allows it to the letter, but the spec's "For
+   every other case they are optional, and any given must match the record" treats the flags as a
+   check, not a permission. No test covers it.
+2. **A second `sync` opens, and with `--create` makes, a Store before refusing.** `open_store`
+   (`main.rs:203-206`) runs before `WorkingCopy::sync` takes `sync.lock`. Probe: with a `sync`
+   running and the Store moved away, `tidings --create sync config wc` made a new Store and only
+   then said a `sync` was running already. The same ordering problem ticket 02's re-review fixed
+   for `check_can_create`.
+
+### Summary
+
+Standards: 0 hard violations, 7 judgement calls (worst: the `sync` command, not the module,
+deciding between resuming and creating). Spec: 2 wrong (worst: `--create` on a Working copy whose
+Store has gone deletes its unchanged files).
+
+### Resolution
+
+Fixed in 6fe79fb:
+
+1. **Spec (c)1, `--create` wiping a Working copy:** fixed by refusing `--create` for an existing
+   Working copy. **A decision for the spec's owner:** the ticket's "never creates a new Store
+   without `--create`" allowed `--create` to recreate a missing Store, but that deletes every
+   unchanged file in the folder to match the new, empty Store. Refusing it follows the spec's "For
+   every other case they are optional, and any given must match the record": the flags are a
+   check, not a permission. `StoreAddress::open` no longer creates, and a missing Store is reported
+   as "the Store of the Working copy F is missing at L (backend)", without the `--create` hint,
+   which stays for `tidings store …` and a new Working copy. Test:
+   `a_working_copy_whose_store_has_gone_fails_to_open` (fs and SQLite): `commit` and `sync`, plain,
+   with `--create`, and with the recorded flags plus `--create`, are all refused, no Store is made
+   and every file stays. It fails on 51c97f5.
+2. **Spec (c)2, a second `sync` opening a Store:** fixed. The sync lock is taken before the Store
+   is opened. Test: `a_second_sync_of_a_working_copy_is_refused` moves the Store away and checks
+   the second `sync` says one is running and makes nothing. It fails on 51c97f5.
+3. **Standards 1, the command not thin:** fixed. `WorkingCopy::sync(folder, area, &StoreArgs,
+   stop, report)` is the one entry point; `exists`, `check_area`, `check_can_create` and `create`
+   are private. (The spec's "Where it lives" says commands "open the Store, and call it"; `sync`
+   now leaves opening to the module, as that section's intent asks.)
+4. **Standards 2 and 3, the memory checks:** `is_memory()` is private and used throughout
+   `location.rs`, and the refusal moved there as `check_not_memory()`.
+5. **Standards 5, 6 and 7:** `Sync::start_with(flags, area, folder)` replaces the repeated spawns
+   where the shape matches; the other items fixed.
+
+Not acted on: Standards 4 (`check_matches` next to the data it inspects, in the same module).
+
+### Re-review of 6fe79fb
+
+**Standards.** Every claimed fix is in place. One hard violation: a doc line at
+`working_copy.rs:144` is 101 columns. Judgement calls: the memory check runs twice on the create
+path (`open_or_create`, then `open_with_address`); `open_or_create` returns a three-part tuple
+(private, used once: tolerable); in a test, `run` holds first a `Command` then its output, and
+`command` is a `&[&str]` where elsewhere it is a `Command`; the `tidings()` + args + `run` shape
+still repeats three times.
+
+**Spec.** Probed on fs and SQLite: `--create` is refused on an existing Working copy whether alone,
+with matching flags or with a matching `TIDINGS_ROOT`, on `sync` and `commit` (there is no
+environment variable for `--create`); the missing-Store error no longer suggests it and nothing is
+made; a second `sync` says one is running with the Store present, moved away or with `--create`;
+`commit` during `sync` works; Ctrl-C exits 0; everything ticket 04 did still holds; new Working
+copies (missing, empty, crash-leftover `.tidings/`) still work. Both new tests fail on 51c97f5.
+Findings:
+
+1. The ticket's wording ("never creates a new Store without `--create`") now reads as though
+   `--create` would make one; neither the ticket nor the spec records the decision.
+2. On the new-Working-copy path the Store is opened, and possibly made, before `create` and the
+   sync lock, so two `sync --create` runs racing on one empty folder can both open or make the
+   Store, and the loser says "is a Working copy already" rather than that one is running. Read from
+   the code; the window is too narrow to probe.
+
+### Resolution of the re-review
+
+Fixed in 5defbdb:
+
+- **The race on a new Working copy:** fixed. The create path now works out the Store's address
+  without opening it (`StoreArgs::address_for_working_copy`), checks the folder, makes the folder
+  and `.tidings/`, takes `sync.lock`, checks the folder again under it, and only then opens or
+  makes the Store and saves the record. A refusal for wrong flags, memory, a missing `--create` or
+  a non-empty folder makes neither a Store nor the folder. If opening the Store itself fails,
+  `.tidings/` is left holding only lock files, which `holds_no_record` counts as unfinished. No
+  race test: it can't be made deterministic.
+- **The double memory check:** one check, inside `address_for_working_copy`. On the resume path
+  `--backend memory` now gets the "doesn't match the Working copy's Store" error rather than the
+  memory error; a record can never name a memory Store, so that is accurate.
+- **The 101-column line and the test names:** fixed.
+
+Left for the spec's owner: updating ticket 04's `--create` wording (re-review Spec 1).
+
+No second re-review: the restructure only reorders existing checks, and the existing tests pass.
