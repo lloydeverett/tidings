@@ -128,13 +128,13 @@ fn committed_revisions_become_the_bases() {
 
 #[test]
 fn a_conflict_commits_nothing_and_marks_each_conflicting_path_diverged_as_sync_would() {
-    for backend in BACKENDS {
+    // A Working copy whose commit meets a Conflict for several Paths, each changed in the Store
+    // while `sync` isn't running.
+    let conflicting = |backend| {
         let location = store_with_config(backend);
         location.write("config", "gone.toml", "gone\n");
         let folder = TempDir::new().unwrap();
         synced(&location, "config", folder.path());
-
-        // Changed in the Store while `sync` isn't running.
         let script = "stage config\nwrite config app.toml --contents theirs\n\
                       write config created.toml --contents theirs\n\
                       write config themes/dark.toml --contents theirs\n\
@@ -147,6 +147,31 @@ fn a_conflict_commits_nothing_and_marks_each_conflicting_path_diverged_as_sync_w
         fs::write(folder.path().join("same.toml"), "same").unwrap();
         fs::write(folder.path().join("gone.toml"), "mine\n").unwrap();
         fs::write(folder.path().join("unrelated.toml"), "mine\n").unwrap();
+        (location, folder)
+    };
+    let same_message = "the Store has the same contents, which are now its Base";
+    for backend in BACKENDS {
+        let (_location, folder) = conflicting(backend);
+        let run = commit_in(folder.path(), &[]).expect_code(3);
+        let lines: Vec<&str> = run.stderr.lines().collect();
+        let theirs_in = |path: &str| format!("the Store's version is in .tidings/theirs/{path}");
+        let diverged = |path: &str| format!("  diverged {path}: {}", theirs_in(path));
+        assert_eq!(
+            lines,
+            [
+                "tidings: Conflict: the Store changed these since their Base, so nothing was \
+                 committed"
+                    .to_owned(),
+                diverged("app.toml"),
+                diverged("created.toml"),
+                "  diverged gone.toml: removed in the Store".to_owned(),
+                format!("  same same.toml: {same_message}"),
+                diverged("themes/dark.toml"),
+            ],
+            "{backend}: {run:?}"
+        );
+
+        let (location, folder) = conflicting(backend);
         let run = commit_in(folder.path(), &["--json"]).expect_code(3);
         let failure: serde_json::Value = serde_json::from_str(&run.stderr).unwrap();
         let theirs_in = |path: &str| format!("the Store's version is in .tidings/theirs/{path}");
@@ -173,7 +198,7 @@ fn a_conflict_commits_nothing_and_marks_each_conflicting_path_diverged_as_sync_w
                         "message": "removed in the Store",
                         "theirs": null,
                     },
-                    {"event": "same", "path": "same.toml"},
+                    {"event": "same", "path": "same.toml", "message": same_message},
                     diverged("themes/dark.toml"),
                 ],
             }),

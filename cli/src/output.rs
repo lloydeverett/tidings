@@ -175,53 +175,78 @@ impl SyncOutput {
 
 /// The JSON object that says what `sync` did, or found, as in `{"event": "created", "path": "a"}`.
 pub fn event_json(event: &SyncEvent) -> Value {
-    let (name, path, message) = event_parts(event);
-    let mut object = serde_json::Map::new();
-    object.insert("event".to_owned(), json!(name));
-    if let Some(path) = path {
-        object.insert("path".to_owned(), json!(path.as_str()));
-    }
-    if let Some(message) = message {
-        object.insert("message".to_owned(), json!(message));
-    }
-    // So that another program following the Working copy can find the Store's version.
-    if let SyncEvent::Diverged { theirs_file, .. } = event {
-        let theirs_file = theirs_file.as_ref().map(|file| file.to_string_lossy());
-        object.insert("theirs".to_owned(), json!(theirs_file));
-    }
-    Value::Object(object)
+    EventParts::of(event).json()
 }
 
 /// The line for a person that says what `sync` did, or found, as in "diverged a: removed in the
 /// Store".
 pub fn event_line(event: &SyncEvent) -> String {
-    let (name, path, message) = event_parts(event);
-    // For a person, a name is words.
-    let mut line = name.replace('-', " ");
-    if let Some(path) = path {
-        line.push_str(&format!(" {path}"));
-    }
-    if let Some(message) = message {
-        line.push_str(&format!(": {message}"));
-    }
-    line
+    EventParts::of(event).line()
 }
 
-/// An event's name, and the Path and message it has, if any.
-fn event_parts(event: &SyncEvent) -> (&'static str, Option<&Path>, Option<String>) {
-    match event {
-        SyncEvent::Created(path) => ("created", Some(path), None),
-        SyncEvent::Updated(path) => ("updated", Some(path), None),
-        SyncEvent::Removed(path) => ("removed", Some(path), None),
-        SyncEvent::Diverged { path, theirs_file, blocked } => (
-            "diverged",
-            Some(path),
-            Some(diverged_message(theirs_file.as_deref(), blocked.as_ref())),
-        ),
-        SyncEvent::Resolved(path) => ("resolved", Some(path), None),
-        SyncEvent::Error { path, message } => ("error", Some(path), Some(message.clone())),
-        SyncEvent::Resync => ("resync", None, None),
-        SyncEvent::CaughtUp => ("caught-up", None, None),
+/// What an event says, to print as a line for a person or as JSON.
+pub struct EventParts<'a> {
+    /// Its name, as in `diverged`.
+    pub name: &'static str,
+    /// The Path it is about, if any.
+    pub path: Option<&'a Path>,
+    /// What else it says, if anything.
+    pub message: Option<String>,
+    /// For a *diverged* event only: the file with the Store's version, or `None` if the Store
+    /// removed it, so that another program following the Working copy can find it.
+    pub theirs: Option<Option<&'a FsPath>>,
+}
+
+impl<'a> EventParts<'a> {
+    /// What `event`, from `sync`, says.
+    pub fn of(event: &'a SyncEvent) -> EventParts<'a> {
+        let parts = |name, path, message| EventParts { name, path, message, theirs: None };
+        match event {
+            SyncEvent::Created(path) => parts("created", Some(path), None),
+            SyncEvent::Updated(path) => parts("updated", Some(path), None),
+            SyncEvent::Removed(path) => parts("removed", Some(path), None),
+            SyncEvent::Diverged { path, theirs_file, blocked } => EventParts {
+                theirs: Some(theirs_file.as_deref()),
+                ..parts(
+                    "diverged",
+                    Some(path),
+                    Some(diverged_message(theirs_file.as_deref(), blocked.as_ref())),
+                )
+            },
+            SyncEvent::Resolved(path) => parts("resolved", Some(path), None),
+            SyncEvent::Error { path, message } => parts("error", Some(path), Some(message.clone())),
+            SyncEvent::Resync => parts("resync", None, None),
+            SyncEvent::CaughtUp => parts("caught-up", None, None),
+        }
+    }
+
+    /// As a JSON object, as in `{"event": "created", "path": "a"}`.
+    pub fn json(&self) -> Value {
+        let mut object = serde_json::Map::new();
+        object.insert("event".to_owned(), json!(self.name));
+        if let Some(path) = self.path {
+            object.insert("path".to_owned(), json!(path.as_str()));
+        }
+        if let Some(message) = &self.message {
+            object.insert("message".to_owned(), json!(message));
+        }
+        if let Some(theirs) = self.theirs {
+            object.insert("theirs".to_owned(), json!(theirs.map(FsPath::to_string_lossy)));
+        }
+        Value::Object(object)
+    }
+
+    /// As a line for a person, as in "diverged a: removed in the Store".
+    pub fn line(&self) -> String {
+        // For a person, a name is words.
+        let mut line = self.name.replace('-', " ");
+        if let Some(path) = self.path {
+            line.push_str(&format!(" {path}"));
+        }
+        if let Some(message) = &self.message {
+            line.push_str(&format!(": {message}"));
+        }
+        line
     }
 }
 
@@ -323,10 +348,10 @@ mod tests {
     use super::*;
     use crate::working_copy::{CommitReport, CommittedChange};
 
-    /// A Path another Commit made Diverged between a Commit that gave `Pending` and the reconcile
-    /// after it, which no test through the binary can time, is reported with the Commit.
+    /// A Commit that gave `Pending` is printed with the events reconciling after it gave, such as
+    /// a Path another Commit made Diverged in between, which no test through the binary can time.
     #[test]
-    fn a_pending_commit_reports_the_paths_reconciling_made_diverged() {
+    fn a_pending_commits_events_are_printed_with_it() {
         let path = Path::new("app.toml").unwrap();
         let report = CommitReport {
             changes: vec![CommittedChange {

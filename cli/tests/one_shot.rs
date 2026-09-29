@@ -188,6 +188,29 @@ fn preconditions_that_fail_exit_with_3_and_write_nothing() {
 }
 
 #[test]
+fn with_json_a_failure_is_one_json_object_on_stderr() {
+    let location = Location::with_store("fs");
+    location.write("data", "a.txt", "a");
+    let failure = |args: &[&str], code| {
+        let run = location.run(&[&["--json", "store"], args].concat()).expect_code(code);
+        assert_eq!(run.stdout, "", "{run:?}");
+        assert_eq!(run.stderr.lines().count(), 1, "{run:?}");
+        serde_json::from_str::<serde_json::Value>(&run.stderr).unwrap()
+    };
+
+    let args = ["write", "data", "a.txt", "--contents", "b", "--if-absent"];
+    let message = "Conflict: a Precondition did not hold for a.txt";
+    let expected = serde_json::json!({"failure": "conflict", "message": message});
+    assert_eq!(failure(&args, 3), expected);
+    let expected = serde_json::json!({"failure": "missing", "message": "no File at data b.txt"});
+    assert_eq!(failure(&["read", "data", "b.txt"], 2), expected);
+    let message = "invalid path \"a.txt/b\": it would be under another File, or have other Files \
+                   under it";
+    let expected = serde_json::json!({"failure": "error", "message": message});
+    assert_eq!(failure(&["write", "data", "a.txt/b", "--contents", "b"], 1), expected);
+}
+
+#[test]
 fn listing_gives_the_paths_under_a_prefix_in_order() {
     for backend in BACKENDS {
         let location = Location::with_store(backend);

@@ -164,7 +164,7 @@ pub enum Reconciled {
     Event(SyncEvent),
     /// Nothing `sync` would report: its local contents are the same as the Store's, which it took
     /// as its Base.
-    TookStoresVersion(Path),
+    TookStoresFile(Path),
 }
 
 /// What a Commit of a Working copy's local changes gave, once recorded.
@@ -1179,7 +1179,7 @@ fn reconciled(paths: BTreeSet<Path>, events: Vec<SyncEvent>) -> Vec<Reconciled> 
     let mut reconciled = Vec::new();
     for (path, events) in by_path {
         if events.is_empty() {
-            reconciled.push(Reconciled::TookStoresVersion(path));
+            reconciled.push(Reconciled::TookStoresFile(path));
         } else {
             reconciled.extend(events.into_iter().map(Reconciled::Event));
         }

@@ -32,7 +32,8 @@ tidings store watch data                          # every Change to data, until 
   `delete-prefix`, `edit` and `watch`, each taking the Area then the Path or Prefix. `write` takes
   the contents from stdin, `--contents` or `--from <file>`. `write` and `delete` take
   `--if-absent` or `--if-revision`.
-- **Output.** Text for a person, or JSON with `--json` (one line per Change for `watch`).
+- **Output.** Text for a person, or JSON with `--json` (one line per Change for `watch`, and a
+  failure as one object on stderr).
 - **Exit codes.** `0` success, `1` error, `2` no File (`store read`, `store stat`), `3` Conflict.
 
 `tidings store shell` keeps one Store open, so a Commit can be built up over several commands,

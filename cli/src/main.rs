@@ -127,8 +127,9 @@ fn main() -> ExitCode {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("tidings: can't start the async runtime: {error}");
-            return ExitCode::from(1);
+            let failure = Failure::error(format!("can't start the async runtime: {error}"));
+            failure.print(cli.json);
+            return failure.exit_code();
         }
     };
     let output = Output { json: cli.json, at_prompt: false };
