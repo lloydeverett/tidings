@@ -8,7 +8,7 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use common::{Location, Sync, tidings};
+use common::{Location, Sync, tidings, wait_until};
 use tempfile::TempDir;
 
 const BACKENDS: [&str; 2] = ["fs", "sqlite"];
@@ -409,8 +409,6 @@ fn a_file_committed_while_sync_starts_is_not_missed() {
 
 #[test]
 fn a_resync_reconciles_every_path() {
-    // Removing an Area's directory gives a Resync on the filesystem Backend. SQLite gives one
-    // only after falling ten minutes behind.
     let location = Location::with_store("fs");
     location.write("cache", "thumbnails/a.png", "a");
     location.write("cache", "b.txt", "b");
@@ -418,8 +416,7 @@ fn a_resync_reconciles_every_path() {
     let mut sync = Sync::start(&location, "cache", folder.path());
     sync.wait_for("caught-up");
 
-    // As when the OS clears the cache.
-    fs::remove_dir_all(location.root().join("cache")).unwrap();
+    clear_the_cache_directory(&location);
     sync.wait_for("resync");
     sync.wait_for("caught-up");
     sync.stop();
@@ -503,7 +500,7 @@ fn sync_quiet_prints_only_what_needs_attention() {
         wait_until(|| folder.path().join("a.txt").exists());
         location.write("cache", "b.txt", "b");
         wait_until(|| folder.path().join("b.txt").exists());
-        fs::remove_dir_all(location.root().join("cache")).unwrap();
+        clear_the_cache_directory(&location);
         let expected = if json { r#"{"event":"resync"}"# } else { "resync" };
         assert_eq!(sync.next_line(), expected);
         wait_until(|| !folder.path().join("b.txt").exists());
@@ -538,6 +535,95 @@ fn ctrl_c_during_a_reconcile_lets_it_finish() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn nothing_outside_the_folder_is_changed_through_a_symlinked_directory() {
+    for backend in BACKENDS {
+        let location = Location::with_store(backend);
+        location.write("config", "a/b", "b\n");
+        location.write("config", "a/c", "c\n");
+        let folder = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let mut sync = Sync::start(&location, "config", folder.path());
+        sync.wait_for("caught-up");
+        // The directory moved out of the folder, with a symlink to it left in its place.
+        fs::rename(folder.path().join("a"), outside.path().join("a")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("a"), folder.path().join("a")).unwrap();
+
+        let script =
+            "stage config\nwrite config a/c --contents theirs\ndelete config a/b\ncommit\n";
+        location.run_with_stdin(&["store", "shell"], script).expect_success();
+        let events = sync.wait_for("caught-up");
+        let mut blocked = paths(&events, "error");
+        blocked.sort();
+        assert_eq!(blocked, ["a/b", "a/c"], "{backend}: {events:?}");
+        assert_eq!(fs::read_to_string(outside.path().join("a/b")).unwrap(), "b\n", "{backend}");
+        assert_eq!(fs::read_to_string(outside.path().join("a/c")).unwrap(), "c\n", "{backend}");
+        assert!(folder.path().join("a").is_symlink(), "{backend}");
+
+        // `sync` keeps running.
+        location.write("config", "d", "d\n");
+        let events = sync.wait_for("caught-up");
+        assert_eq!(paths(&events, "created"), ["d"], "{backend}: {events:?}");
+        sync.stop();
+    }
+}
+
+#[test]
+fn a_path_blocked_by_a_local_file_is_reported_and_the_rest_still_applied() {
+    for backend in BACKENDS {
+        let location = Location::with_store(backend);
+        let folder = TempDir::new().unwrap();
+        let mut sync = Sync::start(&location, "config", folder.path());
+        sync.wait_for("caught-up");
+        // A file of the person's own where the Store will want a directory.
+        fs::write(folder.path().join("q"), "mine\n").unwrap();
+
+        let script = "stage config\nwrite config a --contents a\nwrite config q/r --contents r\n\
+                      write config z --contents z\ncommit\n";
+        location.run_with_stdin(&["store", "shell"], script).expect_success();
+        let events = sync.wait_for("caught-up");
+        assert_eq!(paths(&events, "error"), ["q/r"], "{backend}: {events:?}");
+        let error = events.iter().find(|event| event["event"] == "error").unwrap();
+        assert!(error["message"].as_str().unwrap().contains('q'), "{backend}: {events:?}");
+        assert_eq!(paths(&events, "created"), ["a", "z"], "{backend}: {events:?}");
+        assert_eq!(fs::read_to_string(folder.path().join("q")).unwrap(), "mine\n");
+
+        // `sync` keeps running.
+        location.write("config", "later", "later\n");
+        let events = sync.wait_for("caught-up");
+        assert_eq!(paths(&events, "created"), ["later"], "{backend}: {events:?}");
+        sync.stop();
+
+        // The applied Paths were recorded, so with the person's file gone nothing is an addition.
+        fs::remove_file(folder.path().join("q")).unwrap();
+        let run = commit_in(folder.path(), &[]).expect_success();
+        assert!(run.stderr.contains("nothing to commit"), "{backend}: {run:?}");
+    }
+}
+
+#[test]
+fn sync_quiet_prints_a_blocked_path() {
+    for json in [true, false] {
+        let location = Location::with_store("fs");
+        location.write("config", "a", "a");
+        let folder = TempDir::new().unwrap();
+        let mut command = location.command(if json { &["--json"] } else { &[] });
+        command.args(["sync", "--quiet", "config"]).arg(folder.path());
+        let mut sync = Sync::spawn(command);
+        wait_until(|| folder.path().join("a").exists());
+        fs::write(folder.path().join("q"), "mine\n").unwrap();
+        location.write("config", "q/r", "r");
+        let expected = if json {
+            r#"{"event":"error","message":"q isn't a directory","path":"q/r"}"#
+        } else {
+            "error q/r: q isn't a directory"
+        };
+        assert_eq!(sync.next_line(), expected);
+        sync.stop();
+    }
+}
+
 /// The Paths of the events in `events` named `name`, in order.
 fn paths<'a>(events: &'a [serde_json::Value], name: &str) -> Vec<&'a str> {
     events
@@ -547,14 +633,9 @@ fn paths<'a>(events: &'a [serde_json::Value], name: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// Waits until `condition` holds, failing the test if it doesn't within a while.
-#[track_caller]
-fn wait_until(condition: impl Fn() -> bool) {
-    for _ in 0..400 {
-        if condition() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    panic!("waited too long");
+/// Removes the cache Area's directory in `location`, a filesystem Store, as when the OS clears
+/// the cache, which gives a Resync for the Area. SQLite gives one only after falling ten minutes
+/// behind.
+fn clear_the_cache_directory(location: &Location) {
+    fs::remove_dir_all(location.root().join("cache")).unwrap();
 }

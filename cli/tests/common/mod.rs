@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tempfile::TempDir;
@@ -121,8 +121,19 @@ pub fn is_revision(text: &str) -> bool {
     text.len() == 32 && text.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
-/// How long [`Sync::wait_for`] waits for an event before failing the test.
+/// How long [`Sync::wait_for`] waits for an event, and [`wait_until`] for its condition, before
+/// failing the test.
 const EVENT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Waits until `condition` holds, failing the test if it doesn't within [`EVENT_TIMEOUT`].
+#[track_caller]
+pub fn wait_until(condition: impl Fn() -> bool) {
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    while !condition() {
+        assert!(Instant::now() < deadline, "waited too long");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
 
 /// A running `tidings sync --json`, with the events it prints as they come.
 pub struct Sync {

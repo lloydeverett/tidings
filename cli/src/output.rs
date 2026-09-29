@@ -142,7 +142,7 @@ impl Output {
 /// How `sync` prints what it does.
 #[derive(Debug, Clone, Copy)]
 pub struct SyncOutput {
-    /// Whether to print JSON.
+    /// How to print each line, as JSON or for a person.
     pub output: Output,
     /// `--quiet`: print only what needs the person's attention.
     pub quiet: bool,
@@ -151,22 +151,27 @@ pub struct SyncOutput {
 impl SyncOutput {
     /// Prints what `sync` did, as one line, unless it is quiet and this needs no attention.
     pub fn print(self, event: &SyncEvent) -> io::Result<()> {
-        if self.quiet && !matches!(event, SyncEvent::Resync) {
+        if self.quiet && !matches!(event, SyncEvent::Resync | SyncEvent::Blocked { .. }) {
             return Ok(());
         }
-        let (name, path) = match event {
-            SyncEvent::Created(path) => ("created", Some(path)),
-            SyncEvent::Updated(path) => ("updated", Some(path)),
-            SyncEvent::Removed(path) => ("removed", Some(path)),
-            SyncEvent::Resync => ("resync", None),
-            SyncEvent::CaughtUp => ("caught-up", None),
+        let (name, path, message) = match event {
+            SyncEvent::Created(path) => ("created", Some(path), None),
+            SyncEvent::Updated(path) => ("updated", Some(path), None),
+            SyncEvent::Removed(path) => ("removed", Some(path), None),
+            SyncEvent::Blocked { path, reason } => ("error", Some(path), Some(reason)),
+            SyncEvent::Resync => ("resync", None, None),
+            SyncEvent::CaughtUp => ("caught-up", None, None),
         };
-        let line = match (self.output.json, path) {
-            (true, Some(path)) => json!({"event": name, "path": path.as_str()}).to_string(),
-            (true, None) => json!({"event": name}).to_string(),
-            (false, Some(path)) => format!("{name} {path}"),
+        let line = match (self.output.json, path, message) {
+            (true, Some(path), Some(message)) => {
+                json!({"event": name, "path": path.as_str(), "message": message}).to_string()
+            }
+            (true, Some(path), None) => json!({"event": name, "path": path.as_str()}).to_string(),
+            (true, None, _) => json!({"event": name}).to_string(),
+            (false, Some(path), Some(message)) => format!("{name} {path}: {message}"),
+            (false, Some(path), None) => format!("{name} {path}"),
             // For a person, a name is words.
-            (false, None) => name.replace('-', " "),
+            (false, None, _) => name.replace('-', " "),
         };
         print_stdout(&format!("{line}\n"))
     }

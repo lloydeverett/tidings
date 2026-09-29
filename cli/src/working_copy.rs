@@ -10,7 +10,7 @@ use std::fs::{self, TryLockError};
 use std::future::{self, Future};
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path as FsPath, PathBuf};
-use std::pin::pin;
+use std::pin::{Pin, pin};
 
 use tidings::{Area, ChangeFeed, FeedItem, File, Path, Precondition, Revision, Staging, Store};
 
@@ -64,6 +64,9 @@ pub enum SyncEvent {
     Updated(Path),
     /// It removed a File the Store no longer has.
     Removed(Path),
+    /// It couldn't apply the Store's version of a Path because of what is in the folder, as
+    /// `reason` says, so the Path's Base stays as it was.
+    Blocked { path: Path, reason: String },
     /// Changes to the Area may have been missed, so it reconciles every Path.
     Resync,
     /// It has applied everything it knows of.
@@ -103,6 +106,10 @@ enum Paths {
     /// Only these.
     Only(BTreeSet<Path>),
 }
+
+/// Why the Store's version of a Path can't be applied to the folder: something in the way, as in
+/// "q isn't a directory".
+struct Blocked(String);
 
 /// What the folder holds at a Path.
 enum Local {
@@ -201,39 +208,54 @@ impl WorkingCopy {
             for event in self.reconcile(store, next).await? {
                 report(&event)?;
             }
-            // Anything already waiting is reconciled before `sync` says it's caught up.
-            let mut caught_up = false;
-            next = loop {
-                let item = tokio::select! {
-                    biased;
-                    () = &mut stop => return Ok(()),
-                    item = feed.next() => item,
-                    () = future::ready(()), if !caught_up => {
-                        report(&SyncEvent::CaughtUp)?;
-                        caught_up = true;
-                        continue;
-                    }
-                };
-                // The feed ends only once the Store is dropped, which it isn't until `sync` ends.
-                let Some(item) = item else { return Ok(()) };
-                match item {
-                    FeedItem::Changes(changes) => {
-                        let paths: BTreeSet<Path> = changes
-                            .into_iter()
-                            .filter(|change| change.area == self.area)
-                            .map(|change| change.path)
-                            .collect();
-                        if !paths.is_empty() {
-                            break Paths::Only(paths);
-                        }
-                    }
-                    FeedItem::Resync(area) if area == self.area => {
-                        report(&SyncEvent::Resync)?;
-                        break Paths::All;
-                    }
-                    FeedItem::Resync(_) => {}
+            match self.wait_for_paths(feed, stop.as_mut(), &mut report).await? {
+                Some(paths) => next = paths,
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// Waits on `feed` for the Paths to reconcile next: those of a batch of Changes to the Area, or
+    /// every Path on a Resync for it, which is reported. Before waiting on an empty feed, reports
+    /// that `sync` is caught up, so anything already waiting is reconciled first. Gives `None`
+    /// once `stop` finishes.
+    async fn wait_for_paths(
+        &self,
+        feed: &mut ChangeFeed,
+        mut stop: Pin<&mut impl Future<Output = ()>>,
+        report: &mut impl FnMut(&SyncEvent) -> io::Result<()>,
+    ) -> Result<Option<Paths>, Failure> {
+        let mut caught_up = false;
+        loop {
+            let item = tokio::select! {
+                biased;
+                () = &mut stop => return Ok(None),
+                item = feed.next() => item,
+                () = future::ready(()), if !caught_up => {
+                    report(&SyncEvent::CaughtUp)?;
+                    caught_up = true;
+                    continue;
                 }
             };
+            // The feed ends only once the Store is dropped, which it isn't until `sync` ends.
+            let Some(item) = item else { return Ok(None) };
+            match item {
+                FeedItem::Changes(changes) => {
+                    let paths: BTreeSet<Path> = changes
+                        .into_iter()
+                        .filter(|change| change.area == self.area)
+                        .map(|change| change.path)
+                        .collect();
+                    if !paths.is_empty() {
+                        return Ok(Some(Paths::Only(paths)));
+                    }
+                }
+                FeedItem::Resync(area) if area == self.area => {
+                    report(&SyncEvent::Resync)?;
+                    return Ok(Some(Paths::All));
+                }
+                FeedItem::Resync(_) => {}
+            }
         }
     }
 
@@ -291,13 +313,17 @@ impl WorkingCopy {
     }
 
     /// Reconciles `path` with `theirs`, what the Store holds there, which differs from its Base
-    /// in `bases`, updating the Base.
+    /// in `bases`, updating the Base. If what is in the folder blocks applying `theirs`, the Base
+    /// stays as it was.
     fn reconcile_path(
         &self,
         bases: &mut BTreeMap<Path, Base>,
         path: &Path,
         theirs: Option<&File>,
     ) -> Result<Option<SyncEvent>, Failure> {
+        if let Err(Blocked(reason)) = self.check_directories(path)? {
+            return Ok(Some(SyncEvent::Blocked { path: path.clone(), reason }));
+        }
         let base = bases.get(path).copied();
         let local = self.local(path)?;
         let unchanged = match (&local, base) {
@@ -327,7 +353,32 @@ impl WorkingCopy {
         Ok(event)
     }
 
-    /// Makes the folder hold `theirs` at `path`, where it now holds `local`.
+    /// Whether the directories `path` is in, in the folder, are each a real directory or missing,
+    /// so that nothing outside the folder is reached through them: not a symlink, nor a file.
+    fn check_directories(&self, path: &Path) -> Result<Result<(), Blocked>, Failure> {
+        let mut at = self.folder.clone();
+        let mut directories = path.as_str().split('/');
+        // The last part names the File, not a directory.
+        directories.next_back();
+        for name in directories {
+            at.push(name);
+            let metadata = match fs::symlink_metadata(&at) {
+                Ok(metadata) => metadata,
+                // Missing, so made as a real directory when a File is written under it.
+                Err(error) if error.kind() == ErrorKind::NotFound => break,
+                Err(error) => return Err(failed_at(&at)(error)),
+            };
+            if !metadata.is_dir() {
+                let directory = at.strip_prefix(&self.folder).unwrap_or(&at).display();
+                let what = if metadata.is_symlink() { "is a symlink" } else { "isn't a directory" };
+                return Ok(Err(Blocked(format!("{directory} {what}"))));
+            }
+        }
+        Ok(Ok(()))
+    }
+
+    /// Makes the folder hold `theirs` at `path`, where it now holds `local`. The directories
+    /// `path` is in must have passed [`WorkingCopy::check_directories`].
     fn apply(
         &self,
         path: &Path,
@@ -337,7 +388,7 @@ impl WorkingCopy {
         let at = self.path_in_folder(path);
         match (local, theirs) {
             (_, Some(file)) => {
-                self.write(&at, file.contents()).map_err(failed_at(&at))?;
+                self.write(&at, file.contents())?;
                 Ok(Some(match local {
                     Local::Absent => SyncEvent::Created(path.clone()),
                     _ => SyncEvent::Updated(path.clone()),
@@ -354,7 +405,12 @@ impl WorkingCopy {
     /// Writes `contents` to the file `at`, making the directories it needs, so that it is never
     /// seen half-written: in `.tidings/tmp/` first, forced to disk, then renamed into place. A
     /// file it replaces keeps its permissions.
-    fn write(&self, at: &FsPath, contents: &str) -> io::Result<()> {
+    fn write(&self, at: &FsPath, contents: &str) -> Result<(), Failure> {
+        self.write_io(at, contents).map_err(failed_at(at))
+    }
+
+    /// [`WorkingCopy::write`], failing with the I/O error.
+    fn write_io(&self, at: &FsPath, contents: &str) -> io::Result<()> {
         let tmp = self.folder.join(RECORD_DIRECTORY).join(TMP_DIRECTORY);
         fs::create_dir_all(&tmp)?;
         let mut builder = tempfile::Builder::new();
