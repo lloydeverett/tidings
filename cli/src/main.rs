@@ -18,8 +18,8 @@ use tidings::Area;
 use crate::command::{AreaName, Session, StoreCommand};
 use crate::failure::Failure;
 use crate::location::StoreArgs;
-use crate::output::{Output, Report, print_stdout};
-use crate::working_copy::{SyncEvent, WorkingCopy};
+use crate::output::{Output, Report, SyncOutput, print_stdout};
+use crate::working_copy::WorkingCopy;
 
 /// Read, write and watch a tidings Store.
 ///
@@ -42,13 +42,17 @@ struct Cli {
 /// A top-level command.
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Make a folder a Working copy of an Area, holding its Files, until Ctrl-C
+    /// Make a folder a Working copy of an Area, and keep it in step with the Store until Ctrl-C
     ///
-    /// The folder must be empty or missing. Nothing in it reaches the Store until `commit`.
+    /// The folder must be empty or missing. Files the Store adds, changes or removes appear in it,
+    /// but a file changed locally is left alone. Nothing in it reaches the Store until `commit`.
     Sync {
         area: AreaName,
         /// The folder. The current directory if left out.
         folder: Option<PathBuf>,
+        /// Print only resyncs and errors.
+        #[arg(long)]
+        quiet: bool,
     },
     /// Commit every local change in a Working copy, all together or not at all
     ///
@@ -120,7 +124,10 @@ fn main() -> ExitCode {
     };
     let output = Output { json: cli.json, at_prompt: false };
     let result = match cli.command {
-        Command::Sync { area, folder } => runtime.block_on(sync(&cli.store, output, area, folder)),
+        Command::Sync { area, folder, quiet } => {
+            let output = SyncOutput { output, quiet };
+            runtime.block_on(sync(&cli.store, output, area, folder))
+        }
         Command::Commit { working_copy } => runtime.block_on(commit(output, &working_copy)),
         Command::Store(StoreSubcommand::Shell) => shell::run(&runtime, &cli.store, cli.json),
         Command::Store(StoreSubcommand::OneShot(command)) => {
@@ -169,11 +176,11 @@ async fn one_shot(store: &StoreArgs, json: bool, command: OneShot) -> Result<(),
     }
 }
 
-/// `sync`: makes `folder` a Working copy of `area`, writes every File into it, and waits for
+/// `sync`: makes `folder` a Working copy of `area`, and keeps it in step with the Store until
 /// Ctrl-C.
 async fn sync(
     store: &StoreArgs,
-    output: Output,
+    output: SyncOutput,
     area: AreaName,
     folder: Option<PathBuf>,
 ) -> Result<(), Failure> {
@@ -185,15 +192,10 @@ async fn sync(
     // Before the Store, which `--create` would otherwise make even for a folder that can't be a
     // Working copy.
     WorkingCopy::check_can_create(&folder)?;
-    let (address, opened) = store.open_with_address().await?;
+    // Opening the Store takes the Change feed, before anything is reconciled.
+    let (address, mut opened) = store.open_with_address().await?;
     let working_copy = WorkingCopy::create(&folder, address, area.into())?;
-    let _syncing = working_copy.lock_for_sync()?;
-    for event in working_copy.reconcile_all(&opened.store).await? {
-        output.print_sync_event(&event)?;
-    }
-    output.print_sync_event(&SyncEvent::CaughtUp)?;
-    ctrl_c.await;
-    Ok(())
+    working_copy.sync(&opened.store, &mut opened.feed, ctrl_c, |event| output.print(event)).await
 }
 
 /// `commit`: commits every local change in the Working copy.

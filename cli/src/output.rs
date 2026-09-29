@@ -102,24 +102,6 @@ impl Output {
         }
     }
 
-    /// Prints what `sync` did, as one line.
-    pub fn print_sync_event(self, event: &SyncEvent) -> io::Result<()> {
-        let (name, path) = match event {
-            SyncEvent::Created(path) => ("created", Some(path)),
-            SyncEvent::Updated(path) => ("updated", Some(path)),
-            SyncEvent::Removed(path) => ("removed", Some(path)),
-            SyncEvent::CaughtUp => ("caught-up", None),
-        };
-        let line = match (self.json, path) {
-            (true, Some(path)) => json!({"event": name, "path": path.as_str()}).to_string(),
-            (true, None) => json!({"event": name}).to_string(),
-            (false, Some(path)) => format!("{name} {path}"),
-            // For a person, a name is words.
-            (false, None) => name.replace('-', " "),
-        };
-        print_stdout(&format!("{line}\n"))
-    }
-
     /// The lines that show `item` for the Areas in `areas`, or every Area if it is empty.
     pub fn feed_lines(self, item: &FeedItem, areas: &[Area]) -> Vec<String> {
         let shown = |area: Area| areas.is_empty() || areas.contains(&area);
@@ -154,6 +136,39 @@ impl Output {
         } else {
             format!("{origin} {kind} {area} {}", change.path)
         }
+    }
+}
+
+/// How `sync` prints what it does.
+#[derive(Debug, Clone, Copy)]
+pub struct SyncOutput {
+    /// Whether to print JSON.
+    pub output: Output,
+    /// `--quiet`: print only what needs the person's attention.
+    pub quiet: bool,
+}
+
+impl SyncOutput {
+    /// Prints what `sync` did, as one line, unless it is quiet and this needs no attention.
+    pub fn print(self, event: &SyncEvent) -> io::Result<()> {
+        if self.quiet && !matches!(event, SyncEvent::Resync) {
+            return Ok(());
+        }
+        let (name, path) = match event {
+            SyncEvent::Created(path) => ("created", Some(path)),
+            SyncEvent::Updated(path) => ("updated", Some(path)),
+            SyncEvent::Removed(path) => ("removed", Some(path)),
+            SyncEvent::Resync => ("resync", None),
+            SyncEvent::CaughtUp => ("caught-up", None),
+        };
+        let line = match (self.output.json, path) {
+            (true, Some(path)) => json!({"event": name, "path": path.as_str()}).to_string(),
+            (true, None) => json!({"event": name}).to_string(),
+            (false, Some(path)) => format!("{name} {path}"),
+            // For a person, a name is words.
+            (false, None) => name.replace('-', " "),
+        };
+        print_stdout(&format!("{line}\n"))
     }
 }
 

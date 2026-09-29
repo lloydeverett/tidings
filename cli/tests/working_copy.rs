@@ -283,3 +283,278 @@ fn commit_in(directory: &Path, args: &[&str]) -> common::Run {
     command.arg("commit").args(args).current_dir(directory);
     common::run(command, "")
 }
+
+#[test]
+fn files_the_store_writes_and_deletes_appear_and_disappear() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        let mut sync = Sync::start(&location, "config", folder.path());
+        sync.wait_for("caught-up");
+
+        location.write("config", "new.toml", "new\n");
+        let events = sync.wait_for("caught-up");
+        assert_eq!(paths(&events, "created"), ["new.toml"], "{backend}: {events:?}");
+        assert_eq!(fs::read_to_string(folder.path().join("new.toml")).unwrap(), "new\n");
+
+        location.write("config", "app.toml", "a = 2\n");
+        let events = sync.wait_for("caught-up");
+        assert_eq!(paths(&events, "updated"), ["app.toml"], "{backend}: {events:?}");
+        assert_eq!(fs::read_to_string(folder.path().join("app.toml")).unwrap(), "a = 2\n");
+
+        location.run(&["store", "delete", "config", "themes/dark.toml"]).expect_success();
+        let events = sync.wait_for("caught-up");
+        assert_eq!(paths(&events, "removed"), ["themes/dark.toml"], "{backend}: {events:?}");
+        // The directory the removal emptied is removed too.
+        assert!(!folder.path().join("themes").exists(), "{backend}");
+        sync.stop();
+
+        // Every file was renamed into place from `.tidings/tmp/`, leaving nothing there.
+        let tmp = fs::read_dir(folder.path().join(".tidings/tmp")).unwrap();
+        assert_eq!(tmp.count(), 0, "{backend}");
+    }
+}
+
+#[test]
+fn a_removal_removes_only_the_directories_it_emptied() {
+    for backend in BACKENDS {
+        let location = Location::with_store(backend);
+        location.write("config", "deep/er/x.toml", "x\n");
+        location.write("config", "mine/sub/y.toml", "y\n");
+        location.write("config", "mine/kept.toml", "kept\n");
+        let folder = TempDir::new().unwrap();
+        let mut sync = Sync::start(&location, "config", folder.path());
+        sync.wait_for("caught-up");
+        fs::write(folder.path().join("mine/notes.txt"), "untracked\n").unwrap();
+
+        let script = "stage config\ndelete config deep/er/x.toml\ndelete config mine/sub/y.toml\n\
+                      delete config mine/kept.toml\ncommit\n";
+        location.run_with_stdin(&["store", "shell"], script).expect_success();
+        let events = sync.wait_for("caught-up");
+        let mut removed = paths(&events, "removed");
+        removed.sort();
+        assert_eq!(removed, ["deep/er/x.toml", "mine/kept.toml", "mine/sub/y.toml"], "{backend}");
+        sync.stop();
+
+        assert!(!folder.path().join("deep").exists(), "{backend}");
+        assert!(!folder.path().join("mine/sub").exists(), "{backend}");
+        // Still holding a file of the person's own, so left alone, as is the folder itself.
+        assert!(folder.path().join("mine/notes.txt").is_file(), "{backend}");
+        assert!(folder.path().join(".tidings").is_dir(), "{backend}");
+    }
+}
+
+#[test]
+fn a_file_takes_the_place_of_a_directory_and_the_reverse() {
+    for backend in BACKENDS {
+        let location = Location::with_store(backend);
+        location.write("config", "x/y.toml", "y\n");
+        location.write("config", "z", "z\n");
+        let folder = TempDir::new().unwrap();
+        let mut sync = Sync::start(&location, "config", folder.path());
+        sync.wait_for("caught-up");
+
+        let script = "stage config\ndelete config x/y.toml\nwrite config x --contents x\n\
+                      delete config z\nwrite config z/w.toml --contents w\ncommit\n";
+        location.run_with_stdin(&["store", "shell"], script).expect_success();
+        let events = sync.wait_for("caught-up");
+        let names: Vec<&str> =
+            events.iter().map(|event| event["event"].as_str().unwrap()).collect();
+        // Removals come first, making way for the writes.
+        assert_eq!(names, ["removed", "removed", "created", "created", "caught-up"], "{backend}");
+        sync.stop();
+
+        assert_eq!(fs::read_to_string(folder.path().join("x")).unwrap(), "x", "{backend}");
+        assert_eq!(fs::read_to_string(folder.path().join("z/w.toml")).unwrap(), "w", "{backend}");
+    }
+}
+
+#[test]
+fn only_changes_to_the_working_copys_area_are_acted_on() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        let mut sync = Sync::start(&location, "config", folder.path());
+        sync.wait_for("caught-up");
+
+        location.write("data", "other.toml", "data\n");
+        location.write("config", "marker.toml", "marker\n");
+        // Nothing, not even a reconcile that finds nothing to do, for the data Area's Change.
+        let events = sync.wait_for("caught-up");
+        assert_eq!(paths(&events, "created"), ["marker.toml"], "{backend}: {events:?}");
+        assert_eq!(events.len(), 2, "{backend}: {events:?}");
+        sync.stop();
+        assert!(!folder.path().join("other.toml").exists(), "{backend}");
+    }
+}
+
+#[test]
+fn a_file_committed_while_sync_starts_is_not_missed() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        let mut sync = Sync::start(&location, "config", folder.path());
+        location.write("config", "late.toml", "late\n");
+        loop {
+            let events = sync.wait_for("caught-up");
+            if folder.path().join("late.toml").exists() {
+                break;
+            }
+            assert!(paths(&events, "created").len() < 3, "{backend}: {events:?}");
+        }
+        sync.stop();
+        assert_eq!(fs::read_to_string(folder.path().join("late.toml")).unwrap(), "late\n");
+    }
+}
+
+#[test]
+fn a_resync_reconciles_every_path() {
+    // Removing an Area's directory gives a Resync on the filesystem Backend. SQLite gives one
+    // only after falling ten minutes behind.
+    let location = Location::with_store("fs");
+    location.write("cache", "thumbnails/a.png", "a");
+    location.write("cache", "b.txt", "b");
+    let folder = TempDir::new().unwrap();
+    let mut sync = Sync::start(&location, "cache", folder.path());
+    sync.wait_for("caught-up");
+
+    // As when the OS clears the cache.
+    fs::remove_dir_all(location.root().join("cache")).unwrap();
+    sync.wait_for("resync");
+    sync.wait_for("caught-up");
+    sync.stop();
+    assert!(!folder.path().join("thumbnails").exists());
+    assert!(!folder.path().join("b.txt").exists());
+}
+
+#[test]
+fn clearing_the_cache_removes_the_unchanged_local_files() {
+    for backend in BACKENDS {
+        let location = Location::with_store(backend);
+        location.write("cache", "thumbnails/a.png", "a");
+        location.write("cache", "b.txt", "b");
+        let folder = TempDir::new().unwrap();
+        let mut sync = Sync::start(&location, "cache", folder.path());
+        sync.wait_for("caught-up");
+        fs::write(folder.path().join("b.txt"), "mine").unwrap();
+
+        location.run(&["store", "delete-prefix", "cache", ""]).expect_success();
+        let events = sync.wait_for("caught-up");
+        assert_eq!(paths(&events, "removed"), ["thumbnails/a.png"], "{backend}: {events:?}");
+        sync.stop();
+        assert!(!folder.path().join("thumbnails").exists(), "{backend}");
+        assert_eq!(fs::read_to_string(folder.path().join("b.txt")).unwrap(), "mine");
+    }
+}
+
+#[test]
+fn a_local_change_is_left_alone_when_the_store_changes_the_path() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        let mut sync = Sync::start(&location, "config", folder.path());
+        sync.wait_for("caught-up");
+        fs::write(folder.path().join("app.toml"), "mine\n").unwrap();
+        fs::remove_file(folder.path().join("themes/dark.toml")).unwrap();
+        fs::write(folder.path().join("added.toml"), "mine\n").unwrap();
+
+        let script = "stage config\nwrite config app.toml --contents theirs\n\
+                      write config themes/dark.toml --contents theirs\n\
+                      write config added.toml --contents theirs\ncommit\n";
+        location.run_with_stdin(&["store", "shell"], script).expect_success();
+        let events = sync.wait_for("caught-up");
+        assert_eq!(events.len(), 1, "{backend}: {events:?}");
+        sync.stop();
+
+        assert_eq!(fs::read_to_string(folder.path().join("app.toml")).unwrap(), "mine\n");
+        assert!(!folder.path().join("themes/dark.toml").exists(), "{backend}");
+        assert_eq!(fs::read_to_string(folder.path().join("added.toml")).unwrap(), "mine\n");
+    }
+}
+
+#[test]
+fn sync_doesnt_report_the_persons_own_commit_back() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        let mut sync = Sync::start(&location, "config", folder.path());
+        sync.wait_for("caught-up");
+
+        fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
+        fs::write(folder.path().join("added.toml"), "added\n").unwrap();
+        fs::remove_file(folder.path().join("themes/dark.toml")).unwrap();
+        commit_in(folder.path(), &[]).expect_success();
+        let events = sync.wait_for("caught-up");
+        assert_eq!(events.len(), 1, "{backend}: {events:?}");
+        sync.stop();
+    }
+}
+
+#[test]
+fn sync_quiet_prints_only_what_needs_attention() {
+    // A Resync, as in `a_resync_reconciles_every_path`, is the one thing here worth printing.
+    for json in [true, false] {
+        let location = Location::with_store("fs");
+        location.write("cache", "a.txt", "a");
+        let folder = TempDir::new().unwrap();
+        let mut command = location.command(if json { &["--json"] } else { &[] });
+        command.args(["sync", "--quiet", "cache"]).arg(folder.path());
+        let mut sync = Sync::spawn(command);
+        wait_until(|| folder.path().join("a.txt").exists());
+        location.write("cache", "b.txt", "b");
+        wait_until(|| folder.path().join("b.txt").exists());
+        fs::remove_dir_all(location.root().join("cache")).unwrap();
+        let expected = if json { r#"{"event":"resync"}"# } else { "resync" };
+        assert_eq!(sync.next_line(), expected);
+        wait_until(|| !folder.path().join("b.txt").exists());
+        sync.stop();
+    }
+}
+
+#[test]
+fn ctrl_c_during_a_reconcile_lets_it_finish() {
+    for backend in BACKENDS {
+        let location = Location::with_store(backend);
+        let writes: String =
+            (0..300).map(|n| format!("write config f{n:03}.toml --contents {n}\n")).collect();
+        let script = format!("stage config\n{writes}commit\n");
+        location.run_with_stdin(&["store", "shell"], &script).expect_success();
+        let folder = TempDir::new().unwrap();
+        let sync = Sync::start(&location, "config", folder.path());
+        // Stopped as soon as the first file is written, while the rest are still to come.
+        let first = folder.path().join("f000.toml");
+        while !first.exists() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let written_by_then = fs::read_dir(folder.path()).unwrap().count();
+        sync.stop();
+        assert!(written_by_then < 301, "{backend}: sync wrote every file before it was stopped");
+
+        // Every File was written, and the record saved, so nothing is an added file.
+        let files = fs::read_dir(folder.path()).unwrap().count();
+        assert_eq!(files, 301, "{backend}");
+        let run = commit_in(folder.path(), &[]).expect_success();
+        assert!(run.stderr.contains("nothing to commit"), "{backend}: {run:?}");
+    }
+}
+
+/// The Paths of the events in `events` named `name`, in order.
+fn paths<'a>(events: &'a [serde_json::Value], name: &str) -> Vec<&'a str> {
+    events
+        .iter()
+        .filter(|event| event["event"] == name)
+        .map(|event| event["path"].as_str().unwrap())
+        .collect()
+}
+
+/// Waits until `condition` holds, failing the test if it doesn't within a while.
+#[track_caller]
+fn wait_until(condition: impl Fn() -> bool) {
+    for _ in 0..400 {
+        if condition() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!("waited too long");
+}

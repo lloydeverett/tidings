@@ -7,10 +7,12 @@ mod record;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, TryLockError};
-use std::io::{self, ErrorKind};
+use std::future::{self, Future};
+use std::io::{self, ErrorKind, Write};
 use std::path::{Path as FsPath, PathBuf};
+use std::pin::pin;
 
-use tidings::{Area, File, Path, Precondition, Revision, Staging, Store};
+use tidings::{Area, ChangeFeed, FeedItem, File, Path, Precondition, Revision, Staging, Store};
 
 use crate::failure::Failure;
 use crate::location::{Opened, StoreAddress};
@@ -29,6 +31,10 @@ const LOCK_FILE: &str = "lock";
 /// The lock file in [`RECORD_DIRECTORY`] that [`SyncLock`] holds.
 const SYNC_LOCK_FILE: &str = "sync.lock";
 
+/// The directory in [`RECORD_DIRECTORY`] where a file is written before it is renamed into place.
+/// Being inside the folder keeps the rename on one volume.
+const TMP_DIRECTORY: &str = "tmp";
+
 /// A folder that is a Working copy, and the Store and Area its record names, which never change.
 /// Its Bases are read from the record only under [`Lock`], since another command may change them.
 pub struct WorkingCopy {
@@ -38,7 +44,7 @@ pub struct WorkingCopy {
 }
 
 /// Held for as long as a `sync` runs: the lock on `.tidings/sync.lock`.
-pub struct SyncLock {
+struct SyncLock {
     _file: fs::File,
 }
 
@@ -58,6 +64,8 @@ pub enum SyncEvent {
     Updated(Path),
     /// It removed a File the Store no longer has.
     Removed(Path),
+    /// Changes to the Area may have been missed, so it reconciles every Path.
+    Resync,
     /// It has applied everything it knows of.
     CaughtUp,
 }
@@ -86,6 +94,14 @@ pub enum LocalChange {
     Modified,
     /// A Path with a Base, but no file.
     Deleted,
+}
+
+/// Which Paths a reconcile covers.
+enum Paths {
+    /// Every Path in the Area and in the record.
+    All,
+    /// Only these.
+    Only(BTreeSet<Path>),
 }
 
 /// What the folder holds at a Path.
@@ -164,8 +180,65 @@ impl WorkingCopy {
         self.store.open(false).await
     }
 
+    /// Keeps the folder in step with the Store until `stop` finishes, giving each [`SyncEvent`] to
+    /// `report` as it happens. It reconciles every Path first, then the Paths of each batch of
+    /// Changes to the Area on `feed`, and every Path again on a Resync for the Area. `feed` must
+    /// have been taken when `store` was opened, so that nothing committed since is missed.
+    ///
+    /// Only one `sync` of a Working copy runs at a time. `stop` is acted on only between
+    /// reconciles, so each one finishes and saves the record.
+    pub async fn sync(
+        &self,
+        store: &Store,
+        feed: &mut ChangeFeed,
+        stop: impl Future<Output = ()>,
+        mut report: impl FnMut(&SyncEvent) -> io::Result<()>,
+    ) -> Result<(), Failure> {
+        let _syncing = self.lock_for_sync()?;
+        let mut stop = pin!(stop);
+        let mut next = Paths::All;
+        loop {
+            for event in self.reconcile(store, next).await? {
+                report(&event)?;
+            }
+            // Anything already waiting is reconciled before `sync` says it's caught up.
+            let mut caught_up = false;
+            next = loop {
+                let item = tokio::select! {
+                    biased;
+                    () = &mut stop => return Ok(()),
+                    item = feed.next() => item,
+                    () = future::ready(()), if !caught_up => {
+                        report(&SyncEvent::CaughtUp)?;
+                        caught_up = true;
+                        continue;
+                    }
+                };
+                // The feed ends only once the Store is dropped, which it isn't until `sync` ends.
+                let Some(item) = item else { return Ok(()) };
+                match item {
+                    FeedItem::Changes(changes) => {
+                        let paths: BTreeSet<Path> = changes
+                            .into_iter()
+                            .filter(|change| change.area == self.area)
+                            .map(|change| change.path)
+                            .collect();
+                        if !paths.is_empty() {
+                            break Paths::Only(paths);
+                        }
+                    }
+                    FeedItem::Resync(area) if area == self.area => {
+                        report(&SyncEvent::Resync)?;
+                        break Paths::All;
+                    }
+                    FeedItem::Resync(_) => {}
+                }
+            };
+        }
+    }
+
     /// Locks `.tidings/sync.lock`, for as long as a `sync` runs.
-    pub fn lock_for_sync(&self) -> Result<SyncLock, Failure> {
+    fn lock_for_sync(&self) -> Result<SyncLock, Failure> {
         let file = self.open_lock_file(SYNC_LOCK_FILE)?;
         match file.try_lock() {
             Ok(()) => Ok(SyncLock { _file: file }),
@@ -177,42 +250,62 @@ impl WorkingCopy {
         }
     }
 
-    /// Reconciles every Path in the Area and in the record with the Store: where the local file is
-    /// unchanged since its Base, or absent with no Base, the Store's version is applied to the
-    /// folder and becomes the Base. A local change is left alone.
-    pub async fn reconcile_all(&self, store: &Store) -> Result<Vec<SyncEvent>, Failure> {
+    /// Reconciles `paths` with the Store, reading each one's Store state afresh: where the local
+    /// file is unchanged since its Base, or absent with no Base, the Store's version is applied to
+    /// the folder and becomes the Base. A local change is left alone. Removals are applied before
+    /// writes, so that a File can take the place of a directory, and the reverse.
+    async fn reconcile(&self, store: &Store, paths: Paths) -> Result<Vec<SyncEvent>, Failure> {
         let mut lock = self.lock()?;
         let bases = &mut lock.record.bases;
-        let mut paths: BTreeSet<Path> = store.list(self.area, "").await?.into_iter().collect();
-        paths.extend(bases.keys().cloned());
-        let mut events = Vec::new();
+        let paths = match paths {
+            Paths::All => {
+                let mut paths: BTreeSet<Path> =
+                    store.list(self.area, "").await?.into_iter().collect();
+                paths.extend(bases.keys().cloned());
+                paths
+            }
+            Paths::Only(paths) => paths,
+        };
+        let mut removed = Vec::new();
+        let mut written = Vec::new();
         for path in paths {
-            events.extend(self.reconcile(store, bases, path).await?);
+            let theirs = store.read(self.area, &path).await?;
+            let base = bases.get(&path).map(|base| base.revision);
+            if theirs.as_ref().map(File::revision) != base {
+                match theirs {
+                    None => removed.push(path),
+                    Some(file) => written.push(file),
+                }
+            }
+        }
+        let mut events = Vec::new();
+        for path in removed {
+            events.extend(self.reconcile_path(bases, &path, None)?);
+        }
+        for file in written {
+            events.extend(self.reconcile_path(bases, file.path(), Some(&file))?);
         }
         // The folder is changed first and the record saved after.
         self.save(&lock.record)?;
         Ok(events)
     }
 
-    /// Reconciles `path` with the Store, updating its Base in `bases`.
-    async fn reconcile(
+    /// Reconciles `path` with `theirs`, what the Store holds there, which differs from its Base
+    /// in `bases`, updating the Base.
+    fn reconcile_path(
         &self,
-        store: &Store,
         bases: &mut BTreeMap<Path, Base>,
-        path: Path,
+        path: &Path,
+        theirs: Option<&File>,
     ) -> Result<Option<SyncEvent>, Failure> {
-        let theirs = store.read(self.area, &path).await?;
-        let base = bases.get(&path).copied();
-        if theirs.as_ref().map(File::revision) == base.map(|base| base.revision) {
-            return Ok(None);
-        }
-        let local = self.local(&path)?;
+        let base = bases.get(path).copied();
+        let local = self.local(path)?;
         let unchanged = match (&local, base) {
             (Local::Absent, None) => true,
             (Local::File(contents), Some(base)) => Hash::of(contents) == base.hash,
             _ => false,
         };
-        let same_as_theirs = match (&local, &theirs) {
+        let same_as_theirs = match (&local, theirs) {
             (Local::Absent, None) => true,
             (Local::File(contents), Some(file)) => contents == file.contents(),
             _ => false,
@@ -221,14 +314,14 @@ impl WorkingCopy {
             // A local change stays as it is.
             return Ok(None);
         }
-        let event = if unchanged { self.apply(&path, &local, theirs.as_ref())? } else { None };
+        let event = if unchanged { self.apply(path, &local, theirs)? } else { None };
         match theirs {
             Some(file) => {
                 let base = Base { revision: file.revision(), hash: Hash::of(file.contents()) };
-                bases.insert(path, base);
+                bases.insert(path.clone(), base);
             }
             None => {
-                bases.remove(&path);
+                bases.remove(path);
             }
         }
         Ok(event)
@@ -242,13 +335,9 @@ impl WorkingCopy {
         theirs: Option<&File>,
     ) -> Result<Option<SyncEvent>, Failure> {
         let at = self.path_in_folder(path);
-        let failed = failed_at(&at);
         match (local, theirs) {
             (_, Some(file)) => {
-                if let Some(parent) = at.parent() {
-                    fs::create_dir_all(parent).map_err(failed)?;
-                }
-                fs::write(&at, file.contents()).map_err(failed)?;
+                self.write(&at, file.contents()).map_err(failed_at(&at))?;
                 Ok(Some(match local {
                     Local::Absent => SyncEvent::Created(path.clone()),
                     _ => SyncEvent::Updated(path.clone()),
@@ -256,10 +345,47 @@ impl WorkingCopy {
             }
             (Local::Absent, None) => Ok(None),
             (_, None) => {
-                fs::remove_file(&at).map_err(failed)?;
+                self.remove(&at)?;
                 Ok(Some(SyncEvent::Removed(path.clone())))
             }
         }
+    }
+
+    /// Writes `contents` to the file `at`, making the directories it needs, so that it is never
+    /// seen half-written: in `.tidings/tmp/` first, forced to disk, then renamed into place. A
+    /// file it replaces keeps its permissions.
+    fn write(&self, at: &FsPath, contents: &str) -> io::Result<()> {
+        let tmp = self.folder.join(RECORD_DIRECTORY).join(TMP_DIRECTORY);
+        fs::create_dir_all(&tmp)?;
+        let mut builder = tempfile::Builder::new();
+        // As a new file would be made, before the umask, rather than only for its owner.
+        #[cfg(unix)]
+        builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666));
+        let mut file = builder.tempfile_in(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        if let Ok(metadata) = fs::metadata(at) {
+            file.as_file().set_permissions(metadata.permissions())?;
+        }
+        file.as_file().sync_all()?;
+        if let Some(parent) = at.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        file.persist(at).map_err(|error| error.error)?;
+        Ok(())
+    }
+
+    /// Removes the file `at`, then each directory above it that the removal emptied, stopping at
+    /// the first that holds anything else, and at the folder.
+    fn remove(&self, at: &FsPath) -> Result<(), Failure> {
+        fs::remove_file(at).map_err(failed_at(at))?;
+        for directory in at.ancestors().skip(1).take_while(|directory| *directory != self.folder) {
+            match fs::remove_dir(directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::DirectoryNotEmpty => break,
+                Err(error) => return Err(failed_at(directory)(error)),
+            }
+        }
+        Ok(())
     }
 
     /// Commits every local change as one Commit: an added file requires the Path to be absent in
