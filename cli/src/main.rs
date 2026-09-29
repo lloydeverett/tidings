@@ -182,9 +182,9 @@ async fn sync(
         Some(folder) => folder,
         None => std::env::current_dir()?,
     };
-    let opened = store.open(false).await?;
-    let mut working_copy =
-        WorkingCopy::create(&folder, store.location()?, opened.backend, area.into())?;
+    let address = store.address().await?;
+    let opened = address.open(store.create).await?;
+    let working_copy = WorkingCopy::create(&folder, address, area.into())?;
     let _syncing = working_copy.lock_for_sync()?;
     for event in working_copy.reconcile_all(&opened.store).await? {
         output.print_sync_event(&event)?;
@@ -196,7 +196,7 @@ async fn sync(
 
 /// `commit`: commits every local change in the Working copy.
 async fn commit(output: Output, working_copy: &WorkingCopyArgs) -> Result<(), Failure> {
-    let mut working_copy = working_copy.open()?;
+    let working_copy = working_copy.open()?;
     let opened = working_copy.open_store().await?;
     let report = working_copy.commit(&opened.store).await?;
     Ok(output.print(&Report::WorkingCopyCommit(report))?)

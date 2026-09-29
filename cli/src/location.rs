@@ -31,7 +31,7 @@ pub struct StoreArgs {
 
     /// Make a new Store where there is none. Needs `--backend`.
     #[arg(long, global = true)]
-    create: bool,
+    pub create: bool,
 }
 
 /// A Backend, as it is named on the command line.
@@ -85,7 +85,7 @@ impl fmt::Display for Identity {
 }
 
 /// Where a Store on the filesystem or SQLite is.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreLocation {
     /// A Root override, always absolute, so that it means the same from any directory.
     Root(PathBuf),
@@ -120,31 +120,47 @@ impl StoreLocation {
         }
     }
 
-    /// Opens the Store here, on `backend`, or on the Backend found here if that is `None`.
-    /// `create` makes a new Store where there is none.
-    pub async fn open(
-        &self,
-        backend: Option<BackendName>,
-        create: bool,
-    ) -> Result<Opened, Failure> {
-        let (identity, root) = (self.app_identity(), self.root());
-        let detected = Store::detect(&identity, root).await?;
-        let backend = match (detected, backend) {
-            // A Backend that doesn't match gives the library's `WrongBackend` when it opens.
-            (Some(_), Some(backend)) => backend,
-            (None, Some(backend)) if create => backend,
-            (Some(kind), None) => kind.into(),
-            (None, None) if create => {
-                return Err(Failure::error("--create needs --backend, to say which one to make"));
-            }
-            (None, _) => {
-                return Err(Failure::error(format!(
-                    "there is no Store at {}: pass --create and --backend to make one",
-                    self.description(),
-                )));
-            }
-        };
-        let (store, feed) = match backend {
+    /// The Backend that holds the Store here, or `None` if there is no Store here.
+    async fn detect(&self) -> Result<Option<BackendName>, Failure> {
+        let detected = Store::detect(&self.app_identity(), self.root()).await?;
+        Ok(detected.map(BackendName::from))
+    }
+
+    /// The failure for there being no Store here.
+    fn missing(&self) -> Failure {
+        Failure::error(format!(
+            "there is no Store at {}: pass --create and --backend to make one",
+            self.description(),
+        ))
+    }
+}
+
+impl PartialEq for Identity {
+    fn eq(&self, other: &Identity) -> bool {
+        self.text == other.text
+    }
+}
+
+impl Eq for Identity {}
+
+/// Which Store: where it is and the Backend that holds it, which is all it takes to open it again.
+/// Two are equal when they name the same Store in the same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreAddress {
+    pub location: StoreLocation,
+    pub backend: BackendName,
+}
+
+impl StoreAddress {
+    /// Opens the Store. `create` makes a new one where there is none.
+    pub async fn open(&self, create: bool) -> Result<Opened, Failure> {
+        let (identity, root) = (self.location.app_identity(), self.location.root());
+        // A Backend that doesn't match the one found gives the library's `WrongBackend` when it
+        // opens.
+        if !create && self.location.detect().await?.is_none() {
+            return Err(self.location.missing());
+        }
+        let (store, feed) = match self.backend {
             BackendName::Fs => {
                 let mut options = FsOptions::default();
                 if let Some(root) = root {
@@ -161,8 +177,15 @@ impl StoreLocation {
             }
             BackendName::Memory => unreachable!("the memory Backend has no location"),
         };
-        let description = format!("{} ({backend})", self.description());
-        Ok(Opened { store, feed, backend, description })
+        let description = self.to_string();
+        Ok(Opened { store, feed, backend: self.backend, description })
+    }
+}
+
+impl fmt::Display for StoreAddress {
+    /// Where the Store is and its Backend, for a person to read.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} ({})", self.location.description(), self.backend)
     }
 }
 
@@ -184,16 +207,30 @@ impl StoreArgs {
         if self.backend == Some(BackendName::Memory) {
             return self.open_memory(in_shell);
         }
-        self.location()?.open(self.backend, self.create).await
+        self.address().await?.open(self.create).await
+    }
+
+    /// Which Store the flags choose, which can't be one in memory: on the Backend `--backend`
+    /// names, or the one found where the Store is.
+    pub async fn address(&self) -> Result<StoreAddress, Failure> {
+        if self.backend == Some(BackendName::Memory) {
+            return Err(memory_outside_the_shell());
+        }
+        let location = self.location()?;
+        let backend = match (self.backend, location.detect().await?) {
+            (Some(backend), _) | (None, Some(backend)) => backend,
+            (None, None) if self.create => {
+                return Err(Failure::error("--create needs --backend, to say which one to make"));
+            }
+            (None, None) => return Err(location.missing()),
+        };
+        Ok(StoreAddress { location, backend })
     }
 
     /// Opens a Store on the memory Backend, if `in_shell`, and nothing says where it is.
     fn open_memory(&self, in_shell: bool) -> Result<Opened, Failure> {
         if !in_shell {
-            return Err(Failure::error(
-                "the memory Backend lasts only as long as the command, so only \
-                 `tidings store shell` can use it",
-            ));
+            return Err(memory_outside_the_shell());
         }
         if self.root.is_some() || self.identity.is_some() || self.create {
             return Err(Failure::error(
@@ -224,4 +261,12 @@ impl StoreArgs {
             )),
         }
     }
+}
+
+/// The failure for the memory Backend outside `tidings store shell`.
+fn memory_outside_the_shell() -> Failure {
+    Failure::error(
+        "the memory Backend lasts only as long as the command, so only `tidings store shell` can \
+         use it",
+    )
 }

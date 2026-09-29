@@ -5,6 +5,8 @@ mod common;
 
 use std::fs;
 use std::path::Path;
+use std::thread;
+use std::time::Duration;
 
 use common::{Location, Sync, tidings};
 use tempfile::TempDir;
@@ -22,7 +24,7 @@ fn store_with_config(backend: &str) -> Location {
 /// Syncs `area` into `folder`, waits until it's caught up, and stops it.
 fn synced(location: &Location, area: &str, folder: &Path) {
     let mut sync = Sync::start(location, area, folder);
-    sync.wait_for("caught up");
+    sync.wait_for("caught-up");
     sync.stop();
 }
 
@@ -33,7 +35,7 @@ fn sync_writes_every_file_into_a_missing_folder() {
         let parent = TempDir::new().unwrap();
         let folder = parent.path().join("cfg");
         let mut sync = Sync::start(&location, "config", &folder);
-        let events = sync.wait_for("caught up");
+        let events = sync.wait_for("caught-up");
         sync.stop();
 
         let created: Vec<&str> = events
@@ -147,12 +149,70 @@ fn a_file_changed_in_the_store_since_its_base_is_a_conflict() {
 }
 
 #[test]
+fn sync_finishes_a_working_copy_a_crash_left_without_a_record() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        // What a `sync` that stopped before writing the record leaves: `.tidings/` with its lock
+        // and part of a record.
+        let tidings = folder.path().join(".tidings");
+        fs::create_dir(&tidings).unwrap();
+        fs::write(tidings.join("lock"), "").unwrap();
+        fs::write(tidings.join(".working-copy.a1B2c3"), "tidings work").unwrap();
+        synced(&location, "config", folder.path());
+
+        assert_eq!(fs::read_to_string(folder.path().join("app.toml")).unwrap(), "a = 1\n");
+        fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
+        commit_in(folder.path(), &[]).expect_success();
+        assert_eq!(location.read("config", "app.toml"), "a = 2\n");
+    }
+}
+
+#[test]
+fn a_second_commit_waiting_for_the_first_reads_the_bases_it_saved() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
+
+        // Both commits start while another command holds the lock, and wait for it.
+        let lock = fs::File::create(folder.path().join(".tidings/lock")).unwrap();
+        lock.lock().unwrap();
+        let commits: Vec<_> = (0..2)
+            .map(|_| {
+                let mut command = tidings();
+                command.arg("commit").current_dir(folder.path());
+                common::spawn(&mut command)
+            })
+            .collect();
+        thread::sleep(Duration::from_millis(500));
+        drop(lock);
+
+        let mut runs: Vec<String> = commits
+            .into_iter()
+            .map(|commit| {
+                let output = commit.wait_with_output().unwrap();
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                let stderr = String::from_utf8(output.stderr).unwrap();
+                assert_eq!(output.status.code(), Some(0), "{backend}: {stdout}{stderr}");
+                stdout + &stderr
+            })
+            .collect();
+        runs.sort();
+        assert!(runs[0].contains("modified app.toml"), "{backend}: {runs:?}");
+        assert!(runs[1].contains("nothing to commit"), "{backend}: {runs:?}");
+        assert_eq!(location.read("config", "app.toml"), "a = 2\n");
+    }
+}
+
+#[test]
 fn commit_works_while_sync_runs() {
     for backend in BACKENDS {
         let location = store_with_config(backend);
         let folder = TempDir::new().unwrap();
         let mut sync = Sync::start(&location, "config", folder.path());
-        sync.wait_for("caught up");
+        sync.wait_for("caught-up");
         fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
         commit_in(folder.path(), &[]).expect_success();
         sync.stop();

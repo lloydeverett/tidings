@@ -13,16 +13,28 @@ use std::path::{Path as FsPath, PathBuf};
 use tidings::{Area, File, Path, Precondition, Revision, Staging, Store};
 
 use crate::failure::Failure;
-use crate::location::{BackendName, Opened, StoreLocation};
+use crate::location::{Opened, StoreAddress};
 use record::{Base, Hash, Record};
 
-/// The directory in a Working copy's folder that holds its record, which is never a File.
-const TIDINGS: &str = ".tidings";
+/// The directory in a Working copy's folder that holds its record and locks, which is never a
+/// File.
+const RECORD_DIRECTORY: &str = ".tidings";
 
-/// A folder that is a Working copy, and its record.
+/// The record's file in [`RECORD_DIRECTORY`].
+const RECORD_FILE: &str = "working-copy";
+
+/// The lock file in [`RECORD_DIRECTORY`] that [`Lock`] holds.
+const LOCK_FILE: &str = "lock";
+
+/// The lock file in [`RECORD_DIRECTORY`] that [`SyncLock`] holds.
+const SYNC_LOCK_FILE: &str = "sync.lock";
+
+/// A folder that is a Working copy, and the Store and Area its record names, which never change.
+/// Its Bases are read from the record only under [`Lock`], since another command may change them.
 pub struct WorkingCopy {
     folder: PathBuf,
-    record: Record,
+    store: StoreAddress,
+    area: Area,
 }
 
 /// Held for as long as a `sync` runs: the lock on `.tidings/sync.lock`.
@@ -31,9 +43,10 @@ pub struct SyncLock {
 }
 
 /// Held while a command reads the folder to act on it, or changes the folder or the record: the
-/// lock on `.tidings/lock`.
+/// lock on `.tidings/lock`, and the record as it was read under it.
 struct Lock {
     _file: fs::File,
+    record: Record,
 }
 
 /// Something `sync` did, or found.
@@ -84,40 +97,39 @@ enum Local {
 }
 
 impl WorkingCopy {
-    /// Makes `folder`, which must be missing or empty, a Working copy of `area` in the Store at
-    /// `location`, on `backend`, with no Files yet.
+    /// Makes `folder`, which must be missing or empty, a Working copy of `area` in `store`, with
+    /// no Files yet. A `.tidings/` holding no record, as a `sync` that stopped while making the
+    /// Working copy leaves, counts as empty.
     pub fn create(
         folder: &FsPath,
-        location: StoreLocation,
-        backend: BackendName,
+        store: StoreAddress,
         area: Area,
     ) -> Result<WorkingCopy, Failure> {
-        let in_folder = |error: io::Error| Failure::from(error).in_context(folder.display());
-        match fs::read_dir(folder).map(|mut entries| entries.next().is_none()) {
-            Ok(false) => {
-                let what = if record::is_record(&record_file(folder)) {
-                    "is a Working copy already"
-                } else {
-                    "isn't empty"
-                };
-                return Err(Failure::error(format!(
-                    "{} {what}: sync into an empty or missing folder",
-                    folder.display()
-                )));
-            }
-            Ok(true) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(in_folder(error)),
+        let refuse = |what: &str| {
+            Failure::error(format!(
+                "{} {what}: sync into an empty or missing folder",
+                folder.display()
+            ))
+        };
+        if !is_empty(folder)? {
+            return Err(refuse(if record::is_record(&record_file(folder)) {
+                "is a Working copy already"
+            } else {
+                "isn't empty"
+            }));
         }
-        fs::create_dir_all(folder.join(TIDINGS)).map_err(in_folder)?;
-        let working_copy =
-            WorkingCopy { folder: folder.to_owned(), record: Record::new(location, backend, area) };
-        let _lock = working_copy.lock()?;
-        working_copy.save()?;
+        fs::create_dir_all(folder.join(RECORD_DIRECTORY)).map_err(failed_at(folder))?;
+        let working_copy = WorkingCopy { folder: folder.to_owned(), store, area };
+        let _lock = working_copy.lock_file(LOCK_FILE, true)?;
+        // Another `sync` may have made it a Working copy since the folder was found empty.
+        if record_file(folder).exists() {
+            return Err(refuse("is a Working copy already"));
+        }
+        working_copy.save(&Record::new(working_copy.store.clone(), area))?;
         Ok(working_copy)
     }
 
-    /// Opens the Working copy that is `folder`.
+    /// Opens the Working copy that is `folder`, reading which Store and Area it belongs to.
     pub fn open(folder: &FsPath) -> Result<WorkingCopy, Failure> {
         let file = record_file(folder);
         if !record::is_record(&file) {
@@ -126,7 +138,8 @@ impl WorkingCopy {
                 folder.display()
             )));
         }
-        Ok(WorkingCopy { folder: folder.to_owned(), record: Record::read(&file)? })
+        let Record { store, area, .. } = Record::read(&file)?;
+        Ok(WorkingCopy { folder: folder.to_owned(), store, area })
     }
 
     /// Opens the Working copy `start` is in: the first folder from `start` up that has a record.
@@ -143,12 +156,12 @@ impl WorkingCopy {
 
     /// Opens the Store the record names.
     pub async fn open_store(&self) -> Result<Opened, Failure> {
-        self.record.location.open(Some(self.record.backend), false).await
+        self.store.open(false).await
     }
 
     /// Locks `.tidings/sync.lock`, for as long as a `sync` runs.
     pub fn lock_for_sync(&self) -> Result<SyncLock, Failure> {
-        let file = self.lock_file("sync.lock")?;
+        let file = self.lock_file(SYNC_LOCK_FILE, false)?;
         match file.try_lock() {
             Ok(()) => Ok(SyncLock { _file: file }),
             Err(TryLockError::WouldBlock) => Err(Failure::error(format!(
@@ -162,24 +175,29 @@ impl WorkingCopy {
     /// Reconciles every Path in the Area and in the record with the Store: where the local file is
     /// unchanged since its Base, or absent with no Base, the Store's version is applied to the
     /// folder and becomes the Base. A local change is left alone.
-    pub async fn reconcile_all(&mut self, store: &Store) -> Result<Vec<SyncEvent>, Failure> {
-        let _lock = self.lock()?;
-        let mut paths: BTreeSet<Path> =
-            store.list(self.record.area, "").await?.into_iter().collect();
-        paths.extend(self.record.bases.keys().cloned());
+    pub async fn reconcile_all(&self, store: &Store) -> Result<Vec<SyncEvent>, Failure> {
+        let mut lock = self.lock()?;
+        let bases = &mut lock.record.bases;
+        let mut paths: BTreeSet<Path> = store.list(self.area, "").await?.into_iter().collect();
+        paths.extend(bases.keys().cloned());
         let mut events = Vec::new();
         for path in paths {
-            events.extend(self.reconcile(store, path).await?);
+            events.extend(self.reconcile(store, bases, path).await?);
         }
         // The folder is changed first and the record saved after.
-        self.save()?;
+        self.save(&lock.record)?;
         Ok(events)
     }
 
-    /// Reconciles `path` with the Store, without saving the record.
-    async fn reconcile(&mut self, store: &Store, path: Path) -> Result<Option<SyncEvent>, Failure> {
-        let theirs = store.read(self.record.area, &path).await?;
-        let base = self.record.bases.get(&path).copied();
+    /// Reconciles `path` with the Store, updating its Base in `bases`.
+    async fn reconcile(
+        &self,
+        store: &Store,
+        bases: &mut BTreeMap<Path, Base>,
+        path: Path,
+    ) -> Result<Option<SyncEvent>, Failure> {
+        let theirs = store.read(self.area, &path).await?;
+        let base = bases.get(&path).copied();
         if theirs.as_ref().map(File::revision) == base.map(|base| base.revision) {
             return Ok(None);
         }
@@ -202,10 +220,10 @@ impl WorkingCopy {
         match theirs {
             Some(file) => {
                 let base = Base { revision: file.revision(), hash: Hash::of(file.contents()) };
-                self.record.bases.insert(path, base);
+                bases.insert(path, base);
             }
             None => {
-                self.record.bases.remove(&path);
+                bases.remove(&path);
             }
         }
         Ok(event)
@@ -218,8 +236,8 @@ impl WorkingCopy {
         local: &Local,
         theirs: Option<&File>,
     ) -> Result<Option<SyncEvent>, Failure> {
-        let at = self.at(path);
-        let failed = |error| Failure::from(error).in_context(at.display());
+        let at = self.path_in_folder(path);
+        let failed = failed_at(&at);
         match (local, theirs) {
             (_, Some(file)) => {
                 if let Some(parent) = at.parent() {
@@ -242,13 +260,14 @@ impl WorkingCopy {
     /// Commits every local change as one Commit: an added file requires the Path to be absent in
     /// the Store, and a modified or deleted one that the File is unchanged since its Base. The
     /// committed Revisions become the new Bases.
-    pub async fn commit(&mut self, store: &Store) -> Result<CommitReport, Failure> {
-        let _lock = self.lock()?;
+    pub async fn commit(&self, store: &Store) -> Result<CommitReport, Failure> {
+        let mut lock = self.lock()?;
+        let bases = &mut lock.record.bases;
         let files = self.scan()?;
-        let mut staging = Staging::new(self.record.area);
+        let mut staging = Staging::new(self.area);
         let mut changes = Vec::new();
         for (path, contents) in &files {
-            let (change, precondition) = match self.record.bases.get(path) {
+            let (change, precondition) = match bases.get(path) {
                 None => (LocalChange::Added, Precondition::Absent),
                 Some(base) if Hash::of(contents) != base.hash => {
                     (LocalChange::Modified, Precondition::UnchangedSince(base.revision))
@@ -258,7 +277,7 @@ impl WorkingCopy {
             staging.write_requiring(path, contents.as_str(), precondition)?;
             changes.push((path.clone(), change));
         }
-        for (path, base) in &self.record.bases {
+        for (path, base) in bases.iter() {
             if !files.contains_key(path) {
                 staging.delete_requiring(path, Precondition::UnchangedSince(base.revision))?;
                 changes.push((path.clone(), LocalChange::Deleted));
@@ -274,21 +293,21 @@ impl WorkingCopy {
             match (revision, files.get(&path)) {
                 (Some(revision), Some(contents)) => {
                     let base = Base { revision, hash: Hash::of(contents) };
-                    self.record.bases.insert(path.clone(), base);
+                    bases.insert(path.clone(), base);
                 }
                 _ => {
-                    self.record.bases.remove(&path);
+                    bases.remove(&path);
                 }
             }
             report.changes.push(CommittedChange { path, change, revision });
         }
-        self.save()?;
+        self.save(&lock.record)?;
         Ok(report)
     }
 
     /// What the folder holds at `path`.
     fn local(&self, path: &Path) -> Result<Local, Failure> {
-        let at = self.at(path);
+        let at = self.path_in_folder(path);
         let metadata = match fs::symlink_metadata(&at) {
             Ok(metadata) => metadata,
             Err(error)
@@ -296,7 +315,7 @@ impl WorkingCopy {
             {
                 return Ok(Local::Absent);
             }
-            Err(error) => return Err(Failure::from(error).in_context(at.display())),
+            Err(error) => return Err(failed_at(&at)(error)),
         };
         if !metadata.is_file() {
             return Ok(Local::Other);
@@ -304,7 +323,7 @@ impl WorkingCopy {
         match fs::read_to_string(&at) {
             Ok(contents) => Ok(Local::File(contents)),
             Err(error) if error.kind() == ErrorKind::InvalidData => Ok(Local::Other),
-            Err(error) => Err(Failure::from(error).in_context(at.display())),
+            Err(error) => Err(failed_at(&at)(error)),
         }
     }
 
@@ -322,7 +341,7 @@ impl WorkingCopy {
         prefix: &str,
         files: &mut BTreeMap<Path, String>,
     ) -> Result<(), Failure> {
-        let in_directory = |error: io::Error| Failure::from(error).in_context(directory.display());
+        let in_directory = failed_at(directory);
         for entry in fs::read_dir(directory).map_err(in_directory)? {
             let entry = entry.map_err(in_directory)?;
             let at = entry.path();
@@ -330,7 +349,7 @@ impl WorkingCopy {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 return Err(invalid("has a name that isn't UTF-8"));
             };
-            if prefix.is_empty() && name.eq_ignore_ascii_case(TIDINGS) {
+            if prefix.is_empty() && name.eq_ignore_ascii_case(RECORD_DIRECTORY) {
                 continue;
             }
             let file_type = entry.file_type().map_err(in_directory)?;
@@ -340,7 +359,7 @@ impl WorkingCopy {
                 let path = Path::new(format!("{prefix}{name}"))?;
                 let contents = fs::read_to_string(&at).map_err(|error| match error.kind() {
                     ErrorKind::InvalidData => invalid("isn't UTF-8 text"),
-                    _ => Failure::from(error).in_context(at.display()),
+                    _ => failed_at(&at)(error),
                 })?;
                 files.insert(path, contents);
             } else {
@@ -350,30 +369,37 @@ impl WorkingCopy {
         Ok(())
     }
 
-    /// Locks `.tidings/lock`, waiting for any other command holding it.
+    /// Locks `.tidings/lock`, waiting for any other command holding it, and reads the record
+    /// under it.
     fn lock(&self) -> Result<Lock, Failure> {
-        let file = self.lock_file("lock")?;
-        file.lock().map_err(|error| self.failed("lock", error))?;
-        Ok(Lock { _file: file })
+        let file = self.lock_file(LOCK_FILE, true)?;
+        let record = Record::read(&record_file(&self.folder))?;
+        Ok(Lock { _file: file, record })
     }
 
-    /// Opens `.tidings/<name>`, to lock, making it if need be.
-    fn lock_file(&self, name: &str) -> Result<fs::File, Failure> {
-        let path = self.folder.join(TIDINGS).join(name);
+    /// Opens `.tidings/<name>`, making it if need be, and locks it if `wait`, waiting for any
+    /// other command holding it.
+    fn lock_file(&self, name: &str, wait: bool) -> Result<fs::File, Failure> {
+        let path = self.folder.join(RECORD_DIRECTORY).join(name);
         let file = fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path);
-        file.map_err(|error| Failure::from(error).in_context(path.display()))
+        let file = file.map_err(failed_at(&path))?;
+        if wait {
+            file.lock().map_err(|error| self.failed("lock", error))?;
+        }
+        Ok(file)
     }
 
-    /// Saves the record, whole.
-    fn save(&self) -> Result<(), Failure> {
-        self.record.write(&record_file(&self.folder))
+    /// Saves `record`, whole.
+    fn save(&self, record: &Record) -> Result<(), Failure> {
+        record.write(&record_file(&self.folder))
     }
 
-    /// Where the folder holds `path`.
-    fn at(&self, path: &Path) -> PathBuf {
+    /// The file in the folder that holds `path`.
+    fn path_in_folder(&self, path: &Path) -> PathBuf {
         self.folder.join(path.as_str())
     }
 
+    /// The failure for being unable to `what` the folder, as in "lock", because of `error`.
     fn failed(&self, what: &str, error: io::Error) -> Failure {
         Failure::error(format!("can't {what} {}: {error}", self.folder.display()))
     }
@@ -381,5 +407,45 @@ impl WorkingCopy {
 
 /// Where the Working copy that is `folder` keeps its record.
 fn record_file(folder: &FsPath) -> PathBuf {
-    folder.join(TIDINGS).join("working-copy")
+    folder.join(RECORD_DIRECTORY).join(RECORD_FILE)
+}
+
+/// Whether `folder` is missing or empty, counting a `.tidings/` that holds no record, only what
+/// making a Working copy leaves before it writes one, as nothing.
+fn is_empty(folder: &FsPath) -> Result<bool, Failure> {
+    let entries = match fs::read_dir(folder) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(failed_at(folder)(error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(failed_at(folder))?;
+        let is_directory = entry.file_type().map_err(failed_at(folder))?.is_dir();
+        if entry.file_name() != RECORD_DIRECTORY
+            || !is_directory
+            || !holds_no_record(&entry.path())?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether `directory`, a `.tidings/`, holds only what making a Working copy leaves before it
+/// writes the record: the lock files, and a temporary file the record was being written to.
+fn holds_no_record(directory: &FsPath) -> Result<bool, Failure> {
+    let temporary = format!(".{RECORD_FILE}.");
+    for entry in fs::read_dir(directory).map_err(failed_at(directory))? {
+        let name = entry.map_err(failed_at(directory))?.file_name();
+        let name = name.to_string_lossy();
+        if name != LOCK_FILE && name != SYNC_LOCK_FILE && !name.starts_with(&temporary) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Turns an I/O error about `path` into a Failure that names it.
+fn failed_at(path: &FsPath) -> impl Fn(io::Error) -> Failure + Copy + '_ {
+    move |error| Failure::from(error).in_context(path.display())
 }

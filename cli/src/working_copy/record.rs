@@ -22,7 +22,7 @@ use tidings::{Area, Path, Revision};
 
 use crate::command::AreaName;
 use crate::failure::Failure;
-use crate::location::{BackendName, Identity, StoreLocation};
+use crate::location::{BackendName, Identity, StoreAddress, StoreLocation};
 use crate::output::area_name;
 
 /// The first line of every record, which names its format.
@@ -34,8 +34,8 @@ const FORMAT_NAME: &str = "tidings working-copy ";
 /// A Working copy's record.
 #[derive(Debug)]
 pub struct Record {
-    pub location: StoreLocation,
-    pub backend: BackendName,
+    /// The Store the Working copy belongs to.
+    pub store: StoreAddress,
     pub area: Area,
     /// The Base of each Path that has one.
     pub bases: BTreeMap<Path, Base>,
@@ -68,8 +68,8 @@ pub fn is_record(file: &FsPath) -> bool {
 
 impl Record {
     /// A record with no Bases yet.
-    pub fn new(location: StoreLocation, backend: BackendName, area: Area) -> Record {
-        Record { location, backend, area, bases: BTreeMap::new() }
+    pub fn new(store: StoreAddress, area: Area) -> Record {
+        Record { store, area, bases: BTreeMap::new() }
     }
 
     /// Reads the record in `file`.
@@ -91,6 +91,7 @@ impl Record {
         write().map_err(|error| Failure::error(format!("can't write {}: {error}", file.display())))
     }
 
+    /// The record as the text of its file.
     fn to_text(&self) -> String {
         let mut text = format!("{FORMAT}\n");
         let mut line = |fields: &[&str]| {
@@ -98,14 +99,14 @@ impl Record {
             text.push_str(&fields.join("\t"));
             text.push('\n');
         };
-        match &self.location {
+        match &self.store.location {
             StoreLocation::Root(root) => {
                 // A Root override that isn't UTF-8 can't be given on the command line anyway.
                 line(&["root", &root.to_string_lossy()]);
             }
             StoreLocation::Identity(identity) => line(&["identity", &identity.to_string()]),
         }
-        line(&["backend", &self.backend.to_string()]);
+        line(&["backend", &self.store.backend.to_string()]);
         line(&["area", area_name(self.area)]);
         for (path, base) in &self.bases {
             let revision = base.revision.to_string();
@@ -147,12 +148,11 @@ impl Record {
             }
         }
         let missing = |what: &str| format!("doesn't say {what}");
-        Ok(Record {
+        let store = StoreAddress {
             location: location.ok_or_else(|| missing("where the Store is"))?,
             backend: backend.ok_or_else(|| missing("the Backend"))?,
-            area: area.ok_or_else(|| missing("the Area"))?,
-            bases,
-        })
+        };
+        Ok(Record { store, area: area.ok_or_else(|| missing("the Area"))?, bases })
     }
 }
 
@@ -169,6 +169,7 @@ fn parse_value<T: clap::ValueEnum>(name: &str) -> Result<T, String> {
     T::from_str(name, false).map_err(|_| bad("name", name))
 }
 
+/// What is wrong with a record that has `text` where it should have a `what`.
 fn bad(what: &str, text: &str) -> String {
     format!("has a {what} it can't read: {text:?}")
 }

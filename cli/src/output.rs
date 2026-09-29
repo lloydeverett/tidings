@@ -108,13 +108,14 @@ impl Output {
             SyncEvent::Created(path) => ("created", Some(path)),
             SyncEvent::Updated(path) => ("updated", Some(path)),
             SyncEvent::Removed(path) => ("removed", Some(path)),
-            SyncEvent::CaughtUp => ("caught up", None),
+            SyncEvent::CaughtUp => ("caught-up", None),
         };
         let line = match (self.json, path) {
             (true, Some(path)) => json!({"event": name, "path": path.as_str()}).to_string(),
             (true, None) => json!({"event": name}).to_string(),
             (false, Some(path)) => format!("{name} {path}"),
-            (false, None) => name.to_owned(),
+            // For a person, a name is words.
+            (false, None) => name.replace('-', " "),
         };
         print_stdout(&format!("{line}\n"))
     }
