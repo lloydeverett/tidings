@@ -16,7 +16,7 @@ use atomic_write_file::AtomicWriteFile;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use tidings::{InvalidPathReason, Path};
 
-use super::record::{Base, Hash};
+use super::record::Base;
 use super::{LocalChange, RECORD_DIRECTORY, failed_at};
 use crate::failure::Failure;
 
@@ -58,9 +58,7 @@ impl Scan<'_> {
         let changed = self.files.iter().filter_map(|(path, contents)| {
             let difference = match self.bases.get(path) {
                 None => Difference::Added { contents },
-                Some(base) if Hash::of(contents) != base.hash => {
-                    Difference::Modified { contents, base }
-                }
+                Some(base) if !base.holds(contents) => Difference::Modified { contents, base },
                 Some(_) => return None,
             };
             Some((path, difference))

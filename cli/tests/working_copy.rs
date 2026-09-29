@@ -2324,3 +2324,330 @@ fn status_refuses_a_malformed_ignore_file_as_commit_does() {
         assert_eq!(failure["failure"], "error", "{backend}: {run:?}");
     }
 }
+
+#[test]
+fn discard_takes_the_stores_version_of_each_changed_path_but_leaves_added_files() {
+    let diverge = |location: &Location, folder: &Path| {
+        fs::write(folder.join("app.toml"), "mine\n").unwrap();
+        location.write("config", "app.toml", "theirs\n");
+    };
+    with_a_diverged_path(diverge, |label, location, folder| {
+        fs::remove_file(folder.join("themes/dark.toml")).unwrap();
+        fs::write(folder.join("new.toml"), "new\n").unwrap();
+
+        let run = run_in("discard", folder, &[]).expect_success();
+        let took = ": took the Store's version";
+        let expected =
+            [format!("discarded app.toml{took}"), format!("discarded themes/dark.toml{took}")];
+        assert_eq!(run.stdout.lines().collect::<Vec<_>>(), expected, "{label}: {run:?}");
+        let read = |path: &str| fs::read_to_string(folder.join(path)).unwrap();
+        assert_eq!(read("app.toml"), "theirs\n", "{label}");
+        assert_eq!(read("themes/dark.toml"), "bg = \"black\"\n", "{label}");
+        // An added file is left alone unless named.
+        assert_eq!(read("new.toml"), "new\n", "{label}");
+        assert!(!theirs(folder, "app.toml").exists(), "{label}");
+
+        // The Store's versions are the Bases, so only the added file is a change.
+        let run = run_in("status", folder, &[]).expect_success();
+        assert!(run.stdout.starts_with("added new.toml\nsync is"), "{label}: {run:?}");
+        run_in("commit", folder, &[]).expect_success();
+        assert_eq!(location.read("config", "app.toml"), "theirs\n", "{label}");
+
+        let run = run_in("discard", folder, &[]).expect_success();
+        assert!(run.stdout.is_empty(), "{label}: {run:?}");
+        assert!(run.stderr.contains("nothing to discard"), "{label}: {run:?}");
+    });
+}
+
+#[test]
+fn discard_where_the_store_removed_the_file_removes_it_and_its_emptied_directories() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        location.write("config", "gone/deep/a.toml", "a\n");
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        fs::write(folder.path().join("gone/deep/a.toml"), "mine\n").unwrap();
+        location.run(&["store", "delete", "config", "gone/deep/a.toml"]).expect_success();
+
+        // With `sync` not running, the Path is only modified, not yet Diverged.
+        let run = run_in("discard", folder.path(), &["--json"]).expect_success();
+        let json: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+        let expected = serde_json::json!({
+            "discarded": [{"path": "gone/deep/a.toml", "change": "modified", "revision": null}],
+            "events": [],
+        });
+        assert_eq!(json, expected, "{backend}: {run:?}");
+        assert!(!folder.path().join("gone").exists(), "{backend}");
+
+        // A running `sync` finds nothing to do.
+        let mut sync = Sync::start(&location, "config", folder.path());
+        let events = sync.wait_for("caught-up");
+        assert_eq!(events.len(), 1, "{backend}: {events:?}");
+        sync.stop();
+    }
+}
+
+#[test]
+fn discard_named_paths_relative_to_the_current_directory_removes_named_added_files() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        fs::write(folder.path().join("app.toml"), "mine\n").unwrap();
+        fs::write(folder.path().join("themes/dark.toml"), "mine\n").unwrap();
+        fs::create_dir_all(folder.path().join("themes/new")).unwrap();
+        fs::write(folder.path().join("themes/new/light.toml"), "light\n").unwrap();
+        fs::write(folder.path().join("keep.toml"), "keep\n").unwrap();
+
+        // A directory means everything under it, added files included.
+        let themes = folder.path().join("themes");
+        let run = run_in("discard", &themes, &["--json", "."]).expect_success();
+        let json: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+        let revision = location.run(&["--json", "store", "stat", "config", "themes/dark.toml"]);
+        let revision: serde_json::Value = serde_json::from_str(&revision.stdout).unwrap();
+        let revision = &revision["revision"];
+        let expected = serde_json::json!({
+            "discarded": [
+                {"path": "themes/dark.toml", "change": "modified", "revision": revision},
+                {"path": "themes/new/light.toml", "change": "added", "revision": null},
+            ],
+            "events": [],
+        });
+        assert_eq!(json, expected, "{backend}: {run:?}");
+        assert!(!themes.join("new").exists(), "{backend}");
+        assert_eq!(fs::read_to_string(themes.join("dark.toml")).unwrap(), "bg = \"black\"\n");
+        assert_eq!(fs::read_to_string(folder.path().join("app.toml")).unwrap(), "mine\n");
+
+        let run = run_in("discard", &themes, &["../keep.toml"]).expect_success();
+        let removed = "discarded keep.toml: removed, since the Store has no File there\n";
+        assert_eq!(run.stdout, removed, "{backend}: {run:?}");
+        assert!(!folder.path().join("keep.toml").exists(), "{backend}");
+
+        // A name matching nothing, or an ignored file, is refused, and nothing is discarded.
+        fs::write(folder.path().join(".DS_Store"), "junk").unwrap();
+        for name in ["nope.toml", ".DS_Store"] {
+            let run = run_in("discard", folder.path(), &["app.toml", name]).expect_code(1);
+            assert!(run.stderr.contains(name), "{backend}: {run:?}");
+            assert_eq!(fs::read_to_string(folder.path().join("app.toml")).unwrap(), "mine\n");
+        }
+        let run = run_in("discard", folder.path(), &[".DS_Store"]).expect_code(1);
+        assert!(run.stderr.contains("to discard it"), "{backend}: {run:?}");
+        run_in("discard", folder.path(), &["/"]).expect_code(1);
+        assert!(folder.path().join(".DS_Store").exists(), "{backend}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn discard_replaces_what_isnt_a_file_without_following_it_or_leaving_the_folder() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        location.write("config", "gone.toml", "gone\n");
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("target.toml");
+        fs::write(&target, "outside\n").unwrap();
+        for path in ["app.toml", "gone.toml"] {
+            fs::remove_file(folder.path().join(path)).unwrap();
+            std::os::unix::fs::symlink(&target, folder.path().join(path)).unwrap();
+        }
+        location.run(&["store", "delete", "config", "gone.toml"]).expect_success();
+        fs::write(folder.path().join("logo.png"), [0x89, 0x50, 0xff]).unwrap();
+
+        // An invalid file with no Base is left alone unless named, as an added one is.
+        let run = run_in("discard", folder.path(), &[]).expect_success();
+        let expected = "discarded app.toml: took the Store's version\n\
+                        discarded gone.toml: removed, since the Store has no File there\n";
+        assert_eq!(run.stdout, expected, "{backend}: {run:?}");
+        let app = folder.path().join("app.toml");
+        assert!(fs::symlink_metadata(&app).unwrap().is_file(), "{backend}");
+        assert_eq!(fs::read_to_string(&app).unwrap(), "a = 1\n", "{backend}");
+        assert!(fs::symlink_metadata(folder.path().join("gone.toml")).is_err(), "{backend}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "outside\n", "{backend}");
+        assert!(folder.path().join("logo.png").exists(), "{backend}");
+        let run = run_in("discard", folder.path(), &["logo.png"]).expect_success();
+        assert!(run.stdout.starts_with("discarded logo.png: removed"), "{backend}: {run:?}");
+        assert!(!folder.path().join("logo.png").exists(), "{backend}");
+
+        // A symlinked directory on the way keeps the Store's version out, and nothing is
+        // discarded.
+        fs::write(folder.path().join("app.toml"), "mine\n").unwrap();
+        let outside_themes = outside.path().join("themes");
+        fs::create_dir(&outside_themes).unwrap();
+        fs::write(outside_themes.join("dark.toml"), "outside\n").unwrap();
+        fs::remove_dir_all(folder.path().join("themes")).unwrap();
+        std::os::unix::fs::symlink(&outside_themes, folder.path().join("themes")).unwrap();
+        let run = run_in("discard", folder.path(), &[]).expect_code(1);
+        let lines: Vec<&str> = run.stderr.lines().collect();
+        assert_eq!(lines[1..], ["  blocked themes/dark.toml: themes is a symlink"], "{run:?}");
+        let run = run_in("discard", folder.path(), &["--json"]).expect_code(1);
+        let failure: serde_json::Value = serde_json::from_str(&run.stderr).unwrap();
+        assert_eq!(failure["failure"], "blocked", "{backend}: {run:?}");
+        assert_eq!(fs::read_to_string(outside_themes.join("dark.toml")).unwrap(), "outside\n");
+        assert_eq!(fs::read_to_string(&app).unwrap(), "mine\n", "{backend}");
+    }
+}
+
+#[test]
+fn resolve_takes_the_version_merged_against_as_the_base_so_the_commit_goes_through() {
+    let diverge = |location: &Location, folder: &Path| {
+        fs::write(folder.join("app.toml"), "mine\n").unwrap();
+        location.write("config", "app.toml", "theirs\n");
+    };
+    with_a_diverged_path(diverge, |label, location, folder| {
+        fs::write(folder.join("app.toml"), "merged\n").unwrap();
+        let run = run_in("resolve", &folder.join("themes"), &["../app.toml"]).expect_success();
+        let expected = "resolved app.toml: its Base is now the Store's version it was merged \
+                        with\n";
+        assert_eq!(run.stdout, expected, "{label}: {run:?}");
+        assert!(!theirs(folder, "app.toml").exists(), "{label}");
+        assert_eq!(fs::read_to_string(folder.join("app.toml")).unwrap(), "merged\n", "{label}");
+        let run = run_in("status", folder, &[]).expect_success();
+        assert!(run.stdout.starts_with("modified app.toml\nsync is"), "{label}: {run:?}");
+
+        let run = run_in("commit", folder, &[]).expect_success();
+        assert_eq!(run.stdout, "modified app.toml\n", "{label}: {run:?}");
+        assert_eq!(location.read("config", "app.toml"), "merged\n", "{label}");
+    });
+}
+
+#[test]
+fn resolve_after_the_store_changed_again_still_conflicts() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        let mut sync = Sync::start(&location, "config", folder.path());
+        sync.wait_for("caught-up");
+        fs::write(folder.path().join("app.toml"), "mine\n").unwrap();
+        location.write("config", "app.toml", "theirs 1\n");
+        sync.wait_for("diverged");
+        sync.stop();
+        // Changed again while `sync` isn't running, so `theirs` still holds the first.
+        location.write("config", "app.toml", "theirs 2\n");
+
+        fs::write(folder.path().join("app.toml"), "theirs 1\n").unwrap();
+        let run = run_in("resolve", folder.path(), &["--json", "app.toml"]).expect_success();
+        let json: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+        assert!(common::is_revision(json["resolved"][0]["revision"].as_str().unwrap()), "{json}");
+        let run = run_in("commit", folder.path(), &[]).expect_code(3);
+        assert!(run.stderr.contains("diverged app.toml"), "{backend}: {run:?}");
+        assert_eq!(location.read("config", "app.toml"), "theirs 2\n", "{backend}");
+        let local = fs::read_to_string(folder.path().join("app.toml")).unwrap();
+        assert_eq!(local, "theirs 1\n", "{backend}");
+        let theirs_file = fs::read_to_string(theirs(folder.path(), "app.toml")).unwrap();
+        assert_eq!(theirs_file, "theirs 2\n", "{backend}");
+
+        // Nor does a resumed `sync` take the merge for an unchanged file and overwrite it.
+        run_in("resolve", folder.path(), &["app.toml"]).expect_success();
+        location.write("config", "app.toml", "theirs 3\n");
+        let mut sync = Sync::start(&location, "config", folder.path());
+        let events = sync.wait_for("caught-up");
+        assert_eq!(paths(&events, "diverged"), ["app.toml"], "{backend}: {events:?}");
+        sync.stop();
+        let local = fs::read_to_string(folder.path().join("app.toml")).unwrap();
+        assert_eq!(local, "theirs 1\n", "{backend}");
+    }
+}
+
+#[test]
+fn resolve_where_the_store_removed_the_file_leaves_no_base() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        let mut sync = Sync::start(&location, "config", folder.path());
+        sync.wait_for("caught-up");
+        fs::write(folder.path().join("app.toml"), "mine\n").unwrap();
+        location.run(&["store", "delete", "config", "app.toml"]).expect_success();
+        sync.wait_for("diverged");
+        sync.stop();
+
+        let run = run_in("resolve", folder.path(), &["--json", "app.toml"]).expect_success();
+        let json: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+        let expected = serde_json::json!({
+            "resolved": [{"path": "app.toml", "revision": null}],
+            "events": [],
+        });
+        assert_eq!(json, expected, "{backend}: {run:?}");
+        let run = run_in("resolve", folder.path(), &[]);
+        assert_eq!(run.code, 1, "{backend}: {run:?}");
+        let run = run_in("commit", folder.path(), &[]).expect_success();
+        assert_eq!(run.stdout, "added app.toml\n", "{backend}: {run:?}");
+        assert_eq!(location.read("config", "app.toml"), "mine\n", "{backend}");
+    }
+}
+
+#[test]
+fn resolve_refuses_a_path_that_isnt_diverged_and_resolves_nothing() {
+    let diverge = |location: &Location, folder: &Path| {
+        fs::write(folder.join("app.toml"), "mine\n").unwrap();
+        location.write("config", "app.toml", "theirs\n");
+    };
+    with_a_diverged_path(diverge, |label, _location, folder| {
+        fs::write(folder.join("themes/dark.toml"), "mine\n").unwrap();
+        for named in [&["app.toml", "themes/dark.toml"][..], &["app.toml", "."], &["nope.toml"]] {
+            let run = run_in("resolve", folder, named).expect_code(1);
+            let refused = named.last().unwrap();
+            let message = format!("can't resolve what isn't Diverged: {refused}");
+            assert!(run.stderr.contains(&message), "{label}: {run:?}");
+        }
+        let folder_arg = folder.to_str().unwrap();
+        let run = run_in("resolve", folder, &["--json", "-C", folder_arg, "themes/dark.toml"]);
+        let failure: serde_json::Value = serde_json::from_str(&run.expect_code(1).stderr).unwrap();
+        assert_eq!(failure["failure"], "error", "{label}");
+        assert!(theirs(folder, "app.toml").exists(), "{label}");
+        let run = run_in("status", folder, &[]).expect_success();
+        assert!(run.stdout.starts_with("diverged app.toml"), "{label}: {run:?}");
+    });
+}
+
+#[test]
+fn discard_and_resolve_find_the_working_copy_and_check_the_store_flags() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        fs::write(folder.path().join("app.toml"), "mine\n").unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let other = elsewhere.path().to_str().unwrap();
+
+        for subcommand in ["discard", "resolve"] {
+            let run = run_in(subcommand, folder.path(), &["--root", other, "app.toml"]);
+            assert!(run.expect_code(1).stderr.contains(other), "{backend} {subcommand}");
+            let run = run_in(subcommand, elsewhere.path(), &["app.toml"]).expect_code(1);
+            assert!(run.stderr.contains("-C"), "{backend}: {run:?}");
+        }
+        let folder_arg = folder.path().to_str().unwrap();
+        let run = run_in("discard", elsewhere.path(), &["-C", folder_arg]).expect_success();
+        assert_eq!(run.stdout, "discarded app.toml: took the Store's version\n", "{backend}");
+    }
+}
+
+#[test]
+fn a_theirs_that_cant_be_removed_is_an_error_but_the_path_is_settled_all_the_same() {
+    let diverge = |location: &Location, folder: &Path| {
+        fs::write(folder.join("app.toml"), "mine\n").unwrap();
+        location.write("config", "app.toml", "theirs\n");
+    };
+    with_a_diverged_path(diverge, |label, _location, folder| {
+        // The person put a directory of their own where the `theirs` file is.
+        let theirs_file = theirs(folder, "app.toml");
+        fs::remove_file(&theirs_file).unwrap();
+        fs::create_dir(&theirs_file).unwrap();
+        fs::write(theirs_file.join("notes"), "notes\n").unwrap();
+
+        let run = run_in("resolve", folder, &["--json", "app.toml"]).expect_success();
+        let json: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
+        let events = json["events"].as_array().unwrap();
+        assert_eq!(paths(events, "error"), ["app.toml"], "{label}: {run:?}");
+        assert!(message_for(events, "app.toml").contains("can't remove"), "{label}: {run:?}");
+        assert!(theirs_file.join("notes").exists(), "{label}");
+        let run = run_in("status", folder, &[]).expect_success();
+        assert!(run.stdout.starts_with("modified app.toml\n"), "{label}: {run:?}");
+
+        let run = run_in("discard", folder, &[]).expect_success();
+        let lines: Vec<&str> = run.stdout.lines().collect();
+        assert_eq!(lines[0], "discarded app.toml: took the Store's version", "{label}: {run:?}");
+        assert!(lines[1].starts_with("error app.toml: can't remove"), "{label}: {run:?}");
+    });
+}

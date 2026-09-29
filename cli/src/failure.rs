@@ -4,22 +4,22 @@ use std::fmt;
 use std::process::ExitCode;
 
 use serde_json::{Value, json};
-use tidings::Area;
+use tidings::{Area, Path};
 
 use crate::output::{EventParts, Subject, area_name};
-use crate::working_copy::{DivergedPath, Reconciled, Unfit};
+use crate::working_copy::{Blocked, DivergedPath, Reconciled, Unfit};
 
 /// A command that failed: what to tell the person, and the exit code.
 #[derive(Debug)]
 pub struct Failure {
     kind: FailureKind,
     message: String,
-    /// What was found at, or became of, each Path that stopped a Working copy's commit, if that is
-    /// how it failed.
+    /// What was found at, or became of, each Path that stopped a Working copy's commit or discard,
+    /// if that is how it failed.
     outcomes: Option<Outcomes>,
 }
 
-/// What was found at, or became of, each Path that stopped a Working copy's commit.
+/// What was found at, or became of, each Path that stopped a Working copy's commit or discard.
 #[derive(Debug)]
 enum Outcomes {
     /// It was refused because these Paths are Diverged.
@@ -28,6 +28,9 @@ enum Outcomes {
     Conflict(Vec<Reconciled>),
     /// It was refused because these files can't become Files.
     Invalid(Vec<Unfit>),
+    /// A discard was refused because what is in the folder keeps the Store's version of these
+    /// Paths from being put there.
+    Blocked(Vec<(Path, Blocked)>),
 }
 
 /// Each exit code other than success.
@@ -85,6 +88,18 @@ impl Failure {
         }
     }
 
+    /// A Working copy's discard was refused because what is in the folder, as `blocked` says for
+    /// each Path, keeps the Store's version from being put there. Exits with 1.
+    pub fn blocked(blocked: Vec<(Path, Blocked)>) -> Failure {
+        let message = "can't discard these, since what is in the folder keeps the Store's version \
+                       from being put there: move it out of the way, or name only other paths";
+        Failure {
+            kind: FailureKind::Error,
+            message: message.to_owned(),
+            outcomes: Some(Outcomes::Blocked(blocked)),
+        }
+    }
+
     /// There is no File at `path` in `area`.
     pub fn missing(area: Area, path: &str) -> Failure {
         let message = format!("no File at {} {path}", area_name(area));
@@ -115,11 +130,13 @@ impl Failure {
     /// Prints this on stderr: for a person, or, with `json`, as one JSON object on one line, as in
     /// `{"failure": "missing", "message": "no File at data a.txt"}`. The failure is `error`,
     /// `missing` or `conflict`, as [`FailureKind`] says, or `diverged` or `invalid` for a commit
-    /// refused because of Diverged Paths or files that can't be Files. A Working copy's commit
-    /// stopped by Paths also gives `"paths": […]`, each as `sync --json` gives an event, or, for
-    /// one that took the Store's version as its Base, as `{"event": "same", "path": "…",
-    /// "message": "…"}`, or for a file that can't be a File, as `{"event": "invalid", "path":
-    /// "…", "message": "is a symlink"}`.
+    /// refused because of Diverged Paths or files that can't be Files, or `blocked` for a discard
+    /// refused because of what is in the folder. A Working copy's commit or discard stopped by
+    /// Paths also gives `"paths": […]`, each as `sync --json` gives an event, or, for one that
+    /// took the Store's version as its Base, as `{"event": "same", "path": "…", "message": "…"}`,
+    /// or for a file that can't be a File, as `{"event": "invalid", "path": "…", "message": "is a
+    /// symlink"}`, or for a blocked Path, as `{"event": "blocked", "path": "…", "message": "a is
+    /// a symlink"}`.
     pub fn print(&self, json: bool) {
         if !json {
             eprintln!("tidings: {self}");
@@ -128,6 +145,7 @@ impl Failure {
         let failure = match (self.kind, &self.outcomes) {
             (_, Some(Outcomes::Diverged(_))) => "diverged",
             (_, Some(Outcomes::Invalid(_))) => "invalid",
+            (_, Some(Outcomes::Blocked(_))) => "blocked",
             (FailureKind::Error, _) => "error",
             (FailureKind::Missing, _) => "missing",
             (FailureKind::Conflict, _) => "conflict",
@@ -151,6 +169,15 @@ impl Failure {
                 reconciled.iter().map(reconciled_parts).collect()
             }
             Some(Outcomes::Invalid(invalid)) => invalid.iter().map(EventParts::invalid).collect(),
+            Some(Outcomes::Blocked(blocked)) => blocked
+                .iter()
+                .map(|(path, blocked)| EventParts {
+                    name: "blocked",
+                    subject: Some(Subject::Path(path)),
+                    message: Some(blocked.reason()),
+                    theirs: None,
+                })
+                .collect(),
         }
     }
 }

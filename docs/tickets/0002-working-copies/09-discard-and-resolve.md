@@ -8,18 +8,18 @@ commit goes through, unless the Store has changed since the version the person m
 
 **Blocked by:** 06
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `tidings discard [paths…]` reads the Store's version of each chosen modified, deleted,
+- [x] `tidings discard [paths…]` reads the Store's version of each chosen modified, deleted,
       invalid or Diverged Path, applies it to the folder as `sync` would, makes it the Base,
       clears any Divergence and removes `theirs`.
-- [ ] With no paths, *added* files are left alone. A named *added* file is removed.
-- [ ] Paths are relative to the current directory, and a directory means everything under it, as
+- [x] With no paths, *added* files are left alone. A named *added* file is removed.
+- [x] Paths are relative to the current directory, and a directory means everything under it, as
       for `commit`.
-- [ ] `tidings resolve <path…>` requires each Path to be Diverged, refusing otherwise. It makes the
+- [x] `tidings resolve <path…>` requires each Path to be Diverged, refusing otherwise. It makes the
       Store version recorded for `theirs` the Base (or leaves no Base if the Store had removed
       it), clears the Divergence, removes `theirs`, and leaves the folder untouched.
-- [ ] After `resolve`, a `commit` goes through. If the Store changed again after `theirs` was last
+- [x] After `resolve`, a `commit` goes through. If the Store changed again after `theirs` was last
       written, the commit is a Conflict instead.
-- [ ] Both print what they did, with `--json` too, and take `-C` or walk up.
-- [ ] Tests, through the binary, on fs and SQLite, with `sync` running and not running.
+- [x] Both print what they did, with `--json` too, and take `-C` or walk up.
+- [x] Tests, through the binary, on fs and SQLite, with `sync` running and not running.

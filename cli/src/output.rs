@@ -9,8 +9,8 @@ use tidings::{
 };
 
 use crate::working_copy::{
-    Blocked, CommitReport, DivergedPath, LocalChange, LocalName, PathStatus, StatusReport,
-    SyncEvent, Unfit,
+    Blocked, CommitReport, DiscardReport, Discarded, DiscardedChange, DivergedPath, LocalChange,
+    LocalName, PathStatus, ResolveReport, Resolved, StatusReport, SyncEvent, Unfit,
 };
 
 /// What a command gives, for [`Output`] to print.
@@ -37,6 +37,10 @@ pub enum Report {
     WorkingCopyCommit(CommitReport),
     /// What `status` found in a Working copy.
     WorkingCopyStatus(StatusReport),
+    /// What `discard` threw away in a Working copy.
+    WorkingCopyDiscard(DiscardReport),
+    /// What `resolve` settled in a Working copy.
+    WorkingCopyResolve(ResolveReport),
 }
 
 /// How to print.
@@ -125,6 +129,29 @@ impl Output {
                 lines.push(sync.to_owned());
                 print_stdout(&lines.iter().map(|line| format!("{line}\n")).collect::<String>())
             }
+            Report::WorkingCopyDiscard(report) if report.discarded.is_empty() => {
+                eprintln!("nothing to discard");
+                Ok(())
+            }
+            // Each Path, then each `theirs` file that couldn't be removed, as `sync` prints it.
+            Report::WorkingCopyDiscard(report) => print_stdout(
+                &report
+                    .discarded
+                    .iter()
+                    .map(|discarded| discarded_parts(discarded).line())
+                    .chain(report.events.iter().map(event_line))
+                    .map(|line| format!("{line}\n"))
+                    .collect::<String>(),
+            ),
+            Report::WorkingCopyResolve(report) => print_stdout(
+                &report
+                    .resolved
+                    .iter()
+                    .map(|resolved| resolved_parts(resolved).line())
+                    .chain(report.events.iter().map(event_line))
+                    .map(|line| format!("{line}\n"))
+                    .collect::<String>(),
+            ),
         }
     }
 
@@ -331,6 +358,44 @@ fn status_parts(status: &PathStatus) -> EventParts<'_> {
     }
 }
 
+/// What `discard` says about one Path, as in "discarded a: took the Store's version".
+fn discarded_parts(discarded: &Discarded) -> EventParts<'_> {
+    let message = match (discarded.revision, discarded.removed) {
+        (Some(_), _) => "took the Store's version",
+        (None, true) => "removed, since the Store has no File there",
+        (None, false) => "the Store has no File there either",
+    };
+    EventParts {
+        name: "discarded",
+        subject: Some(Subject::Path(&discarded.path)),
+        message: Some(message.to_owned()),
+        theirs: None,
+    }
+}
+
+/// What `resolve` says about one Path, as in "resolved a: its Base is now …".
+fn resolved_parts(resolved: &Resolved) -> EventParts<'_> {
+    let message = match resolved.revision {
+        Some(_) => "its Base is now the Store's version it was merged with",
+        None => "it has no Base, since the Store had removed it",
+    };
+    EventParts {
+        name: "resolved",
+        subject: Some(Subject::Path(&resolved.path)),
+        message: Some(message.to_owned()),
+        theirs: None,
+    }
+}
+
+/// What `discard` threw away, by the name `status` gives it.
+fn discarded_change_name(change: DiscardedChange) -> &'static str {
+    match change {
+        DiscardedChange::Local(change) => change_name(change),
+        DiscardedChange::Invalid => "invalid",
+        DiscardedChange::Diverged => "diverged",
+    }
+}
+
 /// `report` as JSON, or `None` if it has nothing to show.
 fn as_json(report: &Report) -> Option<Value> {
     Some(match report {
@@ -381,6 +446,29 @@ fn as_json(report: &Report) -> Option<Value> {
         Report::WorkingCopyStatus(report) => json!({
             "paths": report.paths.iter().map(|path| status_parts(path).json()).collect::<Vec<_>>(),
             "syncing": report.syncing,
+        }),
+        Report::WorkingCopyDiscard(report) => json!({
+            "discarded": report
+                .discarded
+                .iter()
+                .map(|discarded| json!({
+                    "path": discarded.path.as_str(),
+                    "change": discarded_change_name(discarded.change),
+                    "revision": discarded.revision.map(|revision| revision.to_string()),
+                }))
+                .collect::<Vec<_>>(),
+            "events": report.events.iter().map(event_json).collect::<Vec<_>>(),
+        }),
+        Report::WorkingCopyResolve(report) => json!({
+            "resolved": report
+                .resolved
+                .iter()
+                .map(|resolved| json!({
+                    "path": resolved.path.as_str(),
+                    "revision": resolved.revision.map(|revision| revision.to_string()),
+                }))
+                .collect::<Vec<_>>(),
+            "events": report.events.iter().map(event_json).collect::<Vec<_>>(),
         }),
     })
 }

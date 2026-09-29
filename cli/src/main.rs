@@ -81,6 +81,34 @@ enum Command {
         #[command(flatten)]
         working_copy: WorkingCopyArgs,
     },
+    /// Throw away local changes in a Working copy, taking the Store's version of each File
+    ///
+    /// Each Path that is modified, deleted, invalid or Diverged, or only those named, gets the
+    /// Store's version as it is now, which becomes what the Working copy last took from the
+    /// Store. A Diverged Path's `.tidings/theirs/` file is removed. A file the Store never had is
+    /// left alone unless named, when it is removed. Files `.tidings/ignore` leaves out are never
+    /// touched.
+    Discard {
+        #[command(flatten)]
+        working_copy: WorkingCopyArgs,
+        /// Discard only these files, and everything under these directories, relative to the
+        /// current directory.
+        paths: Vec<PathBuf>,
+    },
+    /// Take what is in a Working copy as the merge of Diverged Paths, so that `commit` goes
+    /// through
+    ///
+    /// Each path must be Diverged. The Store's version in `.tidings/theirs/`, which it was merged
+    /// with, becomes what the Working copy last took from the Store, and the `theirs` file is
+    /// removed; the folder is left as it is. If the Store has changed the File again since, the
+    /// next `commit` is a Conflict all the same.
+    Resolve {
+        #[command(flatten)]
+        working_copy: WorkingCopyArgs,
+        /// The Diverged files, relative to the current directory.
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
     /// Work on the Store directly: read, write and watch its Files, or keep it open in a shell
     #[command(subcommand)]
     Store(StoreSubcommand),
@@ -153,6 +181,12 @@ fn main() -> ExitCode {
         }
         Command::Status { working_copy } => {
             runtime.block_on(status(&cli.store, output, &working_copy))
+        }
+        Command::Discard { working_copy, paths } => {
+            runtime.block_on(discard(&cli.store, output, &working_copy, &paths))
+        }
+        Command::Resolve { working_copy, paths } => {
+            runtime.block_on(resolve(&cli.store, output, &working_copy, &paths))
         }
         Command::Store(StoreSubcommand::Shell) => shell::run(&runtime, &cli.store, cli.json),
         Command::Store(StoreSubcommand::OneShot(command)) => {
@@ -243,6 +277,35 @@ async fn status(
     working_copy.open_store(store).await?;
     let report = working_copy.status()?;
     Ok(output.print(&Report::WorkingCopyStatus(report))?)
+}
+
+/// `discard`: throws away the local changes in the Working copy, or only those at or under
+/// `paths`, relative to the current directory, taking the Store's version. Any Store flags in
+/// `store` must match its record.
+async fn discard(
+    store: &StoreArgs,
+    output: Output,
+    working_copy: &WorkingCopyArgs,
+    paths: &[PathBuf],
+) -> Result<(), Failure> {
+    let working_copy = working_copy.open()?;
+    let opened = working_copy.open_store(store).await?;
+    let report = working_copy.discard(&opened.store, paths, &std::env::current_dir()?).await?;
+    Ok(output.print(&Report::WorkingCopyDiscard(report))?)
+}
+
+/// `resolve`: takes what is in the Working copy at each of `paths`, Diverged Paths relative to the
+/// current directory, as their merge. Any Store flags in `store` must match its record.
+async fn resolve(
+    store: &StoreArgs,
+    output: Output,
+    working_copy: &WorkingCopyArgs,
+    paths: &[PathBuf],
+) -> Result<(), Failure> {
+    let working_copy = working_copy.open()?;
+    let opened = working_copy.open_store(store).await?;
+    let report = working_copy.resolve(&opened.store, paths, &std::env::current_dir()?).await?;
+    Ok(output.print(&Report::WorkingCopyResolve(report))?)
 }
 
 /// Starts listening for Ctrl-C now, and gives what finishes once it is pressed. Until it is, Ctrl-C

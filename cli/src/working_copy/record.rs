@@ -8,7 +8,7 @@
 //! - `backend` and the Backend;
 //! - `area` and the Area;
 //! - `base`, a Path, its Base Revision, and the hash of the contents last written to or read from
-//!   the folder for that Base, in hexadecimal;
+//!   the folder for that Base, in hexadecimal, which is left out if they aren't known;
 //! - `diverged`, a Diverged Path, and the Revision of the Store's version in `theirs`, which is
 //!   left out if the Store has no File there.
 //!
@@ -50,7 +50,21 @@ pub struct Record {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Base {
     pub revision: Revision,
-    pub hash: Hash,
+    /// The hash of the Base's contents, or `None` if they aren't known, as when `resolve` takes a
+    /// Revision the Store no longer holds: every local file then counts as changed since the Base.
+    pub hash: Option<Hash>,
+}
+
+impl Base {
+    /// The Base of the Revision `revision`, which holds `contents`.
+    pub fn of(revision: Revision, contents: &str) -> Base {
+        Base { revision, hash: Some(Hash::of(contents)) }
+    }
+
+    /// Whether `contents` are the Base's, as far as is known.
+    pub fn holds(&self, contents: &str) -> bool {
+        self.hash == Some(Hash::of(contents))
+    }
 }
 
 /// That a Path is Diverged, and the Revision of the Store's File that `theirs` holds for it, if the
@@ -123,8 +137,12 @@ impl Record {
         line(&["area", area_name(self.area)]);
         for (path, base) in &self.bases {
             let revision = base.revision.to_string();
-            let hash = format!("{:032x}", base.hash.0);
-            line(&["base", path.as_str(), &revision, &hash]);
+            match base.hash {
+                Some(hash) => {
+                    line(&["base", path.as_str(), &revision, &format!("{:032x}", hash.0)])
+                }
+                None => line(&["base", path.as_str(), &revision]),
+            }
         }
         for (path, divergence) in &self.divergences {
             match divergence.theirs_revision {
@@ -163,7 +181,11 @@ impl Record {
                 ["base", path, revision, hash] => {
                     let revision = parse_revision(revision)?;
                     let hash = u128::from_str_radix(hash, 16).map_err(|_| bad("hash", hash))?;
-                    bases.insert(parse_path(path)?, Base { revision, hash: Hash(hash) });
+                    bases.insert(parse_path(path)?, Base { revision, hash: Some(Hash(hash)) });
+                }
+                ["base", path, revision] => {
+                    let revision = parse_revision(revision)?;
+                    bases.insert(parse_path(path)?, Base { revision, hash: None });
                 }
                 ["diverged", path] => {
                     divergences.insert(parse_path(path)?, Divergence { theirs_revision: None });

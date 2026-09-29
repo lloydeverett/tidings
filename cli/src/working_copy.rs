@@ -6,6 +6,7 @@
 
 mod record;
 mod scan;
+mod settle;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, TryLockError};
@@ -21,9 +22,10 @@ use tidings::{
 use crate::failure::Failure;
 use crate::location::{Opened, StoreAddress, StoreArgs};
 use crate::output::area_name;
-use record::{Base, Divergence, Hash, Record};
+use record::{Base, Divergence, Record};
 use scan::{Difference, IGNORE_FILE, Scan, is_record_directory};
 pub use scan::{LocalName, Unfit};
+pub use settle::{DiscardReport, Discarded, DiscardedChange, ResolveReport, Resolved};
 
 /// The directory in a Working copy's folder that holds its record and locks, which is never a
 /// File.
@@ -235,9 +237,14 @@ impl Selection {
     }
 
     /// Fails unless each named path covers a file in `scan` or a Path in `record`, so that a
-    /// mistyped one isn't taken for one with nothing to commit, nor an ignored one for one that
-    /// would be committed.
-    fn check_each_names_something(&self, scan: &Scan, record: &Record) -> Result<(), Failure> {
+    /// mistyped one isn't taken for one with nothing to `command` (`commit` or `discard`), nor an
+    /// ignored one for one it would act on.
+    fn check_each_names_something(
+        &self,
+        scan: &Scan,
+        record: &Record,
+        command: &str,
+    ) -> Result<(), Failure> {
         let Selection::Named(named) = self else { return Ok(()) };
         let paths = scan.files.keys().chain(record.bases.keys()).chain(record.divergences.keys());
         let invalid = scan.invalid.iter().map(|unfit| &unfit.name);
@@ -252,7 +259,7 @@ impl Selection {
             let why = if matches!(target, Target::Under(name) if scan.ignored.contains(name)) {
                 format!(
                     "is left out by {RECORD_DIRECTORY}/{IGNORE_FILE}: remove the pattern that \
-                     matches it there to commit it"
+                     matches it there to {command} it"
                 )
             } else if scan.ignored.iter().any(|name| target.covers(name.as_str())) {
                 format!("holds only files {RECORD_DIRECTORY}/{IGNORE_FILE} leaves out")
@@ -711,7 +718,7 @@ impl WorkingCopy {
         };
         let unchanged = match (&local, base) {
             (Local::Absent | Local::Directory, None) => true,
-            (Local::File(contents), Some(base)) => Hash::of(contents) == base.hash,
+            (Local::File(contents), Some(base)) => base.holds(contents),
             _ => false,
         };
         let same_as_store = match (&local, store_file) {
@@ -743,8 +750,7 @@ impl WorkingCopy {
         };
         match store_file {
             Some(file) => {
-                let base = Base { revision: file.revision(), hash: Hash::of(file.contents()) };
-                record.bases.insert(path.clone(), base);
+                record.bases.insert(path.clone(), Base::of(file.revision(), file.contents()));
             }
             None => {
                 record.bases.remove(path);
@@ -888,7 +894,7 @@ impl WorkingCopy {
         let selection = self.select(named, current)?;
         refuse_diverged(&lock.record, &selection)?;
         let scan = scan::scan(&self.folder, &lock.record.bases)?;
-        selection.check_each_names_something(&scan, &lock.record)?;
+        selection.check_each_names_something(&scan, &lock.record, "commit")?;
         refuse_invalid(&scan.invalid, &selection)?;
         let (staging, changes) = self.stage(&scan, &selection)?;
         let files = scan.files;
@@ -909,8 +915,9 @@ impl WorkingCopy {
             .map(|(path, change)| {
                 // The new Base's Revision, if it holds what was committed.
                 let base = lock.record.bases.get(&path);
-                let committed = files.get(&path).map(|contents| Hash::of(contents));
-                let revision = base.filter(|base| Some(base.hash) == committed);
+                let committed = files.get(&path);
+                let revision =
+                    base.filter(|base| committed.is_some_and(|contents| base.holds(contents)));
                 CommittedChange { revision: revision.map(|base| base.revision), path, change }
             })
             .collect();
@@ -997,8 +1004,7 @@ impl WorkingCopy {
                 for (path, _) in changes {
                     match (committed.revisions().get(path), files.get(path)) {
                         (Some(&revision), Some(contents)) => {
-                            let base = Base { revision, hash: Hash::of(contents) };
-                            record.bases.insert(path.clone(), base);
+                            record.bases.insert(path.clone(), Base::of(revision, contents));
                         }
                         _ => {
                             record.bases.remove(path);
