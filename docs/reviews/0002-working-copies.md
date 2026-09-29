@@ -531,3 +531,166 @@ Fixed in 5defbdb:
 Left for the spec's owner: updating ticket 04's `--create` wording (re-review Spec 1).
 
 No second re-review: the restructure only reorders existing checks, and the existing tests pass.
+
+---
+
+## Ticket 05: Divergence
+
+Reviewed: `git diff 2dd7196...d043802` (commit d043802).
+
+### Standards
+
+**(a) Documented-standard violations:** none hard. No line over 100 columns; every new item is
+documented; the report is printed by the output module; tests go through the binary on fs and
+SQLite and treat `.tidings/theirs/` only as a place the person can see.
+
+- Glossary (judgement call): `record.rs:57-60` says "which of the Store's versions `theirs`
+  holds" beside a `Revision`: "version" for a Revision is an _Avoid_ word. (Earlier reviews
+  allowed "the Store's version" for contents, not for a Revision.)
+
+**(b) Judgement calls:**
+
+1. **Possible Mysterious Name, `theirs`:** one flow uses it for an `Option<&File>`, an
+   `Option<PathBuf>`, an `Option<Revision>` and a `String`; worst at `working_copy.rs:511`,
+   `let theirs = theirs.map(|_| theirs_file(path));`.
+2. **Possible Primitive Obsession, `working_copy.rs:463-466`:** "`{path} is a directory`" is a
+   blocking reason built ad hoc beside the `Blocked` enum, and `SyncEvent::Diverged.blocked` is an
+   `Option<String>`.
+3. **Possible Duplicated Code, `working_copy.rs:550-574`:** `write_theirs` and `remove_theirs`
+   both build the `theirs` path and check it with `blocking_directory`.
+4. **Possible Duplicated Code in tests:** two tests inline `.tidings/theirs/app.toml` beside a
+   `theirs()` helper.
+5. **Possible Data Clump:** `(record, path, theirs, blocked)` travels into `diverge` from three
+   sites. Tolerable.
+6. **Possible Repeated Switches, `working_copy.rs:445-453`:** `unchanged` and `same_as_theirs`
+   both had to learn `Local::Directory`.
+
+Noted for Spec: Diverged entries are separate record lines, not part of a Base entry as the spec's
+record section describes, because a Diverged Path may have no Base.
+
+### Spec
+
+Probed on fs and SQLite: every row of the table live and across a stopped-then-resumed `sync`,
+stories 30–34, `--quiet` and `--json`; `theirs` refreshed; *resolved* printed; blocked applies
+reported as Diverged ("q is a directory; …"). A kill -9 during a 120-Path resume healed: after
+resuming, all 120 were Diverged with `theirs` holding the Store's version and local files
+untouched.
+
+**(a) Missing or partial:** none. Each row has a test on both Backends.
+
+**(b) Scope creep:** none.
+
+**(c) Implemented but may be wrong**
+
+1. **A `theirs` file that has gone is never written again.** "`theirs` gets `S`": `diverge`
+   (`:503`) returns early when the record holds the same Revision without checking the file
+   exists, so after a crash between removing `theirs` and saving the record, or a person deleting
+   `theirs/`, it never comes back.
+2. **One `theirs` write failure ends `sync`.** Story 34: "`sync` keeps running". If
+   `.tidings/theirs` is a symlink or a file, `write_theirs` errors, `sync` exits 1 before saving
+   the record, and every resume fails the same way. Nothing escapes `.tidings/`.
+3. **A Path created locally stays Diverged when the Store creates and then removes it.** Row 1:
+   "`S` matches `B` (both absent…) | anything | nothing". The Store writing then deleting `n` over
+   a local `n` with no Base leaves `n` Diverged ("removed in the Store"), though nothing disagrees
+   any more, and a full commit would be blocked until `resolve`. Ambiguous between row 1 and "A
+   Path already Diverged is reconciled the same way"; should be decided.
+
+**The implementer's judgement calls, assessed:**
+
+- Unchanged local file and Store contents equal under a new Revision: the Base is taken silently
+  rather than rewritten and reported *updated*. Accepted: nothing changes on disk.
+- A local directory at a Path counts as absent there ("Directories exist only as Prefixes").
+  Accepted.
+- A Diverged Path the person deletes: with no Base it is row 2 (apply the Store's version); with
+  a Base it is row 4 (stays Diverged). Both follow the table, and neither loses anything.
+- JSON *diverged* names the `theirs` file only in `message`. Story 23 is about following a Working
+  copy from another program, which would have to parse prose: a `theirs` field would help.
+
+### Summary
+
+Standards: 0 hard violations, 1 glossary slip and 6 judgement calls (worst: `theirs` naming four
+different things). Spec: 3 possibly wrong (worst: a failure writing `theirs` stops `sync` for
+good).
+
+### Resolution
+
+Fixed in 1f3f649:
+
+1. **Spec (c)1, a missing `theirs` never written again:** fixed. A Diverged Path whose `theirs`
+   file is missing gets it written again, with no new *diverged* line unless the Revision changed.
+   Test: `a_missing_theirs_is_written_again`.
+2. **Spec (c)2, a `theirs` write failure ending `sync`:** fixed. The Path is recorded Diverged all
+   the same, an *error* names it (even with `--quiet`), `sync` carries on, and a later reconcile
+   retries. Test: `a_theirs_that_cant_be_written_is_an_error_and_sync_carries_on`.
+3. **Spec (c)3, a Divergence outliving its cause:** decided: a Diverged Path whose Store state
+   matches its Base again (both absent, or the same Revision) is no longer Diverged. It is table
+   row 1, "local edits stay local", and a commit would go through. `theirs` is removed and
+   *resolved* printed. Test: `a_divergence_clears_once_the_store_is_back_at_the_base`, with and
+   without a Base (the library gives the same Revision for the same contents).
+4. **JSON `theirs` field:** added: the `theirs` file relative to the folder, or `null` when the
+   Store removed the File.
+5. **Standards:** the glossary slip is fixed; `theirs` is split into `store_file`, `theirs_file`
+   and `theirs_revision`; `Blocked::Directory` joins the enum and the event carries
+   `Option<Blocked>`; `write_theirs` and `remove_theirs` share `theirs_at`; tests use `theirs()`.
+
+All the new or changed tests fail on d043802.
+
+**For the spec's owner:** the fix agent also edited spec 0002 ("Reconciling a Path" and the `sync`
+output bullet) to describe items 1–4. The edit is accurate and changes nothing else, but it was
+not asked for; review or revert it as you see fit.
+
+Not acted on: Standards 5 (the Data Clump into `diverge`) and 6 (two switches learning
+`Local::Directory`), tolerable.
+
+### Re-review of 1f3f649
+
+**Standards.** All claimed fixes are clean. One small hard violation: the fields of the
+`Error { path, message }` event (`working_copy.rs:88`) have no doc comments. Judgement calls: the
+resolve-and-remove-`theirs` block is duplicated in `reconcile_path` (`:448-451`, `:476-482`);
+`diverge` now takes five parameters; `Some(_) =>` at `:461` no longer says only a symlink reaches
+that arm; `Blocked` mixes filesystem paths and a Tidings `Path`; `theirs_at` returns
+`Result<Result<PathBuf, Blocked>, Failure>` and is worked out twice when writing.
+
+**Spec.** Probed on fs and SQLite; all four fixes work, the six new or changed tests fail on
+d043802, and the spec edit is accurate. Nothing was ever written or removed outside
+`.tidings/theirs`. Findings:
+
+1. **A `theirs` that can't be *removed* still ends `sync`.** With `.tidings/theirs/c` replaced by
+   a directory, the Store deleting `c` (or going back to the Base) makes `sync` exit 1 without
+   saving the record, on every restart. The same class as the original finding 2.
+2. **Error noise:** every batch re-reconciles every Diverged Path, so while `theirs` is blocked,
+   each unrelated Store change re-prints one *error* per Diverged Path, even with `--quiet`.
+3. **The *diverged* line names a `theirs` file that wasn't written** when the write failed, and the
+   JSON `theirs` field points there; the *error* line after it contradicts it.
+4. Minor: the error repeats the path, the second time absolute.
+
+### Resolution of the re-review
+
+Fixed in ddfeefe:
+
+1. **A `theirs` that can't be removed:** fixed. `theirs` is now written or removed in one place
+   (`settle_theirs`), after the record is updated; a failure is an *error* for that Path, `sync`
+   carries on, the record is saved, and later reconciles retry. A cleared Divergence stays cleared
+   and the person's directory in `theirs/` is left alone. The spec line covers removal too. Limit:
+   a leftover `theirs` file for a cleared Divergence is retried only while that `sync` runs, since
+   the retry isn't recorded. Test:
+   `a_theirs_that_cant_be_removed_is_an_error_and_sync_carries_on` (back to the Base, and removed
+   in the Store).
+2. **Error noise:** fixed. `sync` keeps an in-memory set of Paths whose `theirs` failed; they are
+   retried silently each reconcile and reported again only when the Divergence changes. Test:
+   `a_theirs_that_cant_be_written_is_reported_once_until_the_divergence_changes`.
+3. **Untruthful *diverged* line:** fixed. When `theirs` can't be written, only the *error* is
+   printed ("Diverged, but can't write .tidings/theirs/a: …").
+4. **The repeated, absolute path:** fixed.
+5. **Standards:** the `Error` fields are documented; one `resolve` helper replaces the duplicated
+   block; an explicit `Blocked::Symlink` pattern says which case reaches that arm; `settle_theirs`
+   replaces `theirs_at`, `has_theirs`, `write_theirs` and `remove_theirs` and works out the
+   location once.
+
+The new tests fail on 1f3f649. No third review: each fix is narrow and tested.
+
+Note: a third library test, `fs::a_file_replaced_then_removed_straight_away_is_reported_removed`,
+failed in the fixer's two full workspace runs and passed alone. The orchestrator's own full run
+afterwards passed all 467 tests. The library is untouched by this spec; together with the two
+noted under tickets 02 and 03, the fs watcher tests look timing-sensitive under load and may be
+worth a look separately.
