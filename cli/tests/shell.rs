@@ -1,4 +1,4 @@
-//! `tidings shell` in script mode, reading its commands from stdin, as a script or heredoc does.
+//! `tidings store shell` in script mode, reading its commands from stdin, as a script or heredoc does.
 //! Interactive mode needs a terminal, so these tests don't cover it.
 
 mod common;
@@ -8,13 +8,13 @@ use common::{Location, Run, is_revision, run, tidings};
 /// Runs `script` in a shell on the memory Backend.
 fn in_memory(script: &str) -> Run {
     let mut command = tidings();
-    command.args(["--backend", "memory", "shell"]);
+    command.args(["--backend", "memory", "store", "shell"]);
     run(command, script)
 }
 
 /// Runs `script` in a shell on the Store at `location`.
 fn at(location: &Location, script: &str) -> Run {
-    location.run_with_stdin(&["shell"], script)
+    location.run_with_stdin(&["store", "shell"], script)
 }
 
 #[test]
@@ -69,14 +69,14 @@ fn a_script_stops_at_the_first_failure_with_its_exit_code() {
     let run = at(&location, "list data\nfrobnicate\nwrite data a.txt --contents a\n");
     let run = run.expect_code(1);
     assert!(run.stderr.contains("line 2"), "{run:?}");
-    location.run(&["read", "data", "a.txt"]).expect_code(2);
+    location.run(&["store", "read", "data", "a.txt"]).expect_code(2);
 }
 
 #[test]
 fn a_required_revision_that_is_stale_is_a_conflict() {
     let location = Location::with_store("sqlite");
     location.write("data", "a.txt", "1");
-    let stat = location.run(&["--json", "stat", "data", "a.txt"]).expect_success().stdout;
+    let stat = location.run(&["--json", "store", "stat", "data", "a.txt"]).expect_success().stdout;
     let stat: serde_json::Value = serde_json::from_str(&stat).unwrap();
     let revision = stat["revision"].as_str().unwrap();
 
@@ -149,7 +149,7 @@ fn changes_are_printed_on_stderr_once_the_feed_is_on() {
 #[test]
 fn json_applies_to_every_command_and_change() {
     let mut command = tidings();
-    command.args(["--backend", "memory", "--json", "shell"]);
+    command.args(["--backend", "memory", "--json", "store", "shell"]);
     let run = run(command, "feed on\nwrite data a.txt --contents a\nread data a.txt\nlist data\n");
     let run = run.expect_success();
     let lines: Vec<serde_json::Value> =
@@ -176,19 +176,20 @@ fn an_open_staging_left_at_the_end_is_discarded() {
     let location = Location::with_store("fs");
     let run = at(&location, "stage data\nwrite data a.txt --contents a\n").expect_success();
     assert!(run.stderr.contains("discarded"), "{run:?}");
-    location.run(&["read", "data", "a.txt"]).expect_code(2);
+    location.run(&["store", "read", "data", "a.txt"]).expect_code(2);
 }
 
 #[test]
 fn the_shell_opens_stores_as_one_shot_commands_do() {
     let location = Location::empty();
-    location.run_with_stdin(&["shell"], "list data\n").expect_code(1);
-    let run = location.run_with_stdin(&["--backend", "fs", "--create", "shell"], "list data\n");
+    location.run_with_stdin(&["store", "shell"], "list data\n").expect_code(1);
+    let run =
+        location.run_with_stdin(&["--backend", "fs", "--create", "store", "shell"], "list data\n");
     run.expect_success();
     // The memory Backend has no location, and is always new.
-    let run = location.run_with_stdin(&["--backend", "memory", "shell"], "list data\n");
+    let run = location.run_with_stdin(&["--backend", "memory", "store", "shell"], "list data\n");
     run.expect_code(1);
     let mut command = tidings();
-    command.args(["--backend", "memory", "--create", "shell"]);
+    command.args(["--backend", "memory", "--create", "store", "shell"]);
     common::run(command, "list data\n").expect_code(1);
 }

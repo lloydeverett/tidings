@@ -44,7 +44,7 @@ impl Location {
     /// A location holding a new Store on `backend` (`fs` or `sqlite`).
     pub fn with_store(backend: &str) -> Location {
         let location = Location::empty();
-        location.run(&["--backend", backend, "--create", "list", "data"]).expect_success();
+        location.run(&["--backend", backend, "--create", "store", "list", "data"]).expect_success();
         location
     }
 
@@ -72,12 +72,12 @@ impl Location {
 
     /// Writes `contents` to `path` in `area`, failing the test if it can't.
     pub fn write(&self, area: &str, path: &str, contents: &str) {
-        self.run(&["write", area, path, "--contents", contents]).expect_success();
+        self.run(&["store", "write", area, path, "--contents", contents]).expect_success();
     }
 
     /// Reads `path` in `area`, failing the test if it can't.
     pub fn read(&self, area: &str, path: &str) -> String {
-        self.run(&["read", area, path]).expect_success().stdout
+        self.run(&["store", "read", area, path]).expect_success().stdout
     }
 }
 

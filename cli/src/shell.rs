@@ -1,4 +1,4 @@
-//! `tidings shell`: one Store kept open while commands are typed, or read from a script.
+//! `tidings store shell`: one Store kept open while commands are typed, or read from a script.
 
 use std::io::{self, BufRead, IsTerminal};
 use std::pin::pin;
@@ -20,7 +20,7 @@ use crate::output::{Output, Report, area_name};
 #[derive(Debug, Parser)]
 #[command(
     no_binary_name = true,
-    name = "tidings shell",
+    name = "tidings store shell",
     override_usage = "<COMMAND> [ARGS]...",
     disable_version_flag = true,
     help_template = "{all-args}"
@@ -92,7 +92,7 @@ pub fn run(runtime: &Runtime, args: &StoreArgs, json: bool) -> Result<(), Failur
     if io::stdin().is_terminal() {
         shell.output.at_prompt = true;
         eprintln!(
-            "tidings shell on {}: `help` lists the commands, `exit` or Ctrl-D leaves",
+            "tidings store shell on {}: `help` lists the commands, `exit` or Ctrl-D leaves",
             opened.description,
         );
         shell.interactive(runtime, opened.feed)

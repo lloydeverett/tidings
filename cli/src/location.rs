@@ -39,7 +39,7 @@ pub struct StoreArgs {
 pub enum BackendName {
     Fs,
     Sqlite,
-    /// Only in `tidings shell`: a Store that lasts as long as the shell.
+    /// Only in `tidings store shell`: a Store that lasts as long as the shell.
     Memory,
 }
 
@@ -146,8 +146,8 @@ impl StoreArgs {
     fn open_memory(&self, in_shell: bool) -> Result<Opened, Failure> {
         if !in_shell {
             return Err(Failure::error(
-                "the memory Backend lasts only as long as the command, so only `tidings shell` \
-                 can use it",
+                "the memory Backend lasts only as long as the command, so only \
+                 `tidings store shell` can use it",
             ));
         }
         if self.root.is_some() || self.identity.is_some() || self.create {

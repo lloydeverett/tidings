@@ -10,13 +10,13 @@ and `--json` stay global, and the exit codes stay as they are.
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `tidings store <command>` behaves exactly as `tidings <command>` did, for every command
+- [x] `tidings store <command>` behaves exactly as `tidings <command>` did, for every command
       listed above, including stdin handling, `--json` output and exit codes.
-- [ ] The old top-level forms are gone, not kept as aliases. Nobody uses the CLI yet.
-- [ ] `tidings --help` and `tidings store --help` list the commands where they now live.
-- [ ] The existing CLI tests are updated to the new form and pass. The shared test harness's
+- [x] The old top-level forms are gone, not kept as aliases. Nobody uses the CLI yet.
+- [x] `tidings --help` and `tidings store --help` list the commands where they now live.
+- [x] The existing CLI tests are updated to the new form and pass. The shared test harness's
       helpers (`with_store`, `write`, `read`) use `tidings store`.
-- [ ] The README's command examples and the shell section use `tidings store`. The full README
+- [x] The README's command examples and the shell section use `tidings store`. The full README
       rewrite is ticket 11.

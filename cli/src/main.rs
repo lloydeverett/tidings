@@ -20,8 +20,8 @@ use crate::output::{Output, print_stdout};
 
 /// Read, write and watch a tidings Store.
 ///
-/// Exits with 0 on success, 2 if `read` or `stat` finds no File, 3 on a Conflict, and 1 on any
-/// other failure.
+/// Exits with 0 on success, 2 if `store read` or `store stat` finds no File, 3 on a Conflict, and
+/// 1 on any other failure.
 #[derive(Debug, Parser)]
 #[command(name = "tidings", version)]
 struct Cli {
@@ -36,9 +36,17 @@ struct Cli {
     command: Command,
 }
 
-/// A one-shot command, or the shell.
+/// A top-level command.
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Work on the Store directly: read, write and watch its Files, or keep it open in a shell
+    #[command(subcommand)]
+    Store(StoreGroup),
+}
+
+/// The commands under `tidings store`: a one-shot command, or the shell.
+#[derive(Debug, Subcommand)]
+enum StoreGroup {
     #[command(flatten)]
     OneShot(OneShot),
     /// Keep the Store open and type commands, building up Stagings over several of them
@@ -73,8 +81,10 @@ fn main() -> ExitCode {
         }
     };
     let result = match cli.command {
-        Command::Shell => shell::run(&runtime, &cli.store, cli.json),
-        Command::OneShot(command) => runtime.block_on(one_shot(&cli.store, cli.json, command)),
+        Command::Store(StoreGroup::Shell) => shell::run(&runtime, &cli.store, cli.json),
+        Command::Store(StoreGroup::OneShot(command)) => {
+            runtime.block_on(one_shot(&cli.store, cli.json, command))
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
