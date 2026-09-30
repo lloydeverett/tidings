@@ -24,8 +24,9 @@ const ACCEPTED: &[&str] = &[
     "caf\u{e9}/r\u{e9}sum\u{e9}.md",
     "\u{65e5}\u{672c}\u{8a9e}/\u{30e1}\u{30e2}.txt",
     "\u{1f600}.txt",
-    // Only the top-level `.tidings` is reserved.
-    "notes/.tidings",
+    // Only a name that is `.tidings` itself is reserved.
+    "notes/.tidings2",
+    "notes/.tidings.toml",
     ".tidings2",
     ".tidings.toml",
     // Names only like those of tidings' temporary files.
@@ -100,6 +101,13 @@ const REFUSED: &[(&str, InvalidPathReason)] = &[
     // Long s and dotless i, which uppercase to `S` and `I`.
     (".tiding\u{17f}/lock", InvalidPathReason::Reserved),
     (".t\u{131}dings", InvalidPathReason::Reserved),
+    // At any depth too, since a directory holding one is another Store's Location, or a Working
+    // copy.
+    ("notes/.tidings", InvalidPathReason::Reserved),
+    ("notes/.tidings/lock", InvalidPathReason::Reserved),
+    ("a/b/.Tidings/c.txt", InvalidPathReason::Reserved),
+    ("a/.TIDINGS", InvalidPathReason::Reserved),
+    ("a/.tiding\u{17f}/b", InvalidPathReason::Reserved),
     // The names of tidings' temporary files, anywhere, so that no File can be taken for one.
     (".settings.toml.tidings-0123456789abcdef0123456789abcdef-0", InvalidPathReason::Reserved),
     ("themes/.dark.toml.tidings-0123456789abcdef0123456789abcdef-12", InvalidPathReason::Reserved),

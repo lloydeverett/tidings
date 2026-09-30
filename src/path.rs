@@ -12,8 +12,7 @@ use crate::{Error, Result};
 /// A Path follows the strictest platform's rules, on every Backend, so a Path that works on one
 /// platform works on all of them. It is relative and `/`-separated, with no empty, `.` or `..`
 /// segments. Each segment is a name Windows accepts, the whole Path is in Unicode NFC form, and
-/// nothing is under `.tidings/` or named like tidings' temporary files, which tidings keeps for
-/// itself. [`InvalidPathReason`] lists the rules.
+/// no name is `.tidings` or named like tidings' temporary files, which tidings keeps for itself. [`InvalidPathReason`] lists the rules.
 ///
 /// It can only be made by validating a string, with [`Path::new`] or through [`IntoPath`].
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -43,8 +42,9 @@ impl Path {
     }
 }
 
-/// The top-level name tidings keeps its own bookkeeping under: the directory in a Location that
-/// holds everything a Backend keeps there. It is its own [`letter_case_fold`].
+/// The name tidings keeps its own bookkeeping under: the directory in a Location that holds
+/// everything a Backend keeps there, and in a Working copy, what the `tidings` command keeps
+/// there. No Path has it as a name, at any depth. It is its own [`letter_case_fold`].
 pub(crate) const RESERVED: &str = ".tidings";
 
 /// Why `path` is refused, if it is.
@@ -61,8 +61,9 @@ pub(crate) fn refusal(path: &str) -> Option<InvalidPathReason> {
         Some(InvalidPathReason::DotSegment)
     } else if segments.clone().any(|segment| !is_portable_name(segment.as_str())) {
         Some(InvalidPathReason::UnportableName)
-    } else if segments.clone().next().is_some_and(|first| is_reserved(first.as_str()))
-        || segments.clone().any(|segment| is_temporary_file_name(segment.as_str()))
+    } else if segments
+        .clone()
+        .any(|segment| is_reserved(segment.as_str()) || is_temporary_file_name(segment.as_str()))
     {
         Some(InvalidPathReason::Reserved)
     } else if !unicode_normalization::is_nfc(path) {
@@ -111,9 +112,10 @@ fn is_device_name_sanitize_filename_misses(name: &str) -> bool {
         || !is_sanitized_for_windows(device)
 }
 
-/// Whether `name`, as a Path's first segment, is tidings' own. Letter case is ignored, because on a
-/// case-insensitive filesystem `.Tidings` is the same directory, and so are `.tidingſ` and
-/// `.tıdings` on some.
+/// Whether `name`, as any segment of a Path, is tidings' own: at the top, a Store's own
+/// `.tidings/`, and deeper down, that of another Store or a Working copy, whose directory is left
+/// out of the Store. Letter case is ignored, because on a case-insensitive filesystem `.Tidings` is
+/// the same directory, and so are `.tidingſ` and `.tıdings` on some.
 fn is_reserved(name: &str) -> bool {
     letter_case_fold(name) == RESERVED
 }
@@ -197,9 +199,10 @@ pub enum InvalidPathReason {
     /// The Path is not in Unicode NFC form. macOS treats different forms of the same character as
     /// one name, so only one form is allowed.
     NotNfc,
-    /// The Path is under `.tidings/`, which tidings keeps for itself, or has a name like those of
-    /// the temporary files a filesystem Commit writes: `.<name>.tidings-<commit-id>-<n>`, where
-    /// `<commit-id>` is 32 lower-case hexadecimal digits and `<n>` a number.
+    /// A name in the Path, at any depth and in any letter case, is `.tidings`, which tidings keeps
+    /// for itself, or is like those of the temporary files a filesystem Commit writes:
+    /// `.<name>.tidings-<commit-id>-<n>`, where `<commit-id>` is 32 lower-case hexadecimal digits
+    /// and `<n>` a number.
     Reserved,
     /// A Prefix other than the empty one doesn't end with `/`.
     NoTrailingSlash,
@@ -237,8 +240,8 @@ impl fmt::Display for InvalidPathReason {
             InvalidPathReason::UnportableName => "a segment is not a name every platform accepts",
             InvalidPathReason::NotNfc => "it is not in Unicode NFC form",
             InvalidPathReason::Reserved => {
-                "it is under `.tidings/`, or named like a temporary file, which tidings keeps for \
-                 itself"
+                "it has a name that is `.tidings`, or one like a temporary file's, which tidings \
+                 keeps for itself"
             }
             InvalidPathReason::NoTrailingSlash => "it is a Prefix that doesn't end with `/`",
             InvalidPathReason::LetterCaseClash => {
