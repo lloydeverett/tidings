@@ -5,7 +5,8 @@ SQLite or in memory. Writes happen only through all-or-nothing commits, and ever
 reported on a change feed. Async on tokio; `tidings::blocking::Store` (feature `blocking`) for
 synchronous code.
 
-Status: first version, complete but early. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
+Status: early. The library's first version is complete, and the `tidings` command now has Working
+copies for everyday editing. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
 
 ## The `tidings` command
 
@@ -100,45 +101,58 @@ $ tidings discard app.toml
 discarded app.toml: took the Store's version
 ```
 
-### Working copies
+### Choosing a Store, output and exit codes
 
-- **Choosing the Store.** The first `sync` of a folder takes the same flags as `tidings store`
-  (see below). After that the Working copy remembers its Store, Backend and Area, so the flags are
-  optional, and any given, or set in the environment, must match, or the command is refused: a
-  stale `TIDINGS_ROOT` in your shell can't commit into the wrong Store. `--create` makes a new
-  Store only for a new Working copy; it is refused on an existing one, even if its Store has gone,
-  since a new, empty Store would remove every unchanged file from the folder.
-- **Finding the Working copy.** Every command but `sync` finds it from the current directory or a
-  folder above it, or from `-C <folder>`. Paths you give are relative to the current directory,
-  and a directory means everything under it. Paths printed are relative to the folder.
-- **Output.** Text for a person, or JSON with `--json`: one object per line for `sync`, one
-  object for the others. Under `--json`, any failure is one JSON object on stderr,
-  `{"failure": …, "message": …}`, with a `paths` list for the Paths it names.
+These apply to every command, both for Working copies and under `tidings store`.
+
+- **Choosing a Store.** Give exactly one of `--root <dir>` or `--identity tld.author.app` (the
+  platform's directories for that App identity). The Backend is found from the Backend markers;
+  `--backend fs|sqlite` makes sure of it. A location with no Store is refused unless you pass
+  `--create` too, so a typo doesn't make a new, empty one. `TIDINGS_ROOT`, `TIDINGS_IDENTITY` and
+  `TIDINGS_BACKEND` stand in for the flags.
+- **Output.** Text for a person, or JSON with `--json`: one object per line for `sync` and
+  `store watch`, one object for the others. Under `--json`, any failure is one JSON object on
+  stderr, `{"failure": …, "message": …}`, with a `paths` list for the Paths it names.
 - **Exit codes.** `0` success, `1` error, `2` no File (`store read`, `store stat`), `3` Conflict,
   or a commit refused because a Path is Diverged. The `failure` in JSON is `error`, `invalid` or
-  `blocked` (exit 1), `missing` (2), or `conflict` or `diverged` (3).
+  `blocked` (exit 1), `missing` (2), or `conflict` or `diverged` (3). `invalid` is a `commit`
+  refused over invalid files; `blocked` is a `discard` refused because something in the folder,
+  such as a file where a directory must go, keeps the Store's File from being written there.
+
+### Working copies
+
+- **Choosing the Store.** The first `sync` of a folder chooses its Store with the flags
+  [above](#choosing-a-store-output-and-exit-codes). After that the Working copy remembers its
+  Store, Backend and Area, so the flags are optional. Any flags given, or set in the environment,
+  must match, or the command is refused: a stale `TIDINGS_ROOT` in your shell can't commit into
+  the wrong Store. `--create` makes a new Store only for a new Working copy. It is refused on an
+  existing one, even if its Store has gone, since a new, empty Store would remove every unchanged
+  file from the folder.
+- **Finding the Working copy.** Every command but `sync` finds it from the current directory or a
+  folder above it, or from `-C <folder>`, which goes after the command: `tidings status -C cfg`,
+  not `tidings -C cfg status`. Paths you name are relative to the current directory, and a
+  directory means everything under it. Paths printed are relative to the folder.
 
 | Command | |
 | --- | --- |
-| `sync <area> [folder]` | Make an empty or missing folder (the current directory if left out) a Working copy of the Area, or resume one, and keep it in step with the Store until Ctrl-C. `--quiet` prints only divergences, resyncs and errors. |
-| `commit [paths…]` | Commit every local change, or only those under the paths given, as one Commit. |
+| `sync <area> [folder]` | Make an empty or missing folder (the current directory if left out) a Working copy of the Area, or resume one, and keep it in step with the Store until Ctrl-C. `--quiet` prints only its `diverged`, `resync` and `error` lines. |
+| `commit [paths…]` | Commit every local change, or only those under the Paths you name, as one Commit. |
 | `status` | List what `commit` would do, and say whether `sync` is running. |
-| `discard [paths…]` | Take the Store's version of each changed or Diverged Path, or only those given. |
+| `discard [paths…]` | Take the Store's version of each changed or Diverged Path, or only those you name. |
 | `resolve <paths…>` | Take what is in the folder as the merge of each Diverged Path. |
 
 **`sync`** resumes where it left off, catching up on whatever changed while it wasn't running. It
 refuses a folder that holds files but isn't a Working copy, a Working copy of another Area, and
 a second `sync` of the same folder. It prints one line for each thing it does:
 
-- `created`, `updated`, `removed`: a Store Change applied to the folder. A directory it empties is
-  removed; one still holding your files is left alone.
+- `created`, `updated`, `removed`: a Change in the Store applied to the folder. A directory it
+  empties is removed; one still holding your files is left alone.
 - `diverged`: the Path changed both locally and in the Store since its Base (the Revision last
   taken from, or committed to, the Store). The Store's version is in `.tidings/theirs/<path>`, or
-  the line says `removed in the Store`. A later Store change refreshes it. A local file that is
-  in the way (a directory where the Store now has a File, say) also makes the Path Diverged.
-- `resolved`: a Divergence cleared by itself, because the local contents now equal the Store's, or
-  the Store went back to the Base. The Path is checked again whenever the Store changes it, and
-  every Path when `sync` starts or resyncs.
+  the line says `removed in the Store`. A later Change in the Store refreshes it. A local file that
+  is in the way (a directory where the Store now has a File, say) also makes the Path Diverged.
+- `resolved`: the Path is no longer Diverged, without a `resolve`, because the local contents now
+  equal the Store's, or the Store went back to the Base.
 - `error`: something `sync` couldn't do for one Path, such as writing its `theirs` file. It
   carries on, and tries again later.
 - `resync`: Changes may have been missed, so it checked the whole Area again.
@@ -147,32 +161,34 @@ a second `sync` of the same folder. It prints one line for each thing it does:
   the folder, or `null`.
 
 **`commit`** requires each new file's Path to be absent in the Store still, and each changed or
-deleted one to be unchanged since its Base. If one isn't, nothing is committed: the command exits
+deleted one to be unchanged since its Base. If one isn't, nothing is committed. The command exits
 3, naming them, and marks them Diverged, with `theirs` written, whether or not `sync` is running.
-A commit that would include a Diverged Path is refused up front (exit 3), but naming only other
-paths goes ahead. If another process committed exactly your contents already, that is no Conflict:
-they become the Base. `commit` and a running `sync` take turns, so `sync` never writes into the
-middle of a commit. With nothing to commit, it says so and succeeds.
+A commit that would include a Diverged Path is refused up front (exit 3), but one naming only
+other Paths goes ahead. If another process committed exactly your contents already, that is no
+Conflict: they become the Base. `commit` and a running `sync` take turns, so `sync` never writes
+into the middle of a commit. With nothing to commit, it says so and succeeds. A Path you name that
+isn't in the folder and has no Base, a typo say, is refused with `no such file in the Working
+copy` (exit 1), by `discard` too.
 
 **`status`** lists each Path as `modified`, `added`, `deleted`, `diverged` or `invalid`, comparing
-contents, so a `touch` shows nothing. It reports the folder against what the Working copy last saw
-of the Store, without asking the Store what changed since: that is `sync`'s job.
+contents, so a `touch` shows nothing. It doesn't ask the Store what changed: see the
+[limits](#working-copy-limits).
 
 **`discard`** reads the Store's version now, and writes it into the folder (or removes the file),
-making it the new Base and clearing any Divergence. A file you added, with no Base, is left alone
-by a bare `discard` or by naming a directory it is in; it is removed only when named itself.
+making it the new Base, so the Path is no longer Diverged. A file you added, with no Base, is left
+alone by a bare `discard` or by naming a directory it is in; it is removed only when named itself.
 
-**`resolve`** makes the Store's version you merged against, the one in `theirs`, the Base, and
-removes `theirs`, leaving the folder as it is. So if the Store has changed again since, the next
+**`resolve`** makes the Revision in `theirs`, the Store's File you merged against, the Base. It
+removes `theirs` and leaves the folder as it is. So if the Store has changed again since, the next
 commit is a Conflict all the same: resolving never hides a change you haven't seen.
 
 **The ignore file**, `.tidings/ignore`, says in `.gitignore` syntax which local files `commit`,
 `status` and `discard` leave out. It starts with the usual editor and OS leftovers: `.*.sw?`, `*~`,
-`4913`, `.DS_Store`, `Thumbs.db` and `.#*`. It applies only to files with no Base: a File the Store
-holds is always synced and committed, even if a pattern matches it. As in git, a file under an
-ignored directory stays ignored whatever pattern re-includes it. If the ignore file is missing,
-nothing is ignored; if it is a symlink or isn't a regular file, or a pattern is bad (the error
-names its line), commands that read it are refused.
+`4913` (the file vim writes to test a directory), `.DS_Store`, `Thumbs.db` and `.#*`. It applies
+only to files with no Base: a File the Store holds is always synced and committed, even if a
+pattern matches it. As in git, a file under an ignored directory stays ignored whatever pattern
+re-includes it. If the ignore file is missing, nothing is ignored. If it is a symlink or isn't a
+regular file, or a pattern is bad (the error names its line), commands that read it are refused.
 
 **Invalid files** are those that can't be Files: a name that isn't a valid Path (such as `CON` or
 `a:b`), contents that aren't UTF-8, a symlink, or anything that isn't a regular file. `status`
@@ -186,6 +202,11 @@ invalid a:b: isn't a valid Path: a segment is not a name every platform accepts
 invalid link.toml: is a symlink
 sync isn't running
 ```
+
+**After a crash** in `sync` or `commit`, two things can be left behind. A `theirs` file for a Path
+no longer Diverged is removed by the next `sync`, `discard` or `resolve`. And if the crash came
+before the Working copy recorded a commit's new Bases, `status` lists the committed Paths as
+`modified` until the next `commit` or `sync`, which finds them already in the Store.
 
 ### `tidings store`
 
@@ -203,15 +224,11 @@ tidings store edit config app.toml                # in $VISUAL or $EDITOR; :cq c
 tidings store watch data                          # every Change to data, until Ctrl-C
 ```
 
-- **Choosing a Store.** Give exactly one of `--root <dir>` or `--identity tld.author.app` (the
-  platform's directories for that App identity). The Backend is found from the Backend markers;
-  `--backend fs|sqlite` makes sure of it. A location with no Store is refused unless you pass
-  `--create` too, so a typo doesn't make a new, empty one. `TIDINGS_ROOT`, `TIDINGS_IDENTITY` and
-  `TIDINGS_BACKEND` stand in for the flags.
+- **Choosing a Store, output and exit codes:** as
+  [above](#choosing-a-store-output-and-exit-codes).
 - **Commands.** `read`, `stat`, `list`, `stat-prefix`, `write`, `delete`, `delete-prefix`, `edit`
   and `watch`, each taking the Area then the Path or Prefix. `write` takes the contents from stdin,
   `--contents` or `--from <file>`. `write` and `delete` take `--if-absent` or `--if-revision`.
-- **Output and exit codes** as for Working copies, with one JSON line per Change for `watch`.
 
 `tidings store shell` keeps one Store open, so a Commit can be built up over several commands,
 and the memory Backend (`--backend memory`) can be used. It takes the same commands (not
@@ -239,20 +256,16 @@ Ways a Working copy can surprise you, and why.
 - **The Store's version in `theirs` is only as fresh as the last `sync` or `commit`.** Without
   `sync` running, the Store may have moved on; `resolve` then commit, and you get a Conflict
   rather than overwriting it. *Why:* only `sync` follows the Store.
-  - A `theirs` file left over for a Path no longer Diverged (after a crash, say) is removed by the
-    next `sync`, `discard` or `resolve`.
 - **`status` doesn't reach the Store.** It shows your edits against what the Working copy last
-  saw, not what changed in the Store since, nor a Divergence `sync` hasn't found yet. *Why:* it
-  compares the folder with the Working copy's record, so it is quick; `sync` and `commit` are what
-  ask the Store.
-  - So after a crash that lost the record of a commit, `status` lists the committed Paths as
-    `modified` until the next `commit` or `sync`, which find them already in the Store.
-- **A Divergence stays until something reconciles the Path.** Making your file equal to `theirs`
-  doesn't clear it by itself: `resolve` it, or it clears when the Store next changes the Path, or
-  `sync` restarts. *Why:* `sync` watches the Store, not the folder.
+  saw, not what changed in the Store since, nor a Path `sync` hasn't yet found Diverged. *Why:* it
+  compares the folder with the Bases the Working copy recorded, so it is quick; `sync` and
+  `commit` are what ask the Store.
+- **A Diverged Path stays Diverged until something checks it again.** Making your file equal to
+  `theirs` doesn't clear it by itself: `resolve` it, or `sync` checks it again when the Store next
+  changes the Path, and checks every Path when it starts or resyncs. *Why:* `sync` watches the
+  Store, not the folder.
 - **An ignored file is still yours.** If the Store makes a File at the Path of an ignored local
-  file with no Base, the Path is Diverged, not overwritten, and a full commit is refused until you
-  settle it. *Why:* syncing never overwrites a local file.
+  file, the Path is Diverged, not overwritten. *Why:* syncing never overwrites a local file.
 - **One Area per Working copy.** *Why:* a commit across Areas would be up to three Commits, and one
   could succeed while another is refused.
 - **No memory Stores.** *Why:* no other process can reach one.
