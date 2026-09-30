@@ -5,6 +5,21 @@ SQLite or in memory. Writes happen only through all-or-nothing commits, and ever
 reported on a change feed. Async on tokio; `tidings::blocking::Store` (feature `blocking`) for
 synchronous code.
 
+| Use | Filesystem | SQLite | Memory | Why, where it isn't obvious |
+| --- | :---: | :---: | :---: | --- |
+| Files that must agree with each other, read together | | ✅ | ✅ | The filesystem has no Snapshots, so reading several files can mix commits, and other programs can see a commit half-applied. |
+| Editing the files in place, with any editor or tool | ✅ | | | Only the filesystem holds ordinary files. An edit landing mid-commit can be lost: a window of milliseconds. |
+| Editing with the `tidings` command | ✅ | ✅ | | A Working copy or `tidings store` reaches a Store from another process. Memory only in `tidings store shell`, and gone when it exits. |
+| Reading, searching or backing up with ordinary tools (grep, git, rsync) | ✅ | | | |
+| Keeping Files after the app exits | ✅ | ✅ | | |
+| Sharing a Store between processes | ✅ | ✅ | | Commits reach other processes late: on SQLite within a poll interval (100 ms), on the filesystem once events are quiet for 150 ms. |
+| Commits never held up by another program | | ✅ | ✅ | On Windows, a file another program has open blocks every commit to its Area until released. |
+| A change feed with only real changes | | ✅ | ✅ | The filesystem can report a rewrite with unchanged contents, or on macOS a permissions change. |
+| Quick `stat` and Prefix Revisions of large Files | | ✅ | ✅ | The filesystem reads the whole File for its Revision. |
+| Nothing written to disk (tests, throwaway state) | | | ✅ | |
+
+The details are under [Consistency](#consistency) and [Limitations](#limitations).
+
 Status: early. The library's first version is complete, and the `tidings` command now has Working
 copies for everyday editing. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
 
