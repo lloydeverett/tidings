@@ -3,6 +3,7 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::thread;
@@ -2886,7 +2887,7 @@ fn discard_resolve_and_a_resync_remove_every_stale_theirs_without_following_syml
 }
 
 #[test]
-fn a_record_in_version_1_is_read_and_one_in_an_unknown_version_refused() {
+fn a_record_in_version_1_is_read_and_one_in_an_unknown_format_or_version_refused_and_kept() {
     let location = store_with_config("fs");
     let folder = TempDir::new().unwrap();
     synced(&location, "config", folder.path());
@@ -2899,11 +2900,34 @@ fn a_record_in_version_1_is_read_and_one_in_an_unknown_version_refused() {
     let run = run_in("status", folder.path(), &[]).expect_success();
     assert!(run.stdout.starts_with("nothing to commit\n"), "{run:?}");
 
-    let unknown = format!("tidings working-copy 3\n{rest}");
-    fs::write(&record, &unknown).unwrap();
-    let run = run_in("status", folder.path(), &[]).expect_code(1);
-    assert!(run.stderr.contains("in a format this version doesn't know"), "{run:?}");
-    assert_eq!(fs::read_to_string(&record).unwrap(), unknown);
+    fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
+    let folder_arg = folder.path().to_str().unwrap();
+    // Every command, with what it says of a record in a version it doesn't know, and of one in a
+    // format it doesn't know, which it doesn't take for a Working copy's.
+    let commands: [(&[&str], &str); 5] = [
+        (&["status", "-C", folder_arg], "is not a Working copy"),
+        (&["commit", "-C", folder_arg], "is not a Working copy"),
+        (&["discard", "-C", folder_arg], "is not a Working copy"),
+        (&["resolve", "-C", folder_arg, "app.toml"], "is not a Working copy"),
+        (&["sync", "config", folder_arg], "isn't empty"),
+    ];
+    for first_line in ["tidings working-copy 3", "tidings working-copy-next 1"] {
+        let unknown = format!("{first_line}\n{rest}");
+        fs::write(&record, &unknown).unwrap();
+        for (args, not_a_record) in commands {
+            let run = location.run(args).expect_code(1);
+            let why = if first_line.ends_with(" 3") {
+                "in a format this version doesn't know"
+            } else {
+                not_a_record
+            };
+            assert!(run.stderr.contains(why), "{first_line}, {args:?}: {run:?}");
+            assert_eq!(fs::read_to_string(&record).unwrap(), unknown, "{args:?}");
+        }
+    }
+    // Nothing was committed, discarded or synced.
+    assert_eq!(fs::read_to_string(folder.path().join("app.toml")).unwrap(), "a = 2\n");
+    assert_eq!(location.read("config", "app.toml"), "a = 1\n");
 }
 
 #[test]
@@ -2933,5 +2957,220 @@ fn discard_refuses_a_named_file_whose_name_cant_be_a_path_as_commit_and_resolve_
             assert!(run.stderr.contains("nothing to discard"), "{backend}: {run:?}");
             assert_eq!(fs::read_to_string(&bad).unwrap(), "mine\n", "{backend}");
         }
+    }
+}
+
+/// `count` Files, `f000` onwards, each holding its number after `phase`, as in `v1-000`, by Path.
+fn numbered_files(phase: &str, count: usize) -> BTreeMap<String, String> {
+    (0..count).map(|i| (format!("f{i:03}"), format!("{phase}-{i:03}"))).collect()
+}
+
+/// Commits `files` to the config Area in `location` as one Commit, with a delete of each of
+/// `deleted`.
+fn commit_all(location: &Location, files: &BTreeMap<String, String>, deleted: &[String]) {
+    let mut script = String::from("stage config\n");
+    for (path, contents) in files {
+        script.push_str(&format!("write config {path} --contents {contents}\n"));
+    }
+    for path in deleted {
+        script.push_str(&format!("delete config {path}\n"));
+    }
+    script.push_str("commit\n");
+    location.run_with_stdin(&["store", "shell"], &script).expect_success();
+}
+
+/// Every file in `folder`, outside `.tidings/`, by its name relative to it, with its contents.
+fn files_in(folder: &Path) -> BTreeMap<String, String> {
+    let mut files = BTreeMap::new();
+    let mut directories = vec![folder.to_owned()];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(&directory).unwrap() {
+            let at = entry.unwrap().path();
+            if at == folder.join(".tidings") {
+                continue;
+            }
+            if at.is_dir() {
+                directories.push(at);
+                continue;
+            }
+            let name = at.strip_prefix(folder).unwrap().to_str().unwrap().replace('\\', "/");
+            files.insert(name, fs::read_to_string(&at).unwrap());
+        }
+    }
+    files
+}
+
+/// Kills the `sync` of `location`'s config Area into `folder` once `started` says it has begun
+/// applying what the Store holds, then resumes it, and checks that the resumed one applies the
+/// rest, making the folder hold `expected`, and reports nothing but events named `applied`, and
+/// that nothing is then left to commit, nor anything in `.tidings/tmp/`.
+fn kill_and_resume(
+    label: &str,
+    location: &Location,
+    folder: &Path,
+    started: impl Fn() -> bool,
+    applied: &[&str],
+    expected: &BTreeMap<String, String>,
+) {
+    let sync = Sync::start(location, "config", folder);
+    wait_until(&started);
+    sync.kill();
+
+    let mut sync = Sync::start_with(&[], "config", folder);
+    let events = sync.wait_for("caught-up");
+    sync.stop();
+    for event in &events[..events.len() - 1] {
+        assert!(applied.contains(&event["event"].as_str().unwrap()), "{label}: {events:?}");
+    }
+    assert!(files_in(folder) == *expected, "{label}: the folder doesn't match the Store");
+    let tmp = folder.join(".tidings/tmp");
+    let left = fs::read_dir(&tmp).map(Iterator::count).unwrap_or(0);
+    assert_eq!(left, 0, "{label}: files left in {}", tmp.display());
+    let run = run_in("commit", folder, &[]).expect_success();
+    assert!(run.stderr.contains("nothing to commit"), "{label}: {run:?}");
+}
+
+#[test]
+fn killing_sync_while_it_applies_then_resuming_leaves_the_folder_matching_the_store() {
+    const COUNT: usize = 300;
+    for backend in BACKENDS {
+        let location = Location::with_store(backend);
+        let first = numbered_files("v1", COUNT);
+        commit_all(&location, &first, &[]);
+        let folder = TempDir::new().unwrap();
+        let wc = folder.path();
+
+        // Killed while it writes the Files into a new Working copy.
+        let started = || wc.join("f000").exists();
+        kill_and_resume(
+            &format!("{backend}, creating"),
+            &location,
+            wc,
+            started,
+            &["created"],
+            &first,
+        );
+
+        // Killed while it updates some Files and removes the others, which it does first.
+        let mut second = numbered_files("v2", COUNT);
+        let odd: Vec<String> = second.keys().skip(1).step_by(2).cloned().collect();
+        second.retain(|path, _| !odd.contains(path));
+        commit_all(&location, &second, &odd);
+        let started = || fs::read_to_string(wc.join("f000")).is_ok_and(|now| now == "v2-000");
+        let applied = ["updated", "removed"];
+        kill_and_resume(&format!("{backend}, updating"), &location, wc, started, &applied, &second);
+    }
+}
+
+/// Checks that `next`, `commit` or `sync`, heals the Working copy that is `folder`, whose folder
+/// holds what the Store does though its record says otherwise, as a crash between changing the
+/// one and saving the other leaves it: saying nothing to commit, or reporting nothing, and then
+/// leaving nothing to commit, so that the next edit commits with no Conflict.
+fn heals(label: &str, next: &str, location: &Location, folder: &Path) {
+    if next == "commit" {
+        let run = run_in("commit", folder, &[]).expect_success();
+        assert!(run.stdout.is_empty(), "{label}: {run:?}");
+        assert!(run.stderr.contains("nothing to commit"), "{label}: {run:?}");
+    } else {
+        let mut sync = Sync::start_with(&[], "config", folder);
+        let events = sync.wait_for("caught-up");
+        sync.stop();
+        assert_eq!(events.len(), 1, "{label}: {events:?}");
+    }
+    let run = run_in("status", folder, &[]).expect_success();
+    assert!(run.stdout.starts_with("nothing to commit\n"), "{label}: {run:?}");
+    fs::write(folder.join("app.toml"), "a = 3\n").unwrap();
+    run_in("commit", folder, &[]).expect_success();
+    assert_eq!(location.read("config", "app.toml"), "a = 3\n", "{label}");
+}
+
+#[test]
+fn a_commit_whose_record_update_was_lost_is_healed_by_the_next_command() {
+    for backend in BACKENDS {
+        for next in ["commit", "sync", "commit with a further edit"] {
+            let label = format!("{backend}, then {next}");
+            let location = store_with_config(backend);
+            let folder = TempDir::new().unwrap();
+            synced(&location, "config", folder.path());
+            let record = folder.path().join(".tidings/working-copy");
+            let before = fs::read(&record).unwrap();
+            fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
+            fs::write(folder.path().join("new.toml"), "new\n").unwrap();
+            fs::remove_file(folder.path().join("themes/dark.toml")).unwrap();
+            run_in("commit", folder.path(), &[]).expect_success();
+            // As a crash between the Commit and saving the record leaves it.
+            fs::write(&record, &before).unwrap();
+
+            if next == "commit with a further edit" {
+                // Only the further edit is committed, with no Conflict.
+                fs::write(folder.path().join("more.toml"), "more\n").unwrap();
+                let run = run_in("commit", folder.path(), &[]).expect_success();
+                assert_eq!(run.stdout, "added more.toml\n", "{label}: {run:?}");
+                assert_eq!(location.read("config", "more.toml"), "more\n", "{label}");
+                heals(&label, "commit", &location, folder.path());
+            } else {
+                heals(&label, next, &location, folder.path());
+            }
+            assert_eq!(location.read("config", "new.toml"), "new\n", "{label}");
+            location.run(&["store", "read", "config", "themes/dark.toml"]).expect_code(2);
+        }
+    }
+}
+
+#[test]
+fn files_sync_changed_but_didnt_record_are_healed_by_the_next_command() {
+    for backend in BACKENDS {
+        for next in ["commit", "sync"] {
+            let label = format!("{backend}, then {next}");
+            let location = store_with_config(backend);
+            let folder = TempDir::new().unwrap();
+            synced(&location, "config", folder.path());
+            let record = folder.path().join(".tidings/working-copy");
+            let before = fs::read(&record).unwrap();
+            location.write("config", "app.toml", "a = 2\n");
+            location.write("config", "new.toml", "new\n");
+            location.run(&["store", "delete", "config", "themes/dark.toml"]).expect_success();
+            synced(&location, "config", folder.path());
+            // As a crash between changing the folder and saving the record leaves it.
+            fs::write(&record, &before).unwrap();
+
+            heals(&label, next, &location, folder.path());
+            assert_eq!(fs::read_to_string(folder.path().join("new.toml")).unwrap(), "new\n");
+            assert!(!folder.path().join("themes").exists(), "{label}");
+        }
+    }
+}
+
+#[test]
+fn leftovers_of_an_interrupted_run_are_removed_by_the_next_sync() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        // What a run killed while writing a file, or the record, leaves in `.tidings/`.
+        let tidings = folder.path().join(".tidings");
+        let leftovers = [tidings.join("tmp/.tmpA1b2C3"), tidings.join(".working-copy.x1Y2z3")];
+        fs::create_dir_all(tidings.join("tmp")).unwrap();
+        for leftover in &leftovers {
+            fs::write(leftover, "a = hal").unwrap();
+        }
+        // A symlink there is removed, not followed.
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("kept.toml");
+        fs::write(&target, "kept\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, tidings.join("tmp/.tmpLink")).unwrap();
+
+        let mut sync = Sync::start_with(&[], "config", folder.path());
+        let events = sync.wait_for("caught-up");
+        sync.stop();
+        assert_eq!(events.len(), 1, "{backend}: {events:?}");
+        assert_eq!(fs::read_dir(tidings.join("tmp")).unwrap().count(), 0, "{backend}");
+        for leftover in &leftovers {
+            assert!(!leftover.exists(), "{backend}: {} is left", leftover.display());
+        }
+        assert_eq!(fs::read_to_string(&target).unwrap(), "kept\n", "{backend}");
+        let run = run_in("commit", folder.path(), &[]).expect_success();
+        assert!(run.stderr.contains("nothing to commit"), "{backend}: {run:?}");
     }
 }

@@ -207,6 +207,13 @@ impl Sync {
         let status = self.process.wait().unwrap();
         assert_eq!(status.code(), Some(0), "sync stopped with {status}");
     }
+
+    /// Kills `sync` with SIGKILL, as a crash or power cut would stop it, wherever it is, and waits
+    /// for it to go.
+    pub fn kill(mut self) {
+        self.process.kill().unwrap();
+        self.process.wait().unwrap();
+    }
 }
 
 impl Drop for Sync {

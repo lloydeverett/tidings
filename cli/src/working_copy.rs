@@ -220,6 +220,16 @@ enum CommitOutcome {
     Conflict(Vec<Reconciled>),
 }
 
+/// One Commit of a Working copy's local changes, once recorded.
+struct Attempt {
+    /// Each local change in it.
+    changes: Vec<(Path, LocalChange)>,
+    /// The contents of each file in the folder that can become a File, as the Commit took them.
+    files: BTreeMap<Path, String>,
+    /// What it gave.
+    outcome: CommitOutcome,
+}
+
 /// The Paths a commit covers.
 enum Selection {
     /// Every Path.
@@ -611,7 +621,8 @@ impl WorkingCopy {
     /// Reconciles `paths`, every Diverged Path and every Path in `theirs_failures` with the Store,
     /// reading each one's Store state afresh, as [`WorkingCopy::reconcile_path`] says. Removals
     /// are applied before writes, so that a File can take the place of a directory, and the
-    /// reverse.
+    /// reverse. Reconciling every Path, as `sync` does when it starts, first removes what a run
+    /// that was stopped partway left in `.tidings/`, as [`WorkingCopy::remove_leftovers`] says.
     ///
     /// Each Path's `theirs` file is then brought in line, as [`WorkingCopy::settle_theirs`] says:
     /// written if it is Diverged and the Store has a File there, and removed otherwise. If that
@@ -627,8 +638,11 @@ impl WorkingCopy {
         theirs_failures: &mut BTreeSet<Path>,
     ) -> Result<Vec<SyncEvent>, Failure> {
         let mut lock = self.lock()?;
-        let record = &mut lock.record;
         let all_paths = matches!(paths, Paths::All);
+        if all_paths {
+            self.remove_leftovers();
+        }
+        let record = &mut lock.record;
         let mut paths = match paths {
             Paths::All => {
                 let mut paths: BTreeSet<Path> =
@@ -897,10 +911,23 @@ impl WorkingCopy {
         events
     }
 
+    /// Removes what a command that was stopped partway, by a crash or a kill, can leave in
+    /// `.tidings/`: each file in `.tidings/tmp/`, where files are written before being renamed
+    /// into place, and each temporary file the record or the ignore file was being written to. The
+    /// caller holds [`Lock`], which every command holds while it writes those, so none is still
+    /// being written. A symlink is removed, not followed, and nothing is removed from a `tmp` that
+    /// isn't a real directory. A leftover that can't be removed does no harm, so it is left for
+    /// the next time.
+    fn remove_leftovers(&self) {
+        let directory = self.folder.join(RECORD_DIRECTORY);
+        remove_files_in(&directory.join(TMP_DIRECTORY), |_| true);
+        remove_files_in(&directory, is_temporary_file);
+    }
+
     /// Writes `contents` to the file `at`, making the directories it needs, so that it is never
-    /// seen half-written: in `.tidings/tmp/` first, forced to disk, then renamed into place. A
-    /// file it replaces keeps its permissions. `failed` gives the failure for an error at a file
-    /// or directory.
+    /// seen half-written: in `.tidings/tmp/` first, forced to disk, then renamed into place, and
+    /// the rename forced to disk, as [`sync_directory`] says. A file it replaces keeps its
+    /// permissions. `failed` gives the failure for an error at a file or directory.
     fn write(
         &self,
         at: &FsPath,
@@ -925,7 +952,10 @@ impl WorkingCopy {
             fs::create_dir_all(parent).map_err(|error| failed(parent, error))?;
         }
         file.persist(at).map_err(|error| failed(at, error.error))?;
-        Ok(())
+        match at.parent() {
+            Some(parent) => sync_directory(parent).map_err(|error| failed(parent, error)),
+            None => Ok(()),
+        }
     }
 
     /// Commits every local change as one Commit, or only those at or under `named`: files or
@@ -938,7 +968,9 @@ impl WorkingCopy {
     /// any Path it would commit is Diverged, and with 1 if any file it would commit can't become a
     /// File, naming each. On a Conflict, nothing is committed: each Path it names is reconciled as
     /// `sync` would, which makes it Diverged, or gives it the new Base if the local contents turn
-    /// out the same as the Store's, and the failure says which.
+    /// out the same as the Store's, and the failure says which. If every Path it names turns out
+    /// the same, as when a crash kept a commit's record from being saved, it is no Conflict: the
+    /// rest of the local changes are committed, if there are any.
     pub async fn commit(
         &self,
         store: &Store,
@@ -948,22 +980,29 @@ impl WorkingCopy {
         let mut lock = self.lock()?;
         let selection = self.select(named, current)?;
         refuse_diverged(&lock.record, &selection)?;
-        let scan = scan::scan(&self.folder, &lock.record.bases)?;
-        selection.check_each_names_something(&scan, &lock.record, NamingCommand::Commit)?;
-        refuse_invalid(&scan.invalid, &selection)?;
-        let (staging, changes) = self.stage(&scan, &selection)?;
-        let files = scan.files;
-        if changes.is_empty() {
-            return Ok(CommitReport { changes: Vec::new(), pending: false, events: Vec::new() });
-        }
-        let result = store.commit(staging).await;
-        let outcome = self.record_commit(store, &mut lock.record, result, &changes, &files).await?;
-        // The folder is changed first and the record saved after.
-        self.save(&lock.record)?;
-        let (pending, events) = match outcome {
-            CommitOutcome::Committed => (false, Vec::new()),
-            CommitOutcome::Pending(events) => (true, events),
-            CommitOutcome::Conflict(reconciled) => return Err(Failure::conflicted(reconciled)),
+        // Once more at most, since every Path a Conflict names is reconciled at once, and one that
+        // took its local contents as its Base is no longer a change.
+        let mut healed = false;
+        let (changes, files, pending, events) = loop {
+            let attempt = self.try_commit(store, &mut lock.record, &selection).await?;
+            let Some(Attempt { changes, files, outcome }) = attempt else {
+                return Ok(CommitReport {
+                    changes: Vec::new(),
+                    pending: false,
+                    events: Vec::new(),
+                });
+            };
+            match outcome {
+                CommitOutcome::Committed => break (changes, files, false, Vec::new()),
+                CommitOutcome::Pending(events) => break (changes, files, true, events),
+                // Each Path the Conflict named already held its local contents in the Store, as
+                // after a commit whose record a crash kept from being saved, and has taken them as
+                // its Base, so the rest is committed on its own.
+                CommitOutcome::Conflict(ref reconciled) if !healed && all_same(reconciled) => {
+                    healed = true;
+                }
+                CommitOutcome::Conflict(reconciled) => return Err(Failure::conflicted(reconciled)),
+            }
         };
         let changes = changes
             .into_iter()
@@ -977,6 +1016,30 @@ impl WorkingCopy {
             })
             .collect();
         Ok(CommitReport { changes, pending, events })
+    }
+
+    /// Scans the folder, then commits each local change `selection` covers as one Commit, as
+    /// [`WorkingCopy::commit`] says, and brings `record`, which the caller holds under [`Lock`], in
+    /// line with the outcome, then saves it. Gives `None` if there is nothing to commit.
+    async fn try_commit(
+        &self,
+        store: &Store,
+        record: &mut Record,
+        selection: &Selection,
+    ) -> Result<Option<Attempt>, Failure> {
+        let scan = scan::scan(&self.folder, &record.bases)?;
+        selection.check_each_names_something(&scan, record, NamingCommand::Commit)?;
+        refuse_invalid(&scan.invalid, selection)?;
+        let (staging, changes) = self.stage(&scan, selection)?;
+        let files = scan.files;
+        if changes.is_empty() {
+            return Ok(None);
+        }
+        let result = store.commit(staging).await;
+        let outcome = self.record_commit(store, record, result, &changes, &files).await?;
+        // The Store is changed first and the record saved after.
+        self.save(record)?;
+        Ok(Some(Attempt { changes, files, outcome }))
     }
 
     /// What `commit` would do, without doing it: each Path that isn't unchanged since its Base, as
@@ -1276,15 +1339,36 @@ fn remove_stale_theirs_in(top: &FsPath, name: &str, record: &Record, events: &mu
     }
 }
 
-/// Removes the file `at`, then each directory above it that the removal emptied, stopping at the
-/// first that holds anything else, and at `top`, which `at` is under. `failed` gives the failure
-/// for an error at a file or directory.
+/// Removes each file or symlink in `directory`, if it is a real directory, whose name `chosen`
+/// accepts, leaving directories alone and ignoring failures, as
+/// [`WorkingCopy::remove_leftovers`] says.
+fn remove_files_in(directory: &FsPath, chosen: impl Fn(&str) -> bool) {
+    let is_directory = fs::symlink_metadata(directory).is_ok_and(|metadata| metadata.is_dir());
+    let Some(entries) = is_directory.then(|| fs::read_dir(directory).ok()).flatten() else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let is_file = entry.file_type().is_ok_and(|file_type| !file_type.is_dir());
+        if is_file && chosen(&entry.file_name().to_string_lossy()) {
+            // Left for the next time if it can't be removed.
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Removes the file `at`, forcing the removal to disk, as [`sync_directory`] says, then each
+/// directory above it that the removal emptied, stopping at the first that holds anything else,
+/// and at `top`, which `at` is under. `failed` gives the failure for an error at a file or
+/// directory.
 fn remove_file_and_emptied_directories(
     top: &FsPath,
     at: &FsPath,
     failed: impl Fn(&FsPath, io::Error) -> Failure,
 ) -> Result<(), Failure> {
     fs::remove_file(at).map_err(|error| failed(at, error))?;
+    if let Some(parent) = at.parent() {
+        sync_directory(parent).map_err(|error| failed(parent, error))?;
+    }
     for directory in at.ancestors().skip(1).take_while(|directory| *directory != top) {
         match fs::remove_dir(directory) {
             Ok(()) => {}
@@ -1292,6 +1376,18 @@ fn remove_file_and_emptied_directories(
             Err(error) => return Err(failed(directory, error)),
         }
     }
+    Ok(())
+}
+
+/// Forces the entries of `directory` to disk, where the platform can, so that a file renamed into
+/// it or removed from it stays so after a power cut. The folder is changed before the record is
+/// saved, so that a crash in between leaves the folder holding what the Store does, which the next
+/// command takes as the Base; this keeps that order on disk too.
+fn sync_directory(directory: &FsPath) -> io::Result<()> {
+    #[cfg(unix)]
+    fs::File::open(directory)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = directory;
     Ok(())
 }
 
@@ -1372,6 +1468,12 @@ fn reconciled(paths: BTreeSet<Path>, events: Vec<SyncEvent>) -> Vec<Reconciled> 
     reconciled
 }
 
+/// Whether each of `reconciled`, the Paths a Conflict named, took the Store's File as its Base,
+/// since its local contents were the same.
+fn all_same(reconciled: &[Reconciled]) -> bool {
+    reconciled.iter().all(|reconciled| matches!(reconciled, Reconciled::TookStoresFile(_)))
+}
+
 /// Where the Working copy that is `folder` keeps its record.
 fn record_file(folder: &FsPath) -> PathBuf {
     folder.join(RECORD_DIRECTORY).join(RECORD_FILE)
@@ -1411,18 +1513,27 @@ fn is_missing_empty_or_unfinished(folder: &FsPath) -> Result<bool, Failure> {
 /// These are the only leftovers allowed, so if [`WorkingCopy::open_or_create`] makes more in
 /// `.tidings/` before writing the record, they must be added here.
 fn holds_no_record(directory: &FsPath) -> Result<bool, Failure> {
-    // As `atomic-write-file` names them, which it doesn't document.
-    let temporary = [format!(".{RECORD_FILE}."), format!(".{IGNORE_FILE}.")];
     for entry in fs::read_dir(directory).map_err(failed_at(directory))? {
         let name = entry.map_err(failed_at(directory))?.file_name();
         let name = name.to_string_lossy();
-        let allowed = [LOCK_FILE, SYNC_LOCK_FILE, IGNORE_FILE].contains(&&*name)
-            || temporary.iter().any(|prefix| name.starts_with(prefix.as_str()));
+        let allowed =
+            [LOCK_FILE, SYNC_LOCK_FILE, IGNORE_FILE].contains(&&*name) || is_temporary_file(&name);
         if !allowed {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// Whether `name`, in `.tidings/`, is a temporary file the record or the ignore file is written
+/// to before it is renamed into place, as `atomic-write-file` names them, which it doesn't
+/// document.
+fn is_temporary_file(name: &str) -> bool {
+    [RECORD_FILE, IGNORE_FILE].iter().any(|file| {
+        name.strip_prefix('.')
+            .and_then(|rest| rest.strip_prefix(file))
+            .is_some_and(|rest| rest.starts_with('.'))
+    })
 }
 
 /// `name`, an absolute path, as it is on disk: each directory it is in with every symlink,
