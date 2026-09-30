@@ -75,6 +75,12 @@ pub struct StoreAddress {
 }
 
 impl StoreAddress {
+    /// Whether the Store's Location is the directory `folder`, which a Working copy of it can't be,
+    /// since the Store's files would mix with the Working copy's.
+    pub fn is_at(&self, folder: &Path) -> bool {
+        same_directory(folder, &self.location)
+    }
+
     /// Opens the Store, or gives `None` if there is none there: it never makes one.
     pub async fn open(&self) -> Result<Option<Opened>, Failure> {
         if detect(&self.location).await?.is_none() {

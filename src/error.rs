@@ -59,6 +59,15 @@ pub enum Error {
         /// The directory the Location is inside.
         outer: PathBuf,
     },
+    /// The Location is a Working copy's folder: its `.tidings/` holds the record the `tidings`
+    /// command keeps there. Opening a Store on the filesystem or SQLite, and
+    /// [`Store::detect`](crate::Store::detect), give it, without changing anything, since the
+    /// Store's files would mix with the Working copy's.
+    #[error("the Location {} is a Working copy's folder", location.display())]
+    LocationIsWorkingCopy {
+        /// The Location, as it was given.
+        location: PathBuf,
+    },
     /// A Staging required a [`PrefixRevision`](crate::PrefixRevision) for `prefix` that was taken
     /// for another Prefix, or from another Store than the one it was committed to. It could never
     /// hold, so the Commit was refused, and nothing was written.

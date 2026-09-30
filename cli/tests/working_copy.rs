@@ -1682,6 +1682,67 @@ fn sync_into_a_folder_that_isnt_empty_changes_nothing_in_it() {
     }
 }
 
+/// Every name under `directory`, relative to it, in order. SQLite's `-wal` and `-shm` files are
+/// left out: they go when a Store's last connection closes, which can be after the command ends.
+fn names_under(directory: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut to_visit = vec![directory.to_path_buf()];
+    while let Some(visiting) = to_visit.pop() {
+        for entry in fs::read_dir(&visiting).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.strip_prefix(directory).unwrap().to_string_lossy().into_owned();
+            if name.ends_with("-wal") || name.ends_with("-shm") {
+                continue;
+            }
+            if path.is_dir() {
+                to_visit.push(path);
+            }
+            names.push(name);
+        }
+    }
+    names.sort();
+    names
+}
+
+/// A folder can't be both a Store's Location and a Working copy of it, since the Store's files
+/// would mix with the Working copy's: `sync` into the Store's own Location is refused, whether the
+/// Store is there already or `--create` would make it, and nothing is made or changed.
+#[test]
+fn sync_into_the_stores_own_location_is_refused() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let before = names_under(location.store());
+        let run = location.run(&["sync", location.store().to_str().unwrap()]).expect_code(1);
+        assert!(run.stderr.contains("is the Store's Location"), "{backend}: {run:?}");
+        assert_eq!(names_under(location.store()), before, "{backend}");
+        assert_eq!(location.read("app.toml"), "a = 1\n", "{backend}");
+
+        let location = Location::empty();
+        let store = location.store().to_str().unwrap();
+        let run = location.run(&["--backend", backend, "--create", "sync", store]).expect_code(1);
+        assert!(run.stderr.contains("is the Store's Location"), "{backend}: {run:?}");
+        assert!(fs::read_dir(location.store()).unwrap().next().is_none(), "{backend}: made");
+    }
+}
+
+/// A Working copy's folder can't be a Store's Location either: the library refuses to open a Store
+/// there, so a `store` command pointed at one fails and changes nothing.
+#[test]
+fn a_working_copys_folder_is_refused_as_a_stores_location() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        synced(&location, folder.path());
+        let before = names_under(folder.path());
+        let mut command = tidings();
+        command.arg("--store").arg(folder.path()).args(["--backend", backend, "--create"]);
+        command.args(["store", "list"]);
+        let run = common::run(command, "").expect_code(1);
+        assert!(run.stderr.contains("is a Working copy's folder"), "{backend}: {run:?}");
+        assert_eq!(names_under(folder.path()), before, "{backend}");
+    }
+}
+
 #[test]
 fn a_second_sync_of_a_working_copy_is_refused() {
     for backend in BACKENDS {

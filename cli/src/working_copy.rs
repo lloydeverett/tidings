@@ -414,6 +414,9 @@ impl WorkingCopy {
         // The flags and the folder are checked before anything is made, so that a refused `sync`
         // makes neither the Store nor the folder.
         let store = flags.address_for_working_copy().await?;
+        if store.is_at(folder) {
+            return Err(refuse_to_create(folder, "is the Store's Location"));
+        }
         WorkingCopy::check_can_create(folder)?;
         fs::create_dir_all(folder.join(RECORD_DIRECTORY)).map_err(failed_at(folder))?;
         let working_copy = WorkingCopy { folder: folder.to_owned(), store };
