@@ -1,11 +1,11 @@
 ---
-status: accepted
+status: accepted, amended by ADR 0009
 ---
 
 # A Working copy is a copy that never overwrites local edits, not a mount
 
 People want to edit a Store's Files with ordinary tools, such as vim, even when the Store is in
-SQLite. The `tidings` command does this with a Working copy: a folder holding one Area's Files as
+SQLite. The `tidings` command does this with a Working copy: a folder holding one Area\*'s Files as
 plain files. `tidings sync` keeps it in step with the Store, and `tidings commit` commits local
 edits back as a single Commit. It is not a filesystem mount. Nothing reaches the Store until it is
 committed, and syncing never overwrites a local edit. A Path changed on both sides is Diverged,
@@ -32,13 +32,18 @@ Conflict, and is never silently lost.
 
 ## Consequences
 
-- A Working copy is for one Area of a filesystem or SQLite Store. A memory Store can't be reached
+- A Working copy is for one Area\* of a filesystem or SQLite Store. A memory Store can't be reached
   from another process.
 - Committing doesn't need `sync` to be running: the Working copy's record of each Path's Base, and
-  of which Store and Area it belongs to, is kept in its `.tidings/`. `.tidings` is reserved, so
+  of which Store and Area\* it belongs to, is kept in its `.tidings/`. `.tidings` is reserved, so
   that folder can never be a File.
 - Working copies are the main way to use the command, so they have the top-level commands (`sync`,
   `commit`, `status`, `discard`, `resolve`), and the commands that act on a Store directly are under
   `tidings store`.
 - A Working copy is built only on the library's public API, in the `cli` crate, and is not part of
   the library.
+
+---
+
+\* Areas were later removed: a Store is now one Location the app chooses. See
+[ADR 0009](0009-a-store-is-one-location-the-app-chooses.md).

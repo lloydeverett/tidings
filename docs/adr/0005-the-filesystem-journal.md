@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: accepted, amended by ADR 0009
 ---
 
 # How the filesystem Backend makes a Commit all-or-nothing
@@ -27,24 +27,24 @@ A temporary file goes next to its target rather than in `.tidings/`, because a t
 symlink into another directory, or can be on another volume. Renaming onto the symlink itself would
 replace a user's link with a plain file, and a rename across volumes is not all-or-nothing. That is
 also why the journal needs a `prepared` state: without it, a crash could leave temporary files
-scattered across the Area that nothing knows about. The watcher ignores the temporary files' names,
+scattered across the Area\* that nothing knows about. The watcher ignores the temporary files' names,
 and no Path can have one, so that no File is ever taken for a temporary file.
 
 Details settled while building it (ticket 09):
 - The `-<n>` in a temporary file's name keeps two of a Commit's temporary files apart when they
   go in the same directory, which the next point allows.
 - When a target's directory doesn't exist yet, its temporary file goes in the nearest directory
-  above it that does, within the Area, and the directory is made in step 5, after the deletes.
+  above it that does, within the Area\*, and the directory is made in step 5, after the deletes.
   That is how a File moves under its own name in one Commit: the file `a` must be deleted before
   the directory `a/` can be made for `a/b`. Likewise, deleting `d/e` removes the emptied directory
   `d/` before a File is renamed onto `d`. Each directory made or changed is forced to disk before
   the journal is removed.
 - A write through a symlink to a file goes to the file the link points to, and its temporary file
-  next to that. Such a write never makes a directory, so it can't make one outside the Area: if
+  next to that. Such a write never makes a directory, so it can't make one outside the Area\*: if
   the directory the link points into doesn't exist, the Commit is refused with `Backend` before
-  step 2. A symlink to a directory is left out of the Area, so a write under one is refused with
+  step 2. A symlink to a directory is left out of the Area\*, so a write under one is refused with
   `DirectoryLink` before step 2 too. One made later, before the Commit is finished, puts the
-  Paths under it outside the Area, so finishing neither deletes nor writes them.
+  Paths under it outside the Area\*, so finishing neither deletes nor writes them.
 - Between steps 1 and 2, the Commit is also refused, with `InvalidPath`, where finishing it could
   go wrong. With `FileUnderFile`, if something that isn't a Path stands where a File it writes, or
   a directory for one, must go, and the Commit's deletes don't remove it: a directory holding
@@ -62,13 +62,13 @@ Details settled while building it (ticket 09):
   and writes `foo`, even with the same contents, and finishing it again doesn't delete `foo`: see
   the next point. Letter case is the only difference this detects; a filesystem that keeps letter
   case apart but ignores Unicode normalization isn't detected, and neither is Windows' letter case
-  set per directory elsewhere in the Area. The check reads the whole directory for each name on
+  set per directory elsewhere in the Area\*. The check reads the whole directory for each name on
   the way, so reading every File of a flat directory of N Files one by one costs in proportion to
   N². Asking the platform for a file's name as it is on disk (`GetFinalPathNameByHandleW` or
   `FindFirstFileW` on Windows, `F_GETPATH` or `getattrlist` on macOS) would cost the same for
   every File, and is left for later.
 - Finishing a Commit again, after a crash part way through or just before the journal was
-  removed, leaves the Area as finishing it once did. A temporary file that is gone was renamed
+  removed, leaves the Area\* as finishing it once did. A temporary file that is gone was renamed
   already, and is skipped. The journal records the Revision of each File a delete removes, and
   finishing again deletes a File only if it is still there under exactly its name with that
   Revision: so a File that one of the Commit's writes, or another program, has put there since is
@@ -95,7 +95,7 @@ Details settled while building it (ticket 10):
   Commit's Changes are recorded before `Pending` is returned, since it has happened. Finishing it
   later reports nothing more.
 - While a `committed` journal is there, whether a Commit gave `Pending`, a crash interrupted it,
-  or it is being finished right then, `read`, `stat`, `list` and `stat_prefix` see the Area as
+  or it is being finished right then, `read`, `stat`, `list` and `stat_prefix` see the Area\* as
   finishing will leave it: a Path it writes is read from its temporary file until that is renamed,
   and a Path it deletes is absent if the File there still has the Revision the journal recorded,
   as finishing deletes only that. The journal records the Path of a write through a symlink as
@@ -108,7 +108,7 @@ Details settled while building it (ticket 10):
 - If the next Commit can't finish the journal either, it isn't made, and gives `Backend`, with a
   message saying that an earlier Commit can't be finished yet and to try again later, and the
   failure as its source. `Pending` would say it had happened. So while a program holds a File
-  open, every Commit to the Area fails until it lets go. `open` logs the failure and opens
+  open, every Commit to the Area\* fails until it lets go. `open` logs the failure and opens
   anyway, since reads show the Commit; only a journal that can't be read stops it.
 - Writing the journal as `committed` can fail once it has been renamed into place, as when forcing
   its directory to disk fails. So if that step fails, the journal is read back: if it is
@@ -124,3 +124,8 @@ Details settled while building it (ticket 10):
   order stays as it is.
 - We rely on tests that kill the process at every step and check what `open` recovers, not on
   reasoning alone.
+
+---
+
+\* Areas were later removed: a Store is now one Location the app chooses. See
+[ADR 0009](0009-a-store-is-one-location-the-app-chooses.md).
