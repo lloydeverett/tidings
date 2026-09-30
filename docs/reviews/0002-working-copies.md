@@ -838,7 +838,7 @@ Fixed in 81754f5:
 
 1. **Mixed `--json` behaviour:** decided and fixed. **A decision for the spec's owner:** under
    `--json`, every failure now prints one JSON object on one line on stderr,
-   `{"failure": <kind>, "message": …}`, with `"outcomes"` added for the Conflict and the Diverged
+   `{"failure": <kind>, "message": …}`, with `"paths"` added for the Conflict and the Diverged
    refusal. The kinds are `error` (exit 1), `missing` (exit 2), `conflict` (exit 3) and
    `diverged` (exit 3). This changes what `tidings store …` commands print on failure under
    `--json` (before, `tidings: …` text), e.g. `tidings --json store write data a.txt --contents b
@@ -851,7 +851,7 @@ Fixed in 81754f5:
 3. **The `"same"` entry:** has a message.
 4. **The parallel switches:** one `EventParts` (name, path, message, `theirs`) renders both text
    and JSON for events and failures.
-5. **Names:** `paths` became `outcomes`, `StoppedPaths` became `Outcomes`, `Failure::conflict` is
+5. **Names:** the internal field `paths` became `outcomes` (the JSON key stays `"paths"`), `StoppedPaths` became `Outcomes`, `Failure::conflict` is
    private with its doc fixed, `TookStoresVersion` became `TookStoresFile`, and the in-process test
    is now `a_pending_commits_events_are_printed_with_it`.
 
@@ -1351,3 +1351,77 @@ Accepted, not changed, **for the spec's owner:**
 
 No re-review: the fixes are narrow and the safety fix is tested. (One library fs test,
 `an_area_directory_removed_while_running_is_made_again_with_a_resync`, flaked once again.)
+
+---
+
+## Ticket 11: The README for everyday use
+
+Reviewed: `git diff b573696...ce8c331` (commit ce8c331).
+
+### Standards
+
+**(a) Documented-standard violations:** none. Prose is within 100 columns (only table and code
+rows exceed); the spec's order is followed (walkthrough and Working copies, then `tidings store`,
+then limits); limits use the *Why:* style; no _Avoid_ word names a domain concept.
+
+**(b) Judgement calls:**
+
+1. "version" standing for a Revision where `resolve` makes "the Store's version … the Base".
+2. Undefined terms: "Divergence", "the Working copy's record", `blocked`, and the `4913` default.
+3. Inconsistent terms within the new text ("Store Change" and "Store change"; "Paths you give",
+   "the paths given", "other paths"); the older sections still lowercase store, area, commit.
+4. Said more than once: `status` not reaching the Store; a Divergence clearing by itself; an
+   ignored file with no Base; refusing to commit a Diverged Path (four times).
+5. "Working copies" does many jobs, and its Output and Exit codes bullets also cover
+   `tidings store`.
+6. Two limits describe crash recovery rather than limits.
+7. Four overlong sentences; a forward reference to the Store-selection flags; the Status line at
+   the top predates Working copies.
+
+### Spec
+
+The reviewer ran the whole walkthrough on SQLite and its output matched README.md line for line,
+Revisions included; the invalid-files example and its `--json` failure matched too. Probed claims
+all held: `--create` refused on an existing Working copy; a stale `TIDINGS_ROOT` refused; `sync` of
+another Area refused; the ignore defaults; Area-relative Paths from a subdirectory; bare `discard`
+and `discard .` leaving a file with no Base; `--quiet`; a Divergence clearing by itself;
+`store read` of a missing File (exit 2, `{"failure":"missing"}`); memory Stores refused for a
+Working copy while the memory shell works.
+
+**(a) Missing or partial:** none; every checkbox is met. **(b) Scope creep:** three extra limits,
+all restating owner-accepted decisions.
+
+**(c) Likely to trip people up:**
+
+1. **Where `-C` goes is never shown.** It works only after the subcommand: `tidings -C cfg status`
+   fails with clap's "unexpected argument", while `tidings status -C cfg` works. Git users will try
+   the first.
+2. `commit` of a path that neither exists nor is recorded exits 1, but the README says only that
+   nothing to commit succeeds.
+
+### Summary
+
+Standards: 0 hard violations, 7 groups of judgement calls (worst: explanations repeated across
+sections). Spec: every example sampled runs as shown; 2 omissions (worst: where `-C` goes).
+
+### Resolution
+
+Fixed in 8897440 (README only):
+
+1. **`-C`:** shown going after the command (`tidings status -C cfg`, not `tidings -C cfg status`).
+2. **A mistyped path:** `commit` and `discard` of a path neither in the folder nor recorded are
+   said to exit 1, "no such file in the Working copy".
+3. **"version" for a Revision:** the `resolve` reference now says "the Revision in `theirs`, the
+   Store's File you merged against". The walkthrough keeps the program's own output line ("…the
+   Store's version it was merged with"), where "version" means contents, as earlier reviews allow.
+4. **Undefined terms:** "no longer Diverged" and "the Bases the Working copy recorded" replace
+   them; `blocked`, `invalid` and `4913` (vim's write-test file) are explained.
+5. **Consistent terms:** "a Change in the Store" and "Paths you name" throughout the new sections.
+6. **Said once:** each repeated point is explained in one place, with a pointer at most.
+7. **Recovery notes:** moved out of the limits into an "After a crash" note.
+8. **Long sentences:** split.
+9–10. **A shared section**, "Choosing a Store, output and exit codes", which the Working copies
+   and `tidings store` sections both point to, replacing the forward reference.
+11. **The Status line:** updated.
+
+The changed examples were run against the binary. No re-review: prose edits only.
