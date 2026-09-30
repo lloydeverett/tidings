@@ -167,9 +167,10 @@ impl WorkingCopy {
             record.divergences.remove(&path);
             report.discarded.push(Discarded { path, change, outcome });
         }
-        report.events = self.remove_stale_theirs(record);
-        // The folder is changed first and the record saved after.
+        // The folder is changed first and the record saved after, and only then is each `theirs`
+        // file it no longer names removed, so that a saved record never names one that is gone.
         self.save(record)?;
+        report.events = self.remove_stale_theirs(record);
         Ok(report)
     }
 
@@ -227,8 +228,10 @@ impl WorkingCopy {
             record.set_base(&path, base);
             report.resolved.push(Resolved { path, revision: divergence.theirs_revision() });
         }
-        report.events = self.remove_stale_theirs(record);
+        // The record is saved first, so that a saved record never names a `theirs` file that is
+        // gone.
         self.save(record)?;
+        report.events = self.remove_stale_theirs(record);
         Ok(report)
     }
 

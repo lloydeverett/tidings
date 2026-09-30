@@ -926,8 +926,9 @@ impl WorkingCopy {
 
     /// Writes `contents` to the file `at`, making the directories it needs, so that it is never
     /// seen half-written: in `.tidings/tmp/` first, forced to disk, then renamed into place, and
-    /// the rename forced to disk, as [`sync_directory`] says. A file it replaces keeps its
-    /// permissions. `failed` gives the failure for an error at a file or directory.
+    /// the rename forced to disk, as [`sync_directory`] says. `.tidings/tmp/` is first made a real
+    /// directory, as [`make_tmp_directory`] says. A file it replaces keeps its permissions.
+    /// `failed` gives the failure for an error at a file or directory.
     fn write(
         &self,
         at: &FsPath,
@@ -935,7 +936,7 @@ impl WorkingCopy {
         failed: impl Fn(&FsPath, io::Error) -> Failure,
     ) -> Result<(), Failure> {
         let tmp = self.folder.join(RECORD_DIRECTORY).join(TMP_DIRECTORY);
-        fs::create_dir_all(&tmp).map_err(|error| failed(&tmp, error))?;
+        make_tmp_directory(&tmp).map_err(|error| failed(&tmp, error))?;
         let mut builder = tempfile::Builder::new();
         // As a new file would be made, before the umask, rather than only for its owner.
         #[cfg(unix)]
@@ -952,10 +953,7 @@ impl WorkingCopy {
             fs::create_dir_all(parent).map_err(|error| failed(parent, error))?;
         }
         file.persist(at).map_err(|error| failed(at, error.error))?;
-        match at.parent() {
-            Some(parent) => sync_directory(parent).map_err(|error| failed(parent, error)),
-            None => Ok(()),
-        }
+        sync_parent(at, failed)
     }
 
     /// Commits every local change as one Commit, or only those at or under `named`: files or
@@ -982,27 +980,32 @@ impl WorkingCopy {
         refuse_diverged(&lock.record, &selection)?;
         // Once more at most, since every Path a Conflict names is reconciled at once, and one that
         // took its local contents as its Base is no longer a change.
-        let mut healed = false;
-        let (changes, files, pending, events) = loop {
+        let mut retried = false;
+        let Attempt { changes, files, outcome } = loop {
             let attempt = self.try_commit(store, &mut lock.record, &selection).await?;
-            let Some(Attempt { changes, files, outcome }) = attempt else {
+            let Some(attempt) = attempt else {
                 return Ok(CommitReport {
                     changes: Vec::new(),
                     pending: false,
                     events: Vec::new(),
                 });
             };
-            match outcome {
-                CommitOutcome::Committed => break (changes, files, false, Vec::new()),
-                CommitOutcome::Pending(events) => break (changes, files, true, events),
+            match &attempt.outcome {
                 // Each Path the Conflict named already held its local contents in the Store, as
                 // after a commit whose record a crash kept from being saved, and has taken them as
                 // its Base, so the rest is committed on its own.
-                CommitOutcome::Conflict(ref reconciled) if !healed && all_same(reconciled) => {
-                    healed = true;
+                CommitOutcome::Conflict(reconciled)
+                    if !retried && all_took_stores_file(reconciled) =>
+                {
+                    retried = true;
                 }
-                CommitOutcome::Conflict(reconciled) => return Err(Failure::conflicted(reconciled)),
+                _ => break attempt,
             }
+        };
+        let (pending, events) = match outcome {
+            CommitOutcome::Committed => (false, Vec::new()),
+            CommitOutcome::Pending(events) => (true, events),
+            CommitOutcome::Conflict(reconciled) => return Err(Failure::conflicted(reconciled)),
         };
         let changes = changes
             .into_iter()
@@ -1366,9 +1369,7 @@ fn remove_file_and_emptied_directories(
     failed: impl Fn(&FsPath, io::Error) -> Failure,
 ) -> Result<(), Failure> {
     fs::remove_file(at).map_err(|error| failed(at, error))?;
-    if let Some(parent) = at.parent() {
-        sync_directory(parent).map_err(|error| failed(parent, error))?;
-    }
+    sync_parent(at, &failed)?;
     for directory in at.ancestors().skip(1).take_while(|directory| *directory != top) {
         match fs::remove_dir(directory) {
             Ok(()) => {}
@@ -1389,6 +1390,32 @@ fn sync_directory(directory: &FsPath) -> io::Result<()> {
     #[cfg(not(unix))]
     let _ = directory;
     Ok(())
+}
+
+/// Forces the entries of the directory `at` is in to disk, as [`sync_directory`] says. `failed`
+/// gives the failure for an error at that directory.
+fn sync_parent(at: &FsPath, failed: impl Fn(&FsPath, io::Error) -> Failure) -> Result<(), Failure> {
+    match at.parent() {
+        Some(parent) => sync_directory(parent).map_err(|error| failed(parent, error)),
+        None => Ok(()),
+    }
+}
+
+/// Makes `tmp`, `.tidings/tmp/`, a real directory if it isn't one, so that no file is written
+/// through it outside the folder: a symlink there is removed, never what it leads to, and a
+/// directory made in its place. Anything else there is an error, left for the person to remove,
+/// since tidings never puts it there.
+fn make_tmp_directory(tmp: &FsPath) -> io::Result<()> {
+    match fs::symlink_metadata(tmp) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(metadata) if metadata.is_symlink() => {
+            fs::remove_file(tmp)?;
+            fs::create_dir(tmp)
+        }
+        Ok(_) => Err(io::Error::other("isn't a directory, as tidings needs it to be: remove it")),
+        Err(error) if error.kind() == ErrorKind::NotFound => fs::create_dir_all(tmp),
+        Err(error) => Err(error),
+    }
 }
 
 /// Clears `path`'s Divergence in `record`, if it has one, giving the event reporting that. Local
@@ -1470,7 +1497,7 @@ fn reconciled(paths: BTreeSet<Path>, events: Vec<SyncEvent>) -> Vec<Reconciled> 
 
 /// Whether each of `reconciled`, the Paths a Conflict named, took the Store's File as its Base,
 /// since its local contents were the same.
-fn all_same(reconciled: &[Reconciled]) -> bool {
+fn all_took_stores_file(reconciled: &[Reconciled]) -> bool {
     reconciled.iter().all(|reconciled| matches!(reconciled, Reconciled::TookStoresFile(_)))
 }
 
