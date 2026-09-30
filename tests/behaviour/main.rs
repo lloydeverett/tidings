@@ -1267,6 +1267,38 @@ mod fs {
         assert_eq!(temporary_files(fixture.directory.path()), Vec::<PathBuf>::new());
     }
 
+    /// A directory that comes to hold a `.tidings/` after a Commit was interrupted, as another
+    /// Store's Location or a Working copy made there, is outside the Store by the time the Commit
+    /// is finished, so finishing neither deletes nor writes under it.
+    #[tokio::test]
+    async fn finishing_a_commit_again_leaves_what_is_under_another_store_made_since() {
+        let fixture = Fs::new();
+        let Opened { store, feed: _feed } = fixture.open().await;
+        let mut staging = Staging::new();
+        staging.write("x/y.txt", "y").unwrap();
+        store.commit(staging).await.unwrap();
+        drop(store);
+
+        let Opened { store, feed: _feed } =
+            fixture.open_with(|options| options.fail_at(FailurePoint::AfterCommittedJournal)).await;
+        let mut staging = Staging::new();
+        staging.delete("x/y.txt").unwrap();
+        staging.write("d/e.txt", "e").unwrap();
+        assert!(matches!(store.commit(staging).await, Err(Error::Backend(_))));
+        std::fs::create_dir_all(fixture.on_disk("x/.tidings")).unwrap();
+        std::fs::create_dir_all(fixture.on_disk("d/.tidings")).unwrap();
+        // Reads see the Commit as finishing it will leave the Store.
+        assert_eq!(store.read("d/e.txt").await.unwrap(), None);
+        assert_eq!(list(&store).await, Vec::<String>::new());
+        drop(store);
+
+        let Opened { store, feed: _feed } = fixture.open().await;
+        assert_eq!(list(&store).await, Vec::<String>::new());
+        assert_eq!(std::fs::read_to_string(fixture.on_disk("x/y.txt")).unwrap(), "y");
+        assert!(!fixture.on_disk("d/e.txt").exists());
+        assert_eq!(temporary_files(fixture.directory.path()), Vec::<PathBuf>::new());
+    }
+
     /// Two Paths can be the same file on disk, through a symlink. A Commit that writes or deletes
     /// both is refused, since which of them wins would depend on the order they land in.
     #[cfg(unix)]

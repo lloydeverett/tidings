@@ -140,6 +140,7 @@ impl AsFinished<'_> {
     pub(super) fn read(&self, path: &Path) -> Result<Option<(Vec<u8>, Timestamp)>> {
         // A temporary file that is gone was renamed over the File already.
         if let Some(temporary) = self.written.get(path)
+            && !self.written_outside(path)?
             && let Some(read) = read_file(temporary)?
         {
             return Ok(Some(read));
@@ -159,11 +160,21 @@ impl AsFinished<'_> {
                 paths.push(path);
             }
         }
-        let written = self.written.keys();
-        paths.extend(written.filter(|path| path.as_str().starts_with(prefix.as_str())).cloned());
+        for path in self.written.keys().filter(|path| prefix.covers(path)) {
+            if !self.written_outside(path)? {
+                paths.push(path.clone());
+            }
+        }
         paths.sort();
         paths.dedup();
         Ok(paths)
+    }
+
+    /// Whether `path`, which the Commit writes, is now under a directory holding a `.tidings/`,
+    /// made since the Commit checked its Paths, so that finishing won't write it
+    /// ([`Journal::finish`]).
+    fn written_outside(&self, path: &Path) -> Result<bool> {
+        Ok(self.location.left_out(path.as_str())? == Some(LeftOut::Nested))
     }
 
     /// The Path and Revision of every File under `prefix`, in order of Path, once the Commit is
@@ -259,15 +270,22 @@ impl Journal {
     /// 3. forces each directory changed or made to disk, so that the Commit is on disk before the
     ///    journal is removed.
     ///
-    /// A Path that is under a symlink to a directory, made since the Commit checked its Paths, is
-    /// outside the Store, so it is neither deleted nor written, and its temporary file is removed.
+    /// A Path that is under a symlink to a directory, or under a directory holding a `.tidings/`,
+    /// made since the Commit checked its Paths, is outside the Store, so it is neither deleted nor
+    /// written, and its temporary file is removed. (A write through a symlink to a File under a
+    /// symlink to a directory still goes to the File the link points to.)
     pub(super) fn finish(&self, location: &Location, again: bool) -> Result<()> {
         let directory = &location.directory;
-        let under_link =
-            |path: &Path| Ok(location.left_out(path.as_str())? == Some(LeftOut::DirectoryLink));
+        let outside = |path: &Path, target: Option<&Target>| {
+            Ok(match location.left_out(path.as_str())? {
+                Some(LeftOut::Nested) => true,
+                Some(LeftOut::DirectoryLink) => !matches!(target, Some(Target::Linked(_))),
+                _ => false,
+            })
+        };
         let mut changed = BTreeSet::new();
         for Remove { path, revision } in &self.removes {
-            if under_link(path)? {
+            if outside(path, None)? {
                 continue;
             }
             let file = on_disk(directory, path.as_str());
@@ -293,11 +311,11 @@ impl Journal {
             if present_at(fs::symlink_metadata(temporary), temporary)?.is_none() {
                 continue;
             }
+            if outside(path, Some(target))? {
+                fs::remove_file(temporary).map_err(|error| failed(temporary, error))?;
+                continue;
+            }
             if let Target::AtPath = target {
-                if under_link(path)? {
-                    fs::remove_file(temporary).map_err(|error| failed(temporary, error))?;
-                    continue;
-                }
                 location.make_directories(path, &mut changed)?;
             }
             let target = replace.on_disk(directory);
