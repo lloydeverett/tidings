@@ -122,8 +122,10 @@ pub fn is_revision(text: &str) -> bool {
 }
 
 /// How long [`Sync::wait_for`] waits for an event, and [`wait_until`] for its condition, before
-/// failing the test.
-const EVENT_TIMEOUT: Duration = Duration::from_secs(20);
+/// failing the test. Long, so that a test fails only when it never comes: `sync` reports a
+/// reconcile once it is done, and one that writes hundreds of Files, each forced to disk, can
+/// take most of a minute on a busy machine. A test that passes doesn't wait it out.
+const EVENT_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Waits until `condition` holds, failing the test if it doesn't within [`EVENT_TIMEOUT`].
 #[track_caller]
