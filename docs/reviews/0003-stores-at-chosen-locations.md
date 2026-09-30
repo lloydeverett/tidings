@@ -211,3 +211,78 @@ load and four full-suite runs.
 
 `cargo fmt` and clippy are clean, and the full `cargo test --workspace --all-features` passes. No
 re-review: item 9 is small and tested in both directions, and the rest are mechanical.
+
+---
+
+## Ticket 03: Docs
+
+Reviewed: `git diff a3b50a8...efa8c85` (commit efa8c85).
+
+### Standards
+
+**(a) Documented-standard violations:** none of CONTEXT.md. "Area" and `--root` appear in ADR
+0009 only as history, and "events" means filesystem events, as earlier reviews accepted.
+
+- **Lines wrapped too early:** `docs/specs/0003-stores-at-chosen-locations.md:3`, and
+  `README.md:96, 416, 444`.
+- **Judgement call:** "a filesystem Store" (README:92, 234) uses "filesystem" as an adjective for
+  the Backend, not as a name for the Store.
+
+**(b) Baseline smells (judgement calls):**
+
+- **Duplicated Code:** the README and the crate docs hold the same example, and only the crate
+  docs' copy compiled. The explanation of nesting, opening a Location twice and a vanished
+  Location is in four places: the README, the crate docs, ADR 0009 and CONTEXT.md.
+- **Drift:** CONTEXT.md's Location entry left out "inside a Working copy", which the README and
+  the crate docs both state.
+- **Inconsistent casing:** the new section writes Store and Location, while the older README
+  sections write "store" and "backend".
+
+Factual checks all held: the error names, the example's API, the CLI flags and environment
+variables, `{"resync": true}`, and etcetera's strategies.
+
+### Spec
+
+The reviewer built the crate and the CLI and ran the doctests. They re-ran the README walkthrough,
+whose hashes match, and checked by running that:
+- `--backend fs` on a SQLite Location is refused;
+- a nested Location is refused, naming the outer directory;
+- `sync` at the Store's own Location is refused;
+- the JSON for a missing File is right.
+
+- **(a) Missing or partial:** none. No stale mention of Areas, App identity, `--root`,
+  `--identity` or `etcetera` is left outside history and deliberate refusals.
+- **(b) Scope creep (minor):** ADR 0009's decisions were rewritten to add what tickets 01 and 02
+  decided, not only its status changed. `etcetera` was added as a dev-dependency for the doctest.
+- **(c) Wrong:** the README said that on macOS `etcetera`'s native strategy gives the same
+  directory for config and data. It doesn't: in etcetera 0.11, config is in
+  `~/Library/Preferences/` and data in `~/Library/Application Support/`. The mistake came from the
+  spec's Further Notes and the ticket, written when this work was planned.
+
+### Summary
+
+Standards: 0 hard violations, 4 lines wrapped wrong, 3 judgement-call smells (worst: the README's
+example was never compiled). Spec: 1 finding (the false macOS claim, which came from the spec
+itself).
+
+### Resolution
+
+1. **The macOS claim:** fixed. The README bullet is gone. The bullet on opening one Location twice
+   now says that the other Backend gives `WrongBackend`, and that an app which could give two
+   Stores the same directory should join a name of its own to each. The spec's note is corrected
+   and says what it first claimed. The ticket is left as written, as history.
+2. **Wrapping:** fixed.
+3. **The README's example:** now compiled. It is marked `rust,no_run`, and the crate includes the
+   README as a `cfg(doctest)` item, so its example is built with the doctests and can't drift from
+   the API.
+4. **CONTEXT.md's Location entry:** fixed. It says a Location can't be inside a Working copy
+   either, and that a directory holding a Working copy is not part of it.
+5. **Explaining nesting in four places:** not fixed. Each is for a different reader: the glossary,
+   the decision, the README and the API docs. Each is short.
+6. **Casing in the older README sections:** not fixed. The README's prose has always written
+   "store" and "backend" in lower case, and only the new section uses the glossary's capitals.
+   Recasing the whole README is out of this ticket's scope.
+7. **ADR 0009's rewritten decisions and the dev-dependency:** kept. The ADR should record the
+   decision as built, and the dev-dependency doesn't reach crates that depend on tidings.
+
+`cargo fmt`, clippy, `cargo doc` with warnings denied and the doctests (now two) pass.

@@ -1,7 +1,7 @@
 # Spec 0003: Stores at Locations the app chooses
 
-Status: built. Terms are used as defined in [CONTEXT.md](../../CONTEXT.md), and the
-decisions in [docs/adr](../adr) apply throughout, especially
+Status: built. Terms are used as defined in [CONTEXT.md](../../CONTEXT.md), and the decisions
+in [docs/adr](../adr) apply throughout, especially
 [ADR 0009](../adr/0009-a-store-is-one-location-the-app-chooses.md).
 
 ## Problem Statement
@@ -281,6 +281,7 @@ Change feed. The app opens as many as it wants, each on the Backend that suits i
     Revision carries the identity of the Store that took it.
   - Nested boundaries are found by any `.tidings/` entry, not only a Backend marker, so a Working
     copy folder is a boundary too. The same rule refuses opening inside one.
-- On macOS, `etcetera`'s native strategy gives the same directory for config and data. An app that
-  opens both there opens the same Location twice, which works (story 12), but gives two Stores over
-  the same Files. The README says so.
+- An app that gives two Stores the same directory opens the same Location twice, which works
+  (story 12), but gives two Stores over the same Files, or `WrongBackend` on different Backends.
+  The README says so. (This note first claimed that `etcetera`'s native strategy does this on
+  macOS; it doesn't, since config and data are in different `~/Library` directories.)

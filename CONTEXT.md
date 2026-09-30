@@ -19,9 +19,9 @@ _Avoid_: area, filesystem, vfs, repository
 The directory a Store on the filesystem or SQLite lives in, chosen by the application. tidings owns
 it: the filesystem keeps the Files there, and SQLite keeps its database in it. A Location may
 vanish at any time, because the user or the OS cleared it; the Store makes it again and sends a
-Resync, which is not an error. A Location can't be inside another Store's Location, or be a
-Working copy's folder, and a directory inside a Location that holds another Store is not part of
-it.
+Resync, which is not an error. A Location can't be inside another Store's Location or a Working
+copy, or be a Working copy's folder, and a directory inside a Location that holds another Store or
+a Working copy is not part of it.
 _Avoid_: root, area directory, path (that is a File's name)
 
 **Backend**:

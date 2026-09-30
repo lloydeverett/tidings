@@ -97,3 +97,8 @@ pub use revision::{ParseRevisionError, PrefixRevision, Revision};
 pub use snapshot::Snapshot;
 pub use staging::Staging;
 pub use store::Store;
+
+/// Compiles the README's example, so it can't drift from the API.
+#[cfg(all(doctest, feature = "fs", feature = "sqlite"))]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

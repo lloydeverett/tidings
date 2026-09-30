@@ -34,7 +34,7 @@ ones, depend on [`etcetera`](https://docs.rs/etcetera) (or anything else) yourse
 gives. Here config is on the filesystem, where people can edit it, and data is in SQLite, which has
 Snapshots:
 
-```rust
+```rust,no_run
 use etcetera::{AppStrategy, AppStrategyArgs, choose_app_strategy};
 use tidings::{FeedItem, FsOptions, SqliteOptions, Staging, Store};
 
@@ -80,11 +80,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - **Any Location may vanish,** as a cache's does when the OS clears it. That isn't an error: the
   Store makes it again, and sends a resync on its change feed. So a cache is just another Store.
 - **The same Location can be opened twice,** on the same Backend, by two processes or within one.
-  Each Store sees the other's commits as external changes.
-- **On macOS, `etcetera`'s native strategy (`choose_native_strategy`) gives the same directory for
-  config and data.** Opening both there opens one Location twice: on the same Backend, two Stores
-  over the same Files; on different Backends, `Error::WrongBackend` for the second. Join a name of
-  your own to each, or use `choose_app_strategy`, which follows XDG on macOS.
+  Each Store sees the other's commits as external changes. On the other Backend, opening it is
+  refused with `Error::WrongBackend`. So if two of your Stores could be given the same directory,
+  join a name of your own to each.
 - **Stores don't nest.** Opening a Store inside another Store's Location, or inside a Working copy,
   is refused with `Error::NestedLocation`, naming the directory it is inside, found with symlinks
   resolved. Opening one at a Working copy's folder is refused with `Error::LocationIsWorkingCopy`.
@@ -93,8 +91,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   It belongs to another Store or to a Working copy. Like a symlinked directory, it and everything
   under it isn't listed, read or watched, and writing under it is refused as an invalid Path
   (`InvalidPathReason::Nested`). One made while the Store is open drops out, with a `Removed`
-  change for each of its Files, which come back if its `.tidings/` goes.
-  SQLite has no such directories: its Files are all in its database.
+  change for each of its Files, which come back if its `.tidings/` goes. SQLite has no such
+  directories: its Files are all in its database.
 
 ## The `tidings` command
 
@@ -413,9 +411,9 @@ Ways you could lose data or see confusing behaviour, and why.
   before the store opened: FSEvents can report a recent creation again, or late. *Why:* avoiding
   it means reading every file when the store opens, and they can be large.
   - On macOS, a Location removed while the store runs can give a second resync a moment after the
-    first. *Why:* FSEvents can report the removal, and the directory made again, late;
-    taking the directory still there for proof that nothing was missed would be wrong if it had
-    been moved away and back.
+    first. *Why:* FSEvents can report the removal, and the directory made again, late; taking
+    the directory still there for proof that nothing was missed would be wrong if it had been
+    moved away and back.
 
 ## Limitations
 
@@ -441,8 +439,8 @@ Each with why, where it isn't obvious.
 - **Symlinks to directories inside a Location are ignored**, with everything under them: not
   listed, read or watched. Writing under one is refused (`DirectoryLink`). *Why:* so each file
   has one path, and every directory holding files is watched.
-- **A Location can be a symlink, but it's resolved once, when the store opens.**
-  Re-pointing it later takes effect at the next open.
+- **A Location can be a symlink, but it's resolved once, when the store opens.** Re-pointing it
+  later takes effect at the next open.
 
 ### Performance
 
