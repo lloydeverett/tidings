@@ -1,4 +1,4 @@
-use crate::{Area, BackendKind, InvalidPathReason, Path};
+use crate::{BackendKind, InvalidPathReason, Path, Prefix};
 
 /// Everything that can go wrong in tidings.
 ///
@@ -32,28 +32,26 @@ pub enum Error {
     /// The Commit has happened, and its Changes are on the Change feed, but it isn't finished yet.
     /// Only the filesystem gives it, when a File can't be replaced even after trying again for a
     /// moment, as happens on Windows while another program has the File open. Reads through
-    /// tidings show the Commit already, and the next Commit to the Area, or opening a Store on it,
-    /// finishes it. Until then, every Commit to the Area first tries to finish it, and isn't made
-    /// if it still can't.
+    /// tidings show the Commit already, and the next Commit to the Store, or opening a Store on
+    /// its Location, finishes it. Until then, every Commit to the Store first tries to finish it,
+    /// and isn't made if it still can't.
     #[error("the Commit happened, but isn't finished yet")]
     Pending,
-    /// The Area belongs to another Backend: its Backend marker names `found`. Opening a Store on
-    /// the filesystem or SQLite gives it, without changing anything, for the first Area marked
-    /// for the other Backend.
-    #[error("the {area:?} Area belongs to the {found} Backend")]
+    /// The Location belongs to another Backend: its Backend marker names `found`. Opening a
+    /// Store on the filesystem or SQLite gives it, without changing anything, for a Location
+    /// marked for the other Backend.
+    #[error("the Location belongs to the {found} Backend")]
     WrongBackend {
-        /// The Area.
-        area: Area,
         /// The Backend its marker names.
         found: BackendKind,
     },
-    /// The Areas are marked for different Backends, so no Store can open them all.
-    /// [`Store::detect`](crate::Store::detect) gives it. It can happen when an Area's directory
-    /// is replaced by one another Backend made.
-    #[error("the Areas are marked for different Backends: {marked:?}")]
-    MixedBackends {
-        /// Each marked Area, in order of Area, with the Backend its marker names.
-        marked: Vec<(Area, BackendKind)>,
+    /// A Staging required a [`PrefixRevision`](crate::PrefixRevision) for `prefix` that was taken
+    /// for another Prefix, or from another Store than the one it was committed to. It could never
+    /// hold, so the Commit was refused, and nothing was written.
+    #[error("the Prefix Revision required for {prefix} was taken for another Prefix or Store")]
+    WrongPrefixRevision {
+        /// The Prefix it was required for.
+        prefix: Prefix,
     },
     /// The Store's Backend can't do this. A Snapshot on the filesystem gives it: check
     /// [`Store::supports_snapshots`](crate::Store::supports_snapshots) first.

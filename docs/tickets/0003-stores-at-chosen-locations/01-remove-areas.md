@@ -16,35 +16,35 @@ Change feed still hold one per Area. Then remove the Areas.
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `Store::open_fs` and `Store::open_sqlite` take the Location and their options, and make the
+- [x] `Store::open_fs` and `Store::open_sqlite` take the Location and their options, and make the
       Location and its parents if missing. `Store::open_memory` is unchanged. `blocking::Store`
       matches.
-- [ ] `read`, `stat`, `list`, `stat_prefix` and `snapshot` take no Area. `Staging::new()` takes
+- [x] `read`, `stat`, `list`, `stat_prefix` and `snapshot` take no Area. `Staging::new()` takes
       none, and has no `area()`. `Change` has no `area`, and `FeedItem::Resync` carries nothing.
-- [ ] `Area`, `AppIdentity`, the Root override on both options types, and `etcetera` are removed;
+- [x] `Area`, `AppIdentity`, the Root override on both options types, and `etcetera` are removed;
       neither Backend feature pulls in `etcetera`.
-- [ ] `Store::detect` takes the Location and reads its one Backend marker. `MixedBackends` is
+- [x] `Store::detect` takes the Location and reads its one Backend marker. `MixedBackends` is
       removed, and `WrongBackend` names only the Backend found. Markers otherwise follow ADR 0007
       for one Location.
-- [ ] SQLite keeps its database at `.tidings/store.sqlite3` in the Location.
-- [ ] A Prefix Revision carries the identity of the opened Store that took it. Requiring it in a
+- [x] SQLite keeps its database at `.tidings/store.sqlite3` in the Location.
+- [x] A Prefix Revision carries the identity of the opened Store that took it. Requiring it in a
       Staging committed to another Store, or for another Prefix, makes the Commit fail with an
       error instead of panicking when it is staged.
-- [ ] Each Store has its own Commit ordering and its own watch or poll task; a Commit never waits
+- [x] Each Store has its own Commit ordering and its own watch or poll task; a Commit never waits
       for another Store's. A task that stops sends one Resync.
-- [ ] Removing a Location while its Store is open gives a Resync, and the Location is made and
+- [x] Removing a Location while its Store is open gives a Resync, and the Location is made and
       marked again, on every Store on disk.
-- [ ] The behaviour suite, marker, blocking and Store-layer tests use one Store at a temporary
+- [x] The behaviour suite, marker, blocking and Store-layer tests use one Store at a temporary
       directory. New tests: two Stores at different Locations, on the same Backend and on fs and
       SQLite together, are independent in their Files, feeds and Resyncs, and a Prefix Revision
       from one is refused by a Commit to the other.
-- [ ] The CLI takes `--store <dir>` (and `TIDINGS_STORE`) in place of `--root` and `--identity`;
+- [x] The CLI takes `--store <dir>` (and `TIDINGS_STORE`) in place of `--root` and `--identity`;
       `--backend` and `--create` are unchanged, and no command takes an Area, including `sync`.
       JSON output has no `area`.
-- [ ] The Working copy record holds `store` (the absolute Location) and `backend`, and is still
+- [x] The Working copy record holds `store` (the absolute Location) and `backend`, and is still
       version 1. A record in the old shape is refused as one in an unknown format.
-- [ ] The CLI tests use `--store`, and cover `--identity` being rejected and an old-shape record
+- [x] The CLI tests use `--store`, and cover `--identity` being rejected and an old-shape record
       being refused.
-- [ ] Doc comments on every item changed here describe Stores and Locations, not Areas.
+- [x] Doc comments on every item changed here describe Stores and Locations, not Areas.

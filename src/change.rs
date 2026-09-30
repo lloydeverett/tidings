@@ -5,18 +5,15 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 
-use crate::area::PerArea;
+use crate::Path;
 use crate::backend::RawChange;
-use crate::{Area, Path};
 
-/// A notice that one Path in one Area was changed or removed, and by whom.
+/// A notice that one Path in a Store was changed or removed, and by whom.
 ///
 /// It never carries the contents: read the File again to see them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Change {
-    /// The Area the Path is in.
-    pub area: Area,
     /// The Path that changed.
     pub path: Path,
     /// Whether the File was changed or removed.
@@ -46,12 +43,12 @@ pub enum Origin {
 /// One item on the Change feed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedItem {
-    /// Every Change recorded since the last item, merged per Area and Path. The Changes of a
+    /// Every Change recorded since the last item, merged per Path. The Changes of a
     /// Commit through this Store always arrive in the same batch, and so do another Store's on
     /// SQLite, and usually on the filesystem. A batch may hold several Commits' Changes.
     Changes(Vec<Change>),
-    /// Changes to this Area may have been missed: read everything you rely on in it again.
-    Resync(Area),
+    /// Changes to the Store may have been missed: read everything you rely on in it again.
+    Resync,
 }
 
 /// The single receiver of a Store's Changes, handed over when the Store is opened.
@@ -59,7 +56,7 @@ pub enum FeedItem {
 /// There is exactly one, and no way to get another later, so every Change after the Store is
 /// opened is reported. If it is dropped, the Store keeps working and stops recording Changes.
 ///
-/// Changes wait here until they are read, merged per Area and Path: a Path changed many times
+/// Changes wait here until they are read, merged per Path: a Path changed many times
 /// before [`next`](Self::next) is called gives one Change, so falling behind never loses a Path
 /// and the memory held grows only with the number of Paths changed.
 #[derive(Debug)]
@@ -68,8 +65,8 @@ pub struct ChangeFeed {
 }
 
 impl ChangeFeed {
-    /// Waits for the next item: every Change recorded since the last one, merged per Area and
-    /// Path, in one batch. The Changes of a Commit through this Store are never split across
+    /// Waits for the next item: every Change recorded since the last one, merged per Path, in one
+    /// batch. The Changes of a Commit through this Store are never split across
     /// batches, and neither are another Store's on SQLite (on the filesystem, see
     /// `Store::open_fs`, with the `fs` feature). A batch may hold several Commits' Changes.
     ///
@@ -92,7 +89,7 @@ impl Drop for ChangeFeed {
     fn drop(&mut self) {
         let mut unread = self.shared.unread.lock().unwrap();
         unread.feed_dropped = true;
-        unread.areas = PerArea::default();
+        unread.pending = Pending::default();
     }
 }
 
@@ -105,14 +102,12 @@ struct Shared {
     recorded: Notify,
 }
 
-/// Every Change recorded and not yet read, merged. It holds at most one entry per Area and Path,
-/// however many Changes were recorded.
+/// Every Change recorded and not yet read, merged. It holds at most one entry per Path, however
+/// many Changes were recorded.
 #[derive(Debug, Default)]
 struct Unread {
-    /// What is unread for each Area. Kept per Area so that a Resync, which covers a whole Area,
-    /// can take the place of that Area's unread Changes: the app reads the whole Area again after
-    /// it anyway.
-    areas: PerArea<UnreadInArea>,
+    /// What is unread.
+    pending: Pending,
     /// Every Store handle has been dropped: once what is unread has been read, the Change feed
     /// ends.
     store_dropped: bool,
@@ -120,19 +115,19 @@ struct Unread {
     feed_dropped: bool,
 }
 
-/// What is unread for one Area.
+/// What is unread.
 #[derive(Debug)]
-enum UnreadInArea {
+enum Pending {
     /// The merged Changes to each Path.
     Changes(BTreeMap<Path, Merged>),
-    /// A Resync. It took the place of the Area's unread Changes, and Changes recorded for the
-    /// Area until it is read add nothing to it: reading the Area again after it covers them.
+    /// A Resync. It took the place of the unread Changes, and Changes recorded until it is read
+    /// add nothing to it: reading the Store again after it covers them.
     Resync,
 }
 
-impl Default for UnreadInArea {
-    fn default() -> UnreadInArea {
-        UnreadInArea::Changes(BTreeMap::new())
+impl Default for Pending {
+    fn default() -> Pending {
+        Pending::Changes(BTreeMap::new())
     }
 }
 
@@ -157,11 +152,11 @@ enum Next {
 }
 
 impl Unread {
-    fn record(&mut self, area: Area, changes: Vec<RawChange>, origin: Origin) {
+    fn record(&mut self, changes: Vec<RawChange>, origin: Origin) {
         if self.store_dropped || self.feed_dropped {
             return;
         }
-        let UnreadInArea::Changes(merged) = self.areas.get_mut(area) else {
+        let Pending::Changes(merged) = &mut self.pending else {
             return;
         };
         for RawChange { path, kind } in changes {
@@ -173,42 +168,28 @@ impl Unread {
         }
     }
 
-    fn resync(&mut self, area: Area) {
+    fn resync(&mut self) {
         if self.store_dropped || self.feed_dropped {
             return;
         }
-        *self.areas.get_mut(area) = UnreadInArea::Resync;
+        self.pending = Pending::Resync;
     }
 
-    /// Resyncs first, one Area at a time, then a batch of every other Area's Changes.
+    /// A Resync, or else a batch of every unread Change.
     fn next(&mut self) -> Next {
-        for (area, unread) in self.areas.iter_mut() {
-            if let UnreadInArea::Resync = unread {
-                *unread = UnreadInArea::default();
-                return Next::Item(FeedItem::Resync(area));
+        match std::mem::take(&mut self.pending) {
+            Pending::Resync => Next::Item(FeedItem::Resync),
+            Pending::Changes(merged) if !merged.is_empty() => {
+                let batch = merged.into_iter().map(|(path, Merged { kind, origin })| Change {
+                    path,
+                    kind,
+                    origin,
+                });
+                Next::Item(FeedItem::Changes(batch.collect()))
             }
+            Pending::Changes(_) if self.store_dropped => Next::Ended,
+            Pending::Changes(_) => Next::Wait,
         }
-        match self.take() {
-            Some(batch) => Next::Item(FeedItem::Changes(batch)),
-            None if self.store_dropped => Next::Ended,
-            None => Next::Wait,
-        }
-    }
-
-    /// Every unread Change, as one batch, or `None` if there is none.
-    fn take(&mut self) -> Option<Vec<Change>> {
-        let mut batch = Vec::new();
-        for (area, unread) in self.areas.iter_mut() {
-            let UnreadInArea::Changes(merged) = unread else { continue };
-            let changes = std::mem::take(merged).into_iter();
-            batch.extend(changes.map(|(path, Merged { kind, origin })| Change {
-                area,
-                path,
-                kind,
-                origin,
-            }));
-        }
-        (!batch.is_empty()).then_some(batch)
     }
 }
 
@@ -220,24 +201,23 @@ pub(crate) struct FeedSender {
 }
 
 impl FeedSender {
-    /// Records `changes` to `area`, all made by `origin`, merging them into what is unread. They
-    /// are recorded all at once, so that a Commit's Changes reach the Change feed in the same
-    /// batch.
+    /// Records `changes`, all made by `origin`, merging them into what is unread. They are
+    /// recorded all at once, so that a Commit's Changes reach the Change feed in the same batch.
     ///
     /// This is where every Change enters the feed, local or external: the Store layer tags each
     /// raw change with its Origin and records it here.
-    pub(crate) fn record(&self, area: Area, changes: Vec<RawChange>, origin: Origin) {
+    pub(crate) fn record(&self, changes: Vec<RawChange>, origin: Origin) {
         if changes.is_empty() {
             return;
         }
-        self.shared.unread.lock().unwrap().record(area, changes, origin);
+        self.shared.unread.lock().unwrap().record(changes, origin);
         self.shared.recorded.notify_one();
     }
 
-    /// Records that Changes to `area` may have been missed. The Resync takes the place of the
-    /// Area's unread Changes, and those recorded for it until the Resync is read.
-    pub(crate) fn resync(&self, area: Area) {
-        self.shared.unread.lock().unwrap().resync(area);
+    /// Records that Changes may have been missed. The Resync takes the place of the unread
+    /// Changes, and those recorded until the Resync is read.
+    pub(crate) fn resync(&self) {
+        self.shared.unread.lock().unwrap().resync();
         self.shared.recorded.notify_one();
     }
 

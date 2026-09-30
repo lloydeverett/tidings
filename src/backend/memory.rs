@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use super::{AreaState, CommitOutcome, CommitRequest, Planned};
+use super::{CommitOutcome, CommitRequest, Planned, StoreState};
 use crate::path::{letter_case_fold, range_under};
 use crate::staging::has_name;
 use crate::{File, Path, Prefix, Result, Revision, Stat};
@@ -121,7 +121,7 @@ fn list(files: &Files, prefix: &Prefix) -> Vec<Path> {
     files.keys().filter(|path| prefix.covers(path)).cloned().collect()
 }
 
-impl AreaState for Held {
+impl StoreState for Held {
     fn revision(&self, path: &Path) -> Result<Option<Revision>> {
         Ok(self.files.get(path).map(|stored| stored.stat.revision()))
     }

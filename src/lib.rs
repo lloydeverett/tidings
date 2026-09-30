@@ -1,16 +1,14 @@
-//! Text files for an application, in three Areas (config, data and cache), held by a Backend: the
-//! filesystem, SQLite or memory. Writes happen only through all-or-nothing Commits of a
-//! [`Staging`], and every Change is announced on the Store's [`ChangeFeed`].
+//! Text files for an application, in as many Stores as it wants, each in a directory it chooses,
+//! held by the Backend it chooses: the filesystem, SQLite or memory. Writes happen only through
+//! all-or-nothing Commits of a [`Staging`], and every Change is announced on the Store's
+//! [`ChangeFeed`].
 //!
 //! The [`Store`] is async, on tokio. With the `blocking` feature, `blocking::Store` offers the
 //! same for synchronous code.
 //!
-//! The terms used throughout (Store, Area, Path, Staging, Commit, Change...) are defined in the
+//! The terms used throughout (Store, Location, Path, Staging, Commit, Change...) are defined in the
 //! crate's `CONTEXT.md`.
 
-#[cfg(any(feature = "fs", feature = "sqlite"))]
-mod app;
-mod area;
 mod backend;
 #[cfg(feature = "blocking")]
 pub mod blocking;
@@ -26,9 +24,6 @@ mod snapshot;
 mod staging;
 mod store;
 
-#[cfg(any(feature = "fs", feature = "sqlite"))]
-pub use app::AppIdentity;
-pub use area::Area;
 pub use backend::BackendKind;
 #[cfg(feature = "fs")]
 pub use backend::fs::FsOptions;

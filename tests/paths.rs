@@ -131,7 +131,7 @@ fn refused_paths_name_the_rule_they_break() {
 
 /// Prefixes that are allowed or refused because of what a Prefix is, beyond the rules for Paths.
 const PREFIXES: &[(&str, Option<InvalidPathReason>)] = &[
-    // The empty Prefix: the whole Area.
+    // The empty Prefix: the whole Store.
     ("", None),
     ("themes/", None),
     ("notes/2026/", None),

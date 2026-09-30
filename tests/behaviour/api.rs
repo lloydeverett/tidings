@@ -9,8 +9,7 @@ use std::time::Duration;
 
 use tidings::blocking::TimedOut;
 use tidings::{
-    Area, Committed, FeedItem, File, IntoPath, IntoPrefix, Path, PrefixRevision, Result, Staging,
-    Stat,
+    Committed, FeedItem, File, IntoPath, IntoPrefix, Path, PrefixRevision, Result, Staging, Stat,
 };
 use tokio::runtime::{Handle, RuntimeFlavor};
 
@@ -38,35 +37,31 @@ pub enum ChangeFeed {
 }
 
 impl Store {
-    pub async fn read(&self, area: Area, path: impl IntoPath + Send) -> Result<Option<File>> {
+    pub async fn read(&self, path: impl IntoPath + Send) -> Result<Option<File>> {
         match self {
-            Store::Async(store) => store.read(area, path).await,
-            Store::Blocking(store) => call_blocking(|| store.read(area, path)),
+            Store::Async(store) => store.read(path).await,
+            Store::Blocking(store) => call_blocking(|| store.read(path)),
         }
     }
 
-    pub async fn stat(&self, area: Area, path: impl IntoPath + Send) -> Result<Option<Stat>> {
+    pub async fn stat(&self, path: impl IntoPath + Send) -> Result<Option<Stat>> {
         match self {
-            Store::Async(store) => store.stat(area, path).await,
-            Store::Blocking(store) => call_blocking(|| store.stat(area, path)),
+            Store::Async(store) => store.stat(path).await,
+            Store::Blocking(store) => call_blocking(|| store.stat(path)),
         }
     }
 
-    pub async fn list(&self, area: Area, prefix: impl IntoPrefix + Send) -> Result<Vec<Path>> {
+    pub async fn list(&self, prefix: impl IntoPrefix + Send) -> Result<Vec<Path>> {
         match self {
-            Store::Async(store) => store.list(area, prefix).await,
-            Store::Blocking(store) => call_blocking(|| store.list(area, prefix)),
+            Store::Async(store) => store.list(prefix).await,
+            Store::Blocking(store) => call_blocking(|| store.list(prefix)),
         }
     }
 
-    pub async fn stat_prefix(
-        &self,
-        area: Area,
-        prefix: impl IntoPrefix + Send,
-    ) -> Result<PrefixRevision> {
+    pub async fn stat_prefix(&self, prefix: impl IntoPrefix + Send) -> Result<PrefixRevision> {
         match self {
-            Store::Async(store) => store.stat_prefix(area, prefix).await,
-            Store::Blocking(store) => call_blocking(|| store.stat_prefix(area, prefix)),
+            Store::Async(store) => store.stat_prefix(prefix).await,
+            Store::Blocking(store) => call_blocking(|| store.stat_prefix(prefix)),
         }
     }
 
@@ -77,11 +72,11 @@ impl Store {
         }
     }
 
-    pub async fn snapshot(&self, area: Area) -> Result<Snapshot> {
+    pub async fn snapshot(&self) -> Result<Snapshot> {
         match self {
-            Store::Async(store) => store.snapshot(area).await.map(Snapshot::Async),
+            Store::Async(store) => store.snapshot().await.map(Snapshot::Async),
             Store::Blocking(store) => {
-                let snapshot = call_blocking(|| store.snapshot(area))?;
+                let snapshot = call_blocking(|| store.snapshot())?;
                 Ok(Snapshot::Blocking(snapshot))
             }
         }

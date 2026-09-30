@@ -1,4 +1,5 @@
-//! Running the `tidings` binary, as a person or a script would, against a temporary Root override.
+//! Running the `tidings` binary, as a person or a script would, against a Store at a temporary
+//! Location.
 #![allow(dead_code)]
 
 use std::io::{BufRead, BufReader, Write};
@@ -34,61 +35,61 @@ impl Run {
     }
 }
 
-/// A temporary directory holding a Store, which each run is pointed at with `--root`.
+/// A temporary directory that is a Store's Location, which each run is pointed at with `--store`.
 pub struct Location {
     directory: TempDir,
 }
 
 impl Location {
-    /// An empty location, with no Store in it yet.
+    /// An empty Location, with no Store in it yet.
     pub fn empty() -> Location {
         Location { directory: tempfile::tempdir().unwrap() }
     }
 
-    /// A location holding a new Store on `backend` (`fs` or `sqlite`).
+    /// A Location holding a new Store on `backend` (`fs` or `sqlite`).
     pub fn with_store(backend: &str) -> Location {
         let location = Location::empty();
-        location.run(&["--backend", backend, "--create", "store", "list", "data"]).expect_success();
+        location.run(&["--backend", backend, "--create", "store", "list"]).expect_success();
         location
     }
 
-    /// The directory the Store's Areas are in.
-    pub fn root(&self) -> &Path {
+    /// The Store's Location.
+    pub fn store(&self) -> &Path {
         self.directory.path()
     }
 
-    /// `tidings --root <root> <args>`, with nothing on stdin.
+    /// `tidings --store <location> <args>`, with nothing on stdin.
     pub fn run(&self, args: &[&str]) -> Run {
         self.run_with_stdin(args, "")
     }
 
-    /// `tidings --root <root> <args>`, with `stdin` on stdin.
+    /// `tidings --store <location> <args>`, with `stdin` on stdin.
     pub fn run_with_stdin(&self, args: &[&str], stdin: &str) -> Run {
         run(self.command(args), stdin)
     }
 
-    /// The command for `tidings --root <root> <args>`, to add to.
+    /// The command for `tidings --store <location> <args>`, to add to.
     pub fn command(&self, args: &[&str]) -> Command {
         let mut command = tidings();
-        command.arg("--root").arg(self.root()).args(args);
+        command.arg("--store").arg(self.store()).args(args);
         command
     }
 
-    /// Writes `contents` to `path` in `area`, failing the test if it can't.
-    pub fn write(&self, area: &str, path: &str, contents: &str) {
-        self.run(&["store", "write", area, path, "--contents", contents]).expect_success();
+    /// Writes `contents` to `path`, failing the test if it can't.
+    pub fn write(&self, path: &str, contents: &str) {
+        self.run(&["store", "write", path, "--contents", contents]).expect_success();
     }
 
-    /// Reads `path` in `area`, failing the test if it can't.
-    pub fn read(&self, area: &str, path: &str) -> String {
-        self.run(&["store", "read", area, path]).expect_success().stdout
+    /// Reads `path`, failing the test if it can't.
+    pub fn read(&self, path: &str) -> String {
+        self.run(&["store", "read", path]).expect_success().stdout
     }
 }
 
 /// The `tidings` command, with none of the environment variables it reads set.
 pub fn tidings() -> Command {
     let mut command = Command::new(binary());
-    for variable in ["TIDINGS_ROOT", "TIDINGS_IDENTITY", "TIDINGS_BACKEND", "VISUAL", "EDITOR"] {
+    for variable in ["TIDINGS_STORE", "TIDINGS_BACKEND", "VISUAL", "EDITOR"] {
         command.env_remove(variable);
     }
     command
@@ -144,16 +145,16 @@ pub struct Sync {
 }
 
 impl Sync {
-    /// Starts `tidings --root <root> --json sync <area> <folder>`.
-    pub fn start(location: &Location, area: &str, folder: &Path) -> Sync {
-        Sync::start_with(&["--root", location.root().to_str().unwrap()], area, folder)
+    /// Starts `tidings --store <location> --json sync <folder>`.
+    pub fn start(location: &Location, folder: &Path) -> Sync {
+        Sync::start_with(&["--store", location.store().to_str().unwrap()], folder)
     }
 
-    /// Starts `tidings <flags> --json sync <area> <folder>`, as for a Working copy that knows its
-    /// Store when `flags` is empty.
-    pub fn start_with(flags: &[&str], area: &str, folder: &Path) -> Sync {
+    /// Starts `tidings <flags> --json sync <folder>`, as for a Working copy that knows its Store
+    /// when `flags` is empty.
+    pub fn start_with(flags: &[&str], folder: &Path) -> Sync {
         let mut command = tidings();
-        command.args(flags).args(["--json", "sync", area]).arg(folder);
+        command.args(flags).args(["--json", "sync"]).arg(folder);
         Sync::spawn(command)
     }
 

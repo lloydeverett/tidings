@@ -4,8 +4,8 @@
 //! [`Store`] mirrors the async [`crate::Store`], with the same operations and behaviour, and
 //! waits for each to finish. It runs the async Store on an internal tokio runtime of its own, as
 //! `reqwest::blocking` does. That runtime keeps running between calls, so what the Store follows
-//! in the background (other Stores' Commits on SQLite, edits in the Areas' directories on the
-//! filesystem) keeps reaching the Change feed while the app isn't calling it. The runtime stops
+//! in the background (other Stores' Commits on SQLite, edits in the Location on the filesystem)
+//! keeps reaching the Change feed while the app isn't calling it. The runtime stops
 //! once the Store, every Snapshot taken from it and its Change feed have all been dropped.
 //!
 //! Every method that waits panics if it is called where blocking would stall a tokio runtime or
@@ -15,25 +15,26 @@
 //! `panic = "abort"`, the process ends with tokio's own message instead, located in tokio.)
 
 use std::panic::{self, AssertUnwindSafe};
+#[cfg(any(feature = "fs", feature = "sqlite"))]
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::runtime::Handle;
 
+#[cfg(any(feature = "fs", feature = "sqlite"))]
+use crate::BackendKind;
 #[cfg(feature = "testing")]
 use crate::ChangeKind;
 #[cfg(feature = "fs")]
 use crate::FsOptions;
 #[cfg(feature = "sqlite")]
 use crate::SqliteOptions;
-#[cfg(any(feature = "fs", feature = "sqlite"))]
-use crate::{AppIdentity, BackendKind};
 use crate::{
-    Area, Committed, FeedItem, File, IntoPath, IntoPrefix, Path, PrefixRevision, Result, Staging,
-    Stat,
+    Committed, FeedItem, File, IntoPath, IntoPrefix, Path, PrefixRevision, Result, Staging, Stat,
 };
 
-/// What an application opens to reach its Files, for synchronous code: the async
+/// What an application opens to reach one set of Files, for synchronous code: the async
 /// [`Store`](crate::Store)'s operations, each waited for.
 ///
 /// A cheap handle that can be shared between threads: clones share the same Files and the same
@@ -45,7 +46,7 @@ pub struct Store {
     runtime: Arc<SharedRuntime>,
 }
 
-/// A view of one Area as it stood when it was taken, from [`Store::snapshot`]: the async
+/// A view of a Store as it stood when it was taken, from [`Store::snapshot`]: the async
 /// [`Snapshot`](crate::Snapshot)'s operations, each waited for.
 ///
 /// Like the async one, it doesn't keep the Store open: the Change feed still ends once every
@@ -88,9 +89,9 @@ impl Store {
         Store::opened(crate::Store::open_memory(), runtime)
     }
 
-    /// Opens a Store that keeps each Area in a directory, as [`crate::Store::open_fs`] does,
-    /// with the same options and errors. The Areas' directories are watched while the app isn't
-    /// calling the Store too.
+    /// Opens a Store that keeps its Files in the directory `location`, as
+    /// [`crate::Store::open_fs`] does, with the same options and errors. The Location is watched
+    /// while the app isn't calling the Store too.
     ///
     /// # Panics
     ///
@@ -98,13 +99,16 @@ impl Store {
     /// can't be started.
     #[cfg(feature = "fs")]
     #[track_caller]
-    pub fn open_fs(app: &AppIdentity, options: FsOptions) -> Result<(Store, ChangeFeed)> {
+    pub fn open_fs(
+        location: impl Into<PathBuf>,
+        options: FsOptions,
+    ) -> Result<(Store, ChangeFeed)> {
         let runtime = SharedRuntime::start();
-        let opened = runtime.block_on(crate::Store::open_fs(app, options))?;
+        let opened = runtime.block_on(crate::Store::open_fs(location, options))?;
         Ok(Store::opened(opened, runtime))
     }
 
-    /// Opens a Store that keeps each Area in a SQLite database, as
+    /// Opens a Store that keeps its Files in a SQLite database in the directory `location`, as
     /// [`crate::Store::open_sqlite`] does, with the same options and errors. Other Stores'
     /// Commits are checked for while the app isn't calling the Store too.
     ///
@@ -114,21 +118,21 @@ impl Store {
     /// can't be started.
     #[cfg(feature = "sqlite")]
     #[track_caller]
-    pub fn open_sqlite(app: &AppIdentity, options: SqliteOptions) -> Result<(Store, ChangeFeed)> {
+    pub fn open_sqlite(
+        location: impl Into<PathBuf>,
+        options: SqliteOptions,
+    ) -> Result<(Store, ChangeFeed)> {
         let runtime = SharedRuntime::start();
-        let opened = runtime.block_on(crate::Store::open_sqlite(app, options))?;
+        let opened = runtime.block_on(crate::Store::open_sqlite(location, options))?;
         Ok(Store::opened(opened, runtime))
     }
 
-    /// Finds which Backend holds the Store for `app`, or the one under `root_override`, as
+    /// Finds which Backend holds the Store at the directory `location`, as
     /// [`crate::Store::detect`] does, with the same errors. It needs no runtime, and can be called
     /// anywhere.
     #[cfg(any(feature = "fs", feature = "sqlite"))]
-    pub fn detect(
-        app: &AppIdentity,
-        root_override: Option<&std::path::Path>,
-    ) -> Result<Option<BackendKind>> {
-        crate::backend::marker::detect(&app.area_directories(root_override)?)
+    pub fn detect(location: impl Into<PathBuf>) -> Result<Option<BackendKind>> {
+        crate::backend::marker::detect(&location.into())
     }
 
     /// The blocking Store and Change feed for an async Store and its feed, opened on `runtime`.
@@ -140,46 +144,46 @@ impl Store {
         (Store { store, runtime }, feed)
     }
 
-    /// Reads the File at `path` in `area`, as [`crate::Store::read`] does.
+    /// Reads the File at `path`, as [`crate::Store::read`] does.
     ///
     /// # Panics
     ///
     /// If it is called in an async task, or a runtime's `block_on`.
     #[track_caller]
-    pub fn read(&self, area: Area, path: impl IntoPath) -> Result<Option<File>> {
-        self.runtime.block_on(self.store.read(area, path))
+    pub fn read(&self, path: impl IntoPath) -> Result<Option<File>> {
+        self.runtime.block_on(self.store.read(path))
     }
 
-    /// Gives when the File at `path` in `area` was last modified and its Revision, as
+    /// Gives when the File at `path` was last modified and its Revision, as
     /// [`crate::Store::stat`] does.
     ///
     /// # Panics
     ///
     /// If it is called in an async task, or a runtime's `block_on`.
     #[track_caller]
-    pub fn stat(&self, area: Area, path: impl IntoPath) -> Result<Option<Stat>> {
-        self.runtime.block_on(self.store.stat(area, path))
+    pub fn stat(&self, path: impl IntoPath) -> Result<Option<Stat>> {
+        self.runtime.block_on(self.store.stat(path))
     }
 
-    /// Lists the Paths of the Files under `prefix` in `area`, as [`crate::Store::list`] does.
+    /// Lists the Paths of the Files under `prefix`, as [`crate::Store::list`] does.
     ///
     /// # Panics
     ///
     /// If it is called in an async task, or a runtime's `block_on`.
     #[track_caller]
-    pub fn list(&self, area: Area, prefix: impl IntoPrefix) -> Result<Vec<Path>> {
-        self.runtime.block_on(self.store.list(area, prefix))
+    pub fn list(&self, prefix: impl IntoPrefix) -> Result<Vec<Path>> {
+        self.runtime.block_on(self.store.list(prefix))
     }
 
-    /// Gives the Prefix Revision of everything under `prefix` in `area`, as
+    /// Gives the Prefix Revision of everything under `prefix`, as
     /// [`crate::Store::stat_prefix`] does.
     ///
     /// # Panics
     ///
     /// If it is called in an async task, or a runtime's `block_on`.
     #[track_caller]
-    pub fn stat_prefix(&self, area: Area, prefix: impl IntoPrefix) -> Result<PrefixRevision> {
-        self.runtime.block_on(self.store.stat_prefix(area, prefix))
+    pub fn stat_prefix(&self, prefix: impl IntoPrefix) -> Result<PrefixRevision> {
+        self.runtime.block_on(self.store.stat_prefix(prefix))
     }
 
     /// Whether this Store's Backend provides Snapshots, as
@@ -188,14 +192,14 @@ impl Store {
         self.store.supports_snapshots()
     }
 
-    /// Takes a [`Snapshot`] of `area`, as [`crate::Store::snapshot`] does.
+    /// Takes a [`Snapshot`] of the Store, as [`crate::Store::snapshot`] does.
     ///
     /// # Panics
     ///
     /// If it is called in an async task, or a runtime's `block_on`.
     #[track_caller]
-    pub fn snapshot(&self, area: Area) -> Result<Snapshot> {
-        let snapshot = self.runtime.block_on(self.store.snapshot(area))?;
+    pub fn snapshot(&self) -> Result<Snapshot> {
+        let snapshot = self.runtime.block_on(self.store.snapshot())?;
         Ok(Snapshot { snapshot, runtime: Arc::clone(&self.runtime) })
     }
 
@@ -214,13 +218,8 @@ impl Store {
     /// [`crate::Store::inject_external_change`] does. For tidings' own tests. It doesn't wait, so
     /// it can be called anywhere.
     #[cfg(feature = "testing")]
-    pub fn inject_external_change(
-        &self,
-        area: Area,
-        path: impl IntoPath,
-        kind: ChangeKind,
-    ) -> Result<()> {
-        self.store.inject_external_change(area, path, kind)
+    pub fn inject_external_change(&self, path: impl IntoPath, kind: ChangeKind) -> Result<()> {
+        self.store.inject_external_change(path, kind)
     }
 }
 
@@ -276,8 +275,8 @@ impl ChangeFeed {
 impl Iterator for ChangeFeed {
     type Item = FeedItem;
 
-    /// Waits for the next item: every Change recorded since the last one, merged per Area and
-    /// Path, in one batch, as [`crate::ChangeFeed::next`] gives it. Gives `None` once every
+    /// Waits for the next item: every Change recorded since the last one, merged per Path, in one
+    /// batch, as [`crate::ChangeFeed::next`] gives it. Gives `None` once every
     /// handle to the Store has been dropped and everything recorded before has been read.
     ///
     /// # Panics

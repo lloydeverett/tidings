@@ -4,9 +4,9 @@ use std::fmt;
 use std::process::ExitCode;
 
 use serde_json::{Value, json};
-use tidings::{Area, Path};
+use tidings::Path;
 
-use crate::output::{EventParts, Subject, area_name};
+use crate::output::{EventParts, Subject};
 use crate::working_copy::{Blocked, DivergedPath, Reconciled, Unfit};
 
 /// A command that failed: what to tell the person, and the exit code.
@@ -100,9 +100,9 @@ impl Failure {
         }
     }
 
-    /// There is no File at `path` in `area`.
-    pub fn missing(area: Area, path: &str) -> Failure {
-        let message = format!("no File at {} {path}", area_name(area));
+    /// There is no File at `path`.
+    pub fn missing(path: &str) -> Failure {
+        let message = format!("no File at {path}");
         Failure { kind: FailureKind::Missing, message, outcomes: None }
     }
 

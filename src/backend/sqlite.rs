@@ -1,19 +1,19 @@
-//! The SQLite Backend: one database per Area, in WAL mode, in the `.tidings/` directory in the
-//! Area's directory, where the Area's Backend marker is. So nothing SQLite keeps there shows to
-//! someone looking at the Area's directory as if it held Files.
+//! The SQLite Backend: one database, in WAL mode, `store.sqlite3` in the `.tidings/` directory in
+//! the Location, where the Location's Backend marker is. So nothing SQLite keeps there shows to
+//! someone looking at the Location as if it held Files.
 //!
-//! Each database has a `files` table holding each File's Path, the Path's letter-case fold, its
+//! The database has a `files` table holding each File's Path, the Path's letter-case fold, its
 //! contents, when it was last modified and its Revision. A Commit is one write transaction, begun
 //! with `BEGIN IMMEDIATE` so that it holds the database's write lock from the start. Inside it,
 //! the rules every Backend shares ([`CommitRequest::plan`]) work out what the Commit changes,
-//! reading the Area through the same transaction, before anything is written. The fold is
+//! reading the Files through the same transaction, before anything is written. The fold is
 //! indexed, so the letter-case check looks up only the names a Commit writes.
 //!
 //! Each Commit that changes something is also appended to the database's change log, in the same
 //! transaction: the Store instance that made it, and each Path it changed or removed. That is how
-//! a Store sees the Commits other Stores make to the same databases, which may be in other
+//! a Store sees the Commits other Stores make to the same database, which may be in other
 //! processes:
-//! - **Polling.** Every poll interval, the Store checks each database's `data_version`, which
+//! - **Polling.** Every poll interval, the Store checks the database's `data_version`, which
 //!   changes when another connection commits to it, and if it changed, reads the log since the
 //!   last Commit it recorded.
 //! - **Committing.** A Commit first reads the log since then too, inside its write transaction. So
@@ -26,14 +26,20 @@
 //! - **Pruning.** Each Commit removes the Commits in the log that are older than the retention
 //!   (10 minutes, by their timestamps, so by the wall clock), and records how far the log was
 //!   pruned. A Store that finds it was pruned past the last Commit it read has missed Changes, and
-//!   sends a Resync for the Area. That happens to a Store that stopped for longer than the
-//!   retention while others committed, and to Stores that haven't read the latest Commits when
-//!   the wall clock jumps forward by more than it. Either way the Resync is true, and the log
-//!   stays small without keeping track of which Stores are open.
+//!   sends a Resync. That happens to a Store that stopped for longer than the retention while
+//!   others committed, and to Stores that haven't read the latest Commits when the wall clock jumps
+//!   forward by more than it. Either way the Resync is true, and the log stays small without
+//!   keeping track of which Stores are open.
 //!
-//! The Store reads and commits through one connection per Area. A Snapshot is a read transaction
-//! on a connection of its own, which in WAL mode neither waits for Commits nor holds them up.
-//! Every call into SQLite blocks, so each runs on tokio's blocking threads.
+//! **A Location removed.** The database is open, so a Store would go on reading and committing to
+//! it after someone removed the Location, and no other Store would see that. So each poll, and
+//! each Commit, first checks that the database at its place in the Location is the one the Store
+//! has open. If it isn't, the Store makes the Location, marks it and makes the database again, as
+//! opening does, and sends a Resync: what the old database held is gone.
+//!
+//! The Store reads and commits through one connection. A Snapshot is a read transaction on a
+//! connection of its own, which in WAL mode neither waits for Commits nor holds them up. Every
+//! call into SQLite blocks, so each runs on tokio's blocking threads.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -42,18 +48,18 @@ use std::time::Duration;
 use jiff::Timestamp;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
 
-use super::{AreaState, CommitOutcome, CommitRequest, Observed, Planned, RawChange, off_runtime};
+use super::{
+    CommitOutcome, CommitRequest, Observed, Planned, RawChange, StoreState, marker, off_runtime,
+};
 use crate::path::{RESERVED, letter_case_fold, letter_case_fold_unicode_versions, range_under};
-use crate::{Area, ChangeKind, Error, File, Origin, Path, Prefix, Result, Revision, Stat};
+use crate::{BackendKind, ChangeKind, Error, File, Origin, Path, Prefix, Result, Revision, Stat};
 
 /// How to open a Store on SQLite, with [`Store::open_sqlite`](crate::Store::open_sqlite).
 ///
-/// `SqliteOptions::default()` puts each Area's database in the platform's standard directory for
-/// the app, and checks for other processes' Commits every 100 ms.
+/// `SqliteOptions::default()` checks for other processes' Commits every 100 ms.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct SqliteOptions {
-    pub(crate) root_override: Option<PathBuf>,
     poll_interval: Duration,
     change_log_retention: Duration,
 }
@@ -61,7 +67,6 @@ pub struct SqliteOptions {
 impl Default for SqliteOptions {
     fn default() -> SqliteOptions {
         SqliteOptions {
-            root_override: None,
             poll_interval: Duration::from_millis(100),
             change_log_retention: Duration::from_secs(10 * 60),
         }
@@ -69,14 +74,6 @@ impl Default for SqliteOptions {
 }
 
 impl SqliteOptions {
-    /// A Root override: the Areas go in `config`, `data` and `cache` directories under `root`,
-    /// instead of the standard directories the App identity picks. It is an override, for tests
-    /// and unusual installations: apps normally leave it unset.
-    pub fn root_override(mut self, root: impl Into<PathBuf>) -> SqliteOptions {
-        self.root_override = Some(root.into());
-        self
-    }
-
     /// How often the Store checks for Commits that other processes made to its databases, which
     /// arrive on its Change feed as external Changes. A shorter interval reports them sooner, and
     /// wakes the Store more often.
@@ -138,6 +135,9 @@ const MIGRATIONS: &[&str] = &[
 ",
 ];
 
+/// The database's name in the Location's `.tidings/` directory.
+const DATABASE: &str = "store.sqlite3";
+
 /// The name in `meta` of the versions of the Unicode data the folds in `files` were made with.
 const FOLD_UNICODE_VERSIONS: &str = "fold_unicode_versions";
 
@@ -154,22 +154,22 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub(crate) struct SqliteBackend {
-    /// Where the database is.
-    path: PathBuf,
     store: StoreConnection,
     /// How long Commits are kept in the change log.
     change_log_retention: Duration,
 }
 
-/// The connection the Store reads and commits through for one Area, and how far the Store has
-/// read the Area's change log. The poller shares it.
+/// The connection the Store reads and commits through, and how far the Store has read the change
+/// log. The poller shares it.
 #[derive(Debug, Clone)]
 struct StoreConnection {
-    connection: AreaConnection,
+    connection: DatabaseConnection,
     log: Arc<Mutex<LogReader>>,
+    /// The Location the database is in.
+    location: Arc<PathBuf>,
 }
 
-/// How far a Store has read an Area's change log. It is used with the Store's connection locked,
+/// How far a Store has read the change log. It is used with the Store's connection locked,
 /// and moved on under the Store layer's `commit_order` lock, which the Store holds until what was
 /// read is recorded on the Change feed.
 ///
@@ -185,6 +185,40 @@ struct LogReader {
     /// The database's `data_version` when the poller last checked it. It changes when another
     /// connection commits to the database.
     data_version: i64,
+    /// Which file the database was when the connection opened it, to tell whether it is still
+    /// there, or was removed with the Location.
+    database: Option<FileIdentity>,
+    /// Whether the database was made again, after the Location was removed, and this Store hasn't
+    /// recorded that Changes were missed yet. It is set until a read of the log succeeds, so
+    /// that a Commit that fails after making it again doesn't lose the Resync.
+    missed: bool,
+}
+
+/// Which file something on disk is: on Unix, its device and inode, and elsewhere, only that it
+/// exists, since a file that is open can't be removed there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl FileIdentity {
+    /// Which file `path` is, or `None` if there is none.
+    fn of(path: &std::path::Path) -> Option<FileIdentity> {
+        let metadata = std::fs::metadata(path).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(FileIdentity { device: metadata.dev(), inode: metadata.ino() })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            Some(FileIdentity {})
+        }
+    }
 }
 
 /// Notices the Commits other Stores make to a Store's databases, by polling them.
@@ -194,37 +228,31 @@ pub(crate) struct SqlitePoller {
     interval: Duration,
 }
 
-/// A connection to one Area's database, for async code. Each call has the connection to itself,
+/// A connection to the database, for async code. Each call has the connection to itself,
 /// on one of tokio's blocking threads.
 #[derive(Debug, Clone)]
-pub(crate) struct AreaConnection(Arc<Mutex<Connection>>);
+pub(crate) struct DatabaseConnection(Arc<Mutex<Connection>>);
 
 /// A Snapshot is a connection of its own, in a read transaction. Dropping it closes the
 /// connection, which ends the transaction.
-pub(crate) type SqliteSnapshot = AreaConnection;
+pub(crate) type SqliteSnapshot = DatabaseConnection;
 
 impl SqliteBackend {
-    /// Opens the database at `path`, creating it if it doesn't exist, and the directory it is in.
-    /// Gives the Backend, and the poller that notices other Stores' Commits from the end of the
-    /// change log as it is now.
+    /// Marks `location` for SQLite ([`marker`]), or fails if it is the filesystem's, then opens
+    /// its database, creating it and the Location if they don't exist. Gives the Backend, and the
+    /// poller that notices other Stores' Commits from the end of the change log as it is now.
     pub(crate) async fn open(
-        path: PathBuf,
+        location: PathBuf,
         options: &SqliteOptions,
     ) -> Result<(SqliteBackend, SqlitePoller)> {
-        let opened = path.clone();
-        let (connection, log) = off_runtime(move || {
-            if let Some(directory) = opened.parent() {
-                std::fs::create_dir_all(directory)
-                    .map_err(|error| super::failed(directory, error))?;
-            }
-            open_database(&opened)
-        })
-        .await?;
-        let connection = AreaConnection::new(connection);
-        let store = StoreConnection { connection, log: Arc::new(Mutex::new(log)) };
+        let opening = location.clone();
+        let (connection, log) = off_runtime(move || open_at(&opening)).await?;
+        let connection = DatabaseConnection::new(connection);
+        let log = Arc::new(Mutex::new(log));
+        let store = StoreConnection { connection, log, location: Arc::new(location) };
         let poller = SqlitePoller { store: store.clone(), interval: options.poll_interval };
         let retention = options.change_log_retention;
-        Ok((SqliteBackend { path, store, change_log_retention: retention }, poller))
+        Ok((SqliteBackend { store, change_log_retention: retention }, poller))
     }
 
     pub(crate) async fn read(&self, path: &Path) -> Result<Option<File>> {
@@ -242,12 +270,12 @@ impl SqliteBackend {
     pub(crate) async fn revisions_under(&self, prefix: &Prefix) -> Result<Vec<(Path, Revision)>> {
         let prefix = prefix.clone();
         let connection = &self.store.connection;
-        connection.call(move |connection| AreaInDatabase(connection).revisions_under(&prefix)).await
+        connection.call(move |connection| InDatabase(connection).revisions_under(&prefix)).await
     }
 
     /// Begins a read transaction on a new connection to the database.
     pub(crate) async fn snapshot(&self) -> Result<SqliteSnapshot> {
-        let path = self.path.clone();
+        let path = database_path(&self.store.location);
         off_runtime(move || {
             let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
             let connection = Connection::open_with_flags(&path, flags).map_err(Error::backend)?;
@@ -257,7 +285,7 @@ impl SqliteBackend {
                 connection.query_row("SELECT EXISTS (SELECT 1 FROM files)", [], |_| Ok(()))
             });
             begin.map_err(Error::backend)?;
-            Ok(AreaConnection::new(connection))
+            Ok(DatabaseConnection::new(connection))
         })
         .await
     }
@@ -270,7 +298,7 @@ impl SqliteBackend {
         let store = &self.store;
         let committing = move |transaction: &Connection, this_store| {
             let timestamp = request.timestamp;
-            let plan = request.plan(&AreaInDatabase(transaction))?;
+            let plan = request.plan(&InDatabase(transaction))?;
             let outcome = plan
                 .apply(|path, planned| apply(transaction, path, planned).map_err(Error::backend))?;
             if outcome.changes.is_empty() {
@@ -288,18 +316,49 @@ impl SqliteBackend {
     }
 }
 
-/// Warns that `area`, just adopted by SQLite, holds other files in `directory`, besides the
-/// `.tidings/` directory SQLite keeps everything in. SQLite never shows them as Files, so an app
-/// that expected them there, as if the Area were the filesystem's, finds it empty.
-pub(crate) fn warn_if_holding_other_files(area: Area, directory: &std::path::Path) {
-    let Ok(entries) = std::fs::read_dir(directory) else { return };
+/// Where the database of the Location `location` is.
+fn database_path(location: &std::path::Path) -> PathBuf {
+    location.join(RESERVED).join(DATABASE)
+}
+
+/// Marks `location` for SQLite, making it if it doesn't exist, and opens its database, as
+/// [`open_database`] does.
+fn open_at(location: &std::path::Path) -> Result<(Connection, LogReader)> {
+    if marker::claim(location, BackendKind::Sqlite)? {
+        warn_if_holding_other_files(location);
+    }
+    open_database(&database_path(location))
+}
+
+/// Warns that `location`, just adopted by SQLite, holds other files besides the `.tidings/`
+/// directory SQLite keeps everything in. SQLite never shows them as Files, so an app that expected
+/// them there, as if the Location were the filesystem's, finds it empty.
+fn warn_if_holding_other_files(location: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(location) else { return };
     let others = entries.flatten().any(|entry| entry.file_name() != RESERVED);
     if others {
         tracing::warn!(
-            "the {area:?} Area at {} already held files, which SQLite doesn't show as Files",
-            directory.display(),
+            "the Location {} already held files, which SQLite doesn't show as Files",
+            location.display(),
         );
     }
+}
+
+/// Opens the database again if the one `connection` has open is no longer at its place in
+/// `location`, because the Location was removed, making and marking the Location again, and
+/// replaces `connection` and `log` with the new ones, noting that Changes were missed.
+fn open_again_if_removed(
+    connection: &mut Connection,
+    log: &mut LogReader,
+    location: &std::path::Path,
+) -> Result<()> {
+    if FileIdentity::of(&database_path(location)) == log.database {
+        return Ok(());
+    }
+    tracing::debug!("the database in {} was removed, so it is made again", location.display());
+    (*connection, *log) = open_at(location)?;
+    log.missed = true;
+    Ok(())
 }
 
 impl StoreConnection {
@@ -317,18 +376,23 @@ impl StoreConnection {
         behavior: TransactionBehavior,
         and: impl FnOnce(&Connection, i64) -> Result<(T, Option<i64>)> + Send + 'static,
     ) -> Result<(Vec<Observed>, T)> {
-        let log = Arc::clone(&self.log);
+        let (log, location) = (Arc::clone(&self.log), Arc::clone(&self.location));
         self.connection
             .call(move |connection| {
+                let mut log = LogReader::lock(&log);
+                open_again_if_removed(connection, &mut log, &location)?;
                 let transaction =
                     connection.transaction_with_behavior(behavior).map_err(Error::backend)?;
-                let mut log = LogReader::lock(&log);
                 let mut seen = log.seen;
-                let observed =
+                let mut observed =
                     read_log(&transaction, log.store, &mut seen).map_err(Error::backend)?;
+                if log.missed {
+                    observed.insert(0, Observed::Missed);
+                }
                 let (made, appended) = and(&transaction, log.store)?;
                 transaction.commit().map_err(Error::backend)?;
                 log.seen = appended.unwrap_or(seen);
+                log.missed = false;
                 Ok((observed, made))
             })
             .await
@@ -343,17 +407,19 @@ impl LogReader {
 
 impl SqlitePoller {
     /// Waits for the poll interval, then gives whether another connection may have committed to
-    /// the database since the last time. A database that can't be checked gives `true`, so that
-    /// reading its log shows what is wrong.
+    /// the database since the last time, or it was removed with the Location, or made again and
+    /// that isn't recorded yet. A database that can't be checked gives `true`, so that reading
+    /// its log shows what is wrong.
     pub(crate) async fn wait(&self) -> bool {
         tokio::time::sleep(self.interval).await;
-        let StoreConnection { connection, log } = &self.store;
-        let log = Arc::clone(log);
+        let StoreConnection { connection, log, location } = &self.store;
+        let (log, database) = (Arc::clone(log), database_path(location));
         let checked = connection
             .call(move |connection| {
                 let now = data_version(connection).map_err(Error::backend)?;
                 let mut log = LogReader::lock(&log);
-                Ok(std::mem::replace(&mut log.data_version, now) != now)
+                let changed = std::mem::replace(&mut log.data_version, now) != now;
+                Ok(changed || log.missed || FileIdentity::of(&database) != log.database)
             })
             .await;
         checked.unwrap_or(true)
@@ -369,9 +435,9 @@ impl SqlitePoller {
     }
 }
 
-impl AreaConnection {
-    fn new(connection: Connection) -> AreaConnection {
-        AreaConnection(Arc::new(Mutex::new(connection)))
+impl DatabaseConnection {
+    fn new(connection: Connection) -> DatabaseConnection {
+        DatabaseConnection(Arc::new(Mutex::new(connection)))
     }
 
     pub(crate) async fn read(&self, path: &Path) -> Result<Option<File>> {
@@ -386,7 +452,7 @@ impl AreaConnection {
 
     pub(crate) async fn list(&self, prefix: &Prefix) -> Result<Vec<Path>> {
         let prefix = prefix.clone();
-        self.call(move |connection| AreaInDatabase(connection).paths_under(&prefix)).await
+        self.call(move |connection| InDatabase(connection).paths_under(&prefix)).await
     }
 
     /// Runs `call` with the connection, on a blocking thread.
@@ -426,8 +492,9 @@ fn open_database(path: &std::path::Path) -> Result<(Connection, LogReader)> {
         )));
     }
     bring_up_to_date(&transaction, version as usize).map_err(Error::backend)?;
-    let log = new_log_reader(&transaction, data_version).map_err(Error::backend)?;
+    let mut log = new_log_reader(&transaction, data_version).map_err(Error::backend)?;
     transaction.commit().map_err(Error::backend)?;
+    log.database = FileIdentity::of(path);
     Ok((connection, log))
 }
 
@@ -490,7 +557,7 @@ fn new_log_reader(connection: &Connection, data_version: i64) -> rusqlite::Resul
     let last: Option<i64> =
         connection.query_row("SELECT max(id) FROM change_log", [], |row| row.get(0))?;
     let seen = last.unwrap_or(0).max(pruned_through(connection)?);
-    Ok(LogReader { store, seen, data_version })
+    Ok(LogReader { store, seen, data_version, database: None, missed: false })
 }
 
 /// The last Commit pruned from the change log.
@@ -644,10 +711,10 @@ fn apply(connection: &Connection, path: &Path, planned: Planned) -> rusqlite::Re
     Ok(())
 }
 
-/// An Area's database as a connection sees it, inside a transaction or not.
-struct AreaInDatabase<'a>(&'a Connection);
+/// The database as a connection sees it, inside a transaction or not.
+struct InDatabase<'a>(&'a Connection);
 
-impl AreaInDatabase<'_> {
+impl InDatabase<'_> {
     /// Gives what `each` makes of every row of `sql`, which takes the parameters `params`.
     fn rows<T>(
         &self,
@@ -688,7 +755,7 @@ impl AreaInDatabase<'_> {
     }
 }
 
-impl AreaState for AreaInDatabase<'_> {
+impl StoreState for InDatabase<'_> {
     fn revision(&self, path: &Path) -> Result<Option<Revision>> {
         let mut statement = self
             .0
@@ -731,7 +798,7 @@ mod tests {
     use rusqlite::Connection;
 
     use super::FOLD_UNICODE_VERSIONS;
-    use crate::{AppIdentity, Area, Error, InvalidPathReason, SqliteOptions, Staging, Store};
+    use crate::{Error, InvalidPathReason, SqliteOptions, Staging, Store};
 
     /// New Unicode data can change how Paths fold, which leaves the folds made with the old data
     /// stale. A test can't change the Unicode data, so this stands in for it: it gives every
@@ -742,19 +809,16 @@ mod tests {
     /// make a fold stale. The spec's Testing Decisions allow it as their third exception.
     #[tokio::test]
     async fn opening_folds_again_what_was_folded_with_other_unicode_data() {
-        let root = tempfile::tempdir().unwrap();
-        let app = AppIdentity::new("tidings tests", "tidings", "org");
-        let open = async || {
-            let options = SqliteOptions::default().root_override(root.path());
-            Store::open_sqlite(&app, options).await.unwrap()
-        };
+        let location = tempfile::tempdir().unwrap();
+        let open =
+            async || Store::open_sqlite(location.path(), SqliteOptions::default()).await.unwrap();
         let (store, _feed) = open().await;
-        let mut staging = Staging::new(Area::Config);
+        let mut staging = Staging::new();
         staging.write("themes/dark.toml", "").unwrap();
         store.commit(staging).await.unwrap();
         drop(store);
 
-        let database = root.path().join("config/.tidings/config.sqlite3");
+        let database = location.path().join(".tidings/store.sqlite3");
         let database = Connection::open(database).unwrap();
         database.execute("UPDATE files SET fold = 'stale'", []).unwrap();
         let versions = "UPDATE meta SET value = 'other' WHERE name = ?1";
@@ -762,7 +826,7 @@ mod tests {
         drop(database);
 
         let (store, _feed) = open().await;
-        let mut staging = Staging::new(Area::Config);
+        let mut staging = Staging::new();
         staging.write("Themes/light.toml", "").unwrap();
         match store.commit(staging).await {
             Err(Error::InvalidPath { reason: InvalidPathReason::LetterCaseClash, .. }) => {}

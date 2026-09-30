@@ -16,7 +16,7 @@ impl File {
         File { path, contents, stat }
     }
 
-    /// The File's Path within its Area.
+    /// The File's Path within its Store.
     pub fn path(&self) -> &Path {
         &self.path
     }

@@ -1,17 +1,19 @@
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::backend::AreaState;
+use crate::backend::StoreState;
 use crate::path::letter_case_fold;
+use crate::store::StoreId;
 use crate::{
-    Area, Error, File, IntoPath, IntoPrefix, InvalidPathReason, Path, Precondition, Prefix,
+    Error, File, IntoPath, IntoPrefix, InvalidPathReason, Path, Precondition, Prefix,
     PrefixRevision, Result, Revision,
 };
 
-/// An owned set of staged writes and deletes for one Area. Nothing happens until it is committed
+/// An owned set of staged writes and deletes for one Store. Nothing happens until it is committed
 /// with [`Store::commit`](crate::Store::commit).
 ///
-/// A Staging is an ordinary value, built without the Store. Dropping it without committing
+/// A Staging is an ordinary value, built without the Store: it belongs to whichever Store it is
+/// committed to. Dropping it without committing
 /// writes nothing.
 ///
 /// A Commit can be made to depend on what was read, with a [`Precondition`] on a File it writes,
@@ -26,7 +28,6 @@ pub struct Staging {
 /// Everything a Staging holds. The Staging builds it, and the Commit hands it to the Backend.
 #[derive(Debug)]
 pub(crate) struct Staged {
-    pub(crate) area: Area,
     /// What to do to each Path. It wins over `prefix_deletes`, because anything staged under a
     /// Prefix before the Prefix delete was dropped from here.
     pub(crate) actions: BTreeMap<Path, Action>,
@@ -36,8 +37,9 @@ pub(crate) struct Staged {
     /// None is ever dropped: a later write or delete replaces the action for a Path, but not what
     /// the Staging required of it.
     preconditions: Vec<(Path, Precondition)>,
-    /// Each Prefix Revision everything under its Prefix must be unchanged since.
-    prefix_preconditions: Vec<PrefixRevision>,
+    /// Each Prefix Revision everything under its Prefix must be unchanged since, with the Prefix
+    /// it was required for.
+    prefix_preconditions: Vec<(Prefix, PrefixRevision)>,
 }
 
 /// The Revisions [`Staged::leave_out_what_changes_nothing`] gives.
@@ -57,22 +59,16 @@ pub(crate) enum Action {
 }
 
 impl Staging {
-    /// An empty Staging for `area`.
-    pub fn new(area: Area) -> Staging {
+    /// An empty Staging.
+    pub fn new() -> Staging {
         Staging {
             staged: Staged {
-                area,
                 actions: BTreeMap::new(),
                 prefix_deletes: BTreeSet::new(),
                 preconditions: Vec::new(),
                 prefix_preconditions: Vec::new(),
             },
         }
-    }
-
-    /// The Area this Staging writes to.
-    pub fn area(&self) -> Area {
-        self.staged.area
     }
 
     /// Stages writing `contents` to `path`. It replaces anything staged for the same Path before,
@@ -131,7 +127,7 @@ impl Staging {
 
     /// Stages deleting every File under `prefix`. Which Files those are is decided when the
     /// Commit is made, so it includes Files added after this call. The empty Prefix deletes
-    /// everything in the Area.
+    /// everything in the Store.
     ///
     /// It replaces anything staged under `prefix` before, apart from the Preconditions staged
     /// there, which must still hold. A write or delete under `prefix` staged after it still
@@ -164,30 +160,23 @@ impl Staging {
     }
 
     /// Requires everything under `prefix` to be unchanged since `prefix_revision`, which
-    /// [`Store::stat_prefix`](crate::Store::stat_prefix) gave for the same Area and Prefix. If a
-    /// File under `prefix` was added, removed or changed since, including Files never read, the
-    /// Commit writes nothing and fails with [`Error::Conflict`](crate::Error::Conflict), naming
-    /// those Files.
+    /// [`Store::stat_prefix`](crate::Store::stat_prefix) gave for the same Prefix, from the Store
+    /// the Staging is committed to. If a File under `prefix` was added, removed or changed since,
+    /// including Files never read, the Commit writes nothing and fails with
+    /// [`Error::Conflict`](crate::Error::Conflict), naming those Files.
+    ///
+    /// If `prefix_revision` was taken for another Prefix, or from another Store, it could never
+    /// hold: the Commit writes nothing and fails with
+    /// [`Error::WrongPrefixRevision`](crate::Error::WrongPrefixRevision).
     ///
     /// Gives [`Error::InvalidPath`](crate::Error::InvalidPath) if `prefix` is not allowed.
-    ///
-    /// # Panics
-    ///
-    /// If `prefix_revision` was taken for another Area or Prefix. It could never hold, so this is
-    /// a mistake in the app rather than a Conflict.
     pub fn require_prefix(
         &mut self,
         prefix: impl IntoPrefix,
         prefix_revision: PrefixRevision,
     ) -> Result<&mut Self> {
         let prefix = prefix.into_prefix()?;
-        let area = self.staged.area;
-        assert!(
-            prefix_revision.is_for(area, &prefix),
-            "{prefix_revision:?} can't be required for {area:?} {prefix:?}: it was taken for another \
-             Area or Prefix",
-        );
-        self.staged.prefix_preconditions.push(prefix_revision);
+        self.staged.prefix_preconditions.push((prefix, prefix_revision));
         Ok(self)
     }
 
@@ -202,7 +191,27 @@ impl Staging {
     }
 }
 
+impl Default for Staging {
+    fn default() -> Staging {
+        Staging::new()
+    }
+}
+
 impl Staged {
+    /// Refuses a Prefix Revision required for another Prefix than it was taken for, or taken from
+    /// another Store than `store`, the one the Staging is committed to, with
+    /// [`Error::WrongPrefixRevision`]. The Store checks it before the Commit starts.
+    pub(crate) fn refuse_wrong_prefix_revisions(&self, store: StoreId) -> Result<()> {
+        let wrong = self
+            .prefix_preconditions
+            .iter()
+            .find(|(prefix, revision)| !revision.is_for(store, prefix));
+        match wrong {
+            Some((prefix, _)) => Err(Error::WrongPrefixRevision { prefix: prefix.clone() }),
+            None => Ok(()),
+        }
+    }
+
     fn add_precondition(&mut self, path: Path, precondition: Precondition) {
         // *Any* requires nothing, so a Staging without Preconditions has nothing to check.
         if precondition != Precondition::Any {
@@ -210,18 +219,18 @@ impl Staged {
         }
     }
 
-    /// Checks every Precondition against `current`, the Area as it is when the Commit runs. It is
+    /// Checks every Precondition against `current`, the Store as it is when the Commit runs. It is
     /// the first step of [`CommitRequest::plan`](crate::backend::CommitRequest::plan), which runs
     /// under the Backend's lock. Gives [`Error::Conflict`] with every Path where a Precondition
     /// fails. A Staging with no Preconditions reads nothing.
-    pub(crate) fn check_preconditions(&self, current: &impl AreaState) -> Result<()> {
+    pub(crate) fn check_preconditions(&self, current: &impl StoreState) -> Result<()> {
         let mut conflicts = BTreeSet::new();
         for (path, precondition) in &self.preconditions {
             if !precondition.holds(current.revision(path)?) {
                 conflicts.insert(path.clone());
             }
         }
-        for prefix_revision in &self.prefix_preconditions {
+        for (_, prefix_revision) in &self.prefix_preconditions {
             let now = current.revisions_under(prefix_revision.prefix())?;
             conflicts.extend(prefix_revision.differences(&now));
         }
@@ -232,11 +241,11 @@ impl Staged {
         }
     }
 
-    /// Turns the Prefix deletes into deletes of the Paths under them in `current`, the Area as it
+    /// Turns the Prefix deletes into deletes of the Paths under them in `current`, the Store as it
     /// is when the Commit runs: the second step of
     /// [`CommitRequest::plan`](crate::backend::CommitRequest::plan). A Path staged after the Prefix
     /// delete keeps its own action.
-    pub(crate) fn expand_prefix_deletes(&mut self, current: &impl AreaState) -> Result<()> {
+    pub(crate) fn expand_prefix_deletes(&mut self, current: &impl StoreState) -> Result<()> {
         for prefix in std::mem::take(&mut self.prefix_deletes) {
             for path in current.paths_under(&prefix)? {
                 self.actions.entry(path).or_insert(Action::Delete);
@@ -251,7 +260,7 @@ impl Staged {
     /// write, including those left out, and the Revision of each File a delete removes.
     pub(crate) fn leave_out_what_changes_nothing(
         &mut self,
-        current: &impl AreaState,
+        current: &impl StoreState,
     ) -> Result<PlannedRevisions> {
         let (mut written, mut removed) = (BTreeMap::new(), BTreeMap::new());
         let mut unchanged = Vec::new();
@@ -277,8 +286,8 @@ impl Staged {
         Ok(PlannedRevisions { written, removed })
     }
 
-    /// Refuses a write that would leave two names in the Area after the Commit that some platform
-    /// can't hold together. A name is a Path, or a Prefix it is under. `current` is the Area as it
+    /// Refuses a write that would leave two names in the Store after the Commit that some platform
+    /// can't hold together. A name is a Path, or a Prefix it is under. `current` is the Store as it
     /// is when the Commit runs. It is the last step of
     /// [`CommitRequest::plan`](crate::backend::CommitRequest::plan), after the Prefix deletes are
     /// expanded, so that a Path deleted in the same Commit doesn't count. It refuses:
@@ -288,9 +297,9 @@ impl Staged {
     ///   ([`InvalidPathReason::FileUnderFile`]).
     ///
     /// Both are found by folding each name, without the `/` that ends a Prefix. Only the names
-    /// the Commit writes are folded, and the Area is asked only about those, so the check costs
-    /// what the Commit writes, not what the Area holds.
-    pub(crate) fn refuse_clashing_paths(&self, current: &impl AreaState) -> Result<()> {
+    /// the Commit writes are folded, and the Store is asked only about those, so the check costs
+    /// what the Commit writes, not what the Store holds.
+    pub(crate) fn refuse_clashing_paths(&self, current: &impl StoreState) -> Result<()> {
         let deleted = |path: &Path| matches!(self.actions.get(path), Some(Action::Delete));
         // Each name written so far in this Commit, by its fold.
         let mut written: HashMap<String, &str> = HashMap::new();
@@ -304,7 +313,7 @@ impl Staged {
                     // Another name written in this Commit.
                     Entry::Occupied(other) if *other.get() == name => continue,
                     Entry::Occupied(other) => Some(without_trailing_slash(other.get()).to_owned()),
-                    // A name in the Area, apart from the Paths this Commit deletes.
+                    // A name in the Store, apart from the Paths this Commit deletes.
                     Entry::Vacant(entry) => {
                         let others = current.paths_named_like(name, entry.key())?;
                         entry.insert(name);

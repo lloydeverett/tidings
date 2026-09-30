@@ -131,7 +131,7 @@ impl WorkingCopy {
         let mut discarding = Vec::new();
         let mut blocked = Vec::new();
         for (path, change) in chosen {
-            let store_file = store.read(self.area, &path).await?;
+            let store_file = store.read(&path).await?;
             let on_the_way = self.blocking_directory(&path)?;
             // Under a symlink or a file, nothing in the folder can be at the Path.
             let local = if on_the_way.is_some() { Local::Absent } else { self.local(&path)? };

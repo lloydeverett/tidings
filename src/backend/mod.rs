@@ -18,9 +18,9 @@ use crate::Error;
 use crate::staging::{Action, PlannedRevisions, Staged};
 use crate::{ChangeKind, File, Origin, Path, Prefix, Result, Revision, Stat};
 
-/// A Backend that keeps its Areas on disk, as an Area's Backend marker names it. Opening a Store
-/// on one Backend refuses Areas marked for the other, and
-/// [`Store::detect`](crate::Store::detect) finds which one a location has.
+/// A Backend that keeps a Store's Files on disk, in a Location, as the Location's Backend marker
+/// names it. Opening a Store on one Backend refuses a Location marked for the other, and
+/// [`Store::detect`](crate::Store::detect) finds which one a Location has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackendKind {
     /// The filesystem, as [`Store::open_fs`](crate::Store::open_fs) opens it.
@@ -62,11 +62,11 @@ pub(crate) enum Backend {
     Sqlite(sqlite::SqliteBackend),
 }
 
-/// A Backend's view of one Area as it stood when a Snapshot was taken.
+/// A Backend's view of the Store as it stood when a Snapshot was taken.
 ///
 /// It holds only what the Backend needs to read that view, never the Store's shared state, so a
 /// Snapshot doesn't keep the Change feed open after the last Store handle goes, and it can still
-/// be read after that. Memory holds the Area's Files. SQLite holds a read transaction on a
+/// be read after that. Memory holds the Store's Files. SQLite holds a read transaction on a
 /// connection of its own. The filesystem has none (ADR 0006).
 #[derive(Debug)]
 pub(crate) enum BackendSnapshot {
@@ -75,9 +75,9 @@ pub(crate) enum BackendSnapshot {
     Sqlite(sqlite::SqliteSnapshot),
 }
 
-/// What an Area holds when a Commit runs, as the checks shared by every Backend need to see it.
+/// What the Store holds when a Commit runs, as the checks shared by every Backend need to see it.
 /// Each Backend reads it its own way, under its lock.
-pub(crate) trait AreaState {
+pub(crate) trait StoreState {
     /// The Revision of the File at `path`, or `None` if there is none.
     fn revision(&self, path: &Path) -> Result<Option<Revision>>;
     /// The Path and Revision of every File under `prefix`, in order of Path.
@@ -93,7 +93,7 @@ pub(crate) trait AreaState {
     /// has the name `name`.
     ///
     /// A Backend keeps each Path's fold indexed, so that this costs what it finds, not what the
-    /// Area holds.
+    /// Store holds.
     fn paths_named_like(&self, name: &str, fold: &str) -> Result<Vec<Path>>;
 }
 
@@ -139,7 +139,7 @@ pub(crate) struct CommitOutcome {
     pub(crate) revisions: BTreeMap<Path, Revision>,
     /// Each Path the Commit changed or removed, in order.
     pub(crate) changes: Vec<RawChange>,
-    /// What other Stores did to the Area before this Commit that this Store hasn't recorded on
+    /// What other Stores did to the Files before this Commit that this Store hasn't recorded on
     /// its Change feed yet, in the order they did it. Only SQLite, which reads it from its change
     /// log, gives any.
     pub(crate) observed_before: Vec<Observed>,
@@ -149,27 +149,27 @@ pub(crate) struct CommitOutcome {
     pub(crate) pending: bool,
 }
 
-/// Something a Backend observed in an Area, other than this Store's Commits as it makes them: in
-/// SQLite's change log, which Commits by every Store on the same storage go into, or with the
-/// filesystem's watcher.
+/// Something a Backend observed in the Store's Files, other than this Store's Commits as it makes
+/// them: in SQLite's change log, which Commits by every Store on the same storage go into, or with
+/// the filesystem's watcher.
 #[derive(Debug)]
 #[cfg_attr(
     not(any(feature = "fs", feature = "sqlite")),
     expect(dead_code, reason = "only SQLite and the filesystem observe other Stores")
 )]
 pub(crate) enum Observed {
-    /// Changes to the Area, all with the same Origin, to go in the same batch: a Commit's, read
+    /// Changes to the Files, all with the same Origin, to go in the same batch: a Commit's, read
     /// from the change log, whose Origin is local if this Store made it, or all the watcher saw in
     /// one burst of events, which are external.
     Changes { origin: Origin, changes: Vec<RawChange> },
     /// Changes may have been missed: Commits were pruned from the log before this Store read
-    /// them, or watching failed, or the Area's directory was removed.
+    /// them, or watching failed, or the Location was removed.
     Missed,
 }
 
-/// A change a Backend made or observed, without its Area and Origin. The Store layer adds the Area,
-/// and the Origin: local for its own Commits, and for what a Backend observed, the Origin it gives
-/// with them ([`Observed::Changes`]).
+/// A change a Backend made or observed, without its Origin. The Store layer adds the Origin: local
+/// for its own Commits, and for what a Backend observed, the Origin it gives with them
+/// ([`Observed::Changes`]).
 #[derive(Debug)]
 pub(crate) struct RawChange {
     pub(crate) path: Path,
@@ -177,14 +177,14 @@ pub(crate) struct RawChange {
 }
 
 impl CommitRequest {
-    /// Works out what the Commit changes, given `current`, the Area as it is under the Backend's
+    /// Works out what the Commit changes, given `current`, the Store as it is under the Backend's
     /// lock. These are the rules every Backend shares, in the order they apply:
     /// 1. every Precondition is checked, so a Commit that also breaks another rule is a Conflict;
     /// 2. the Prefix deletes are expanded;
     /// 3. writes that would not change the contents, and deletes of Paths with no File, are left
     ///    out;
     /// 4. names that some platform can't hold together are refused.
-    pub(crate) fn plan(self, current: &impl AreaState) -> Result<Plan> {
+    pub(crate) fn plan(self, current: &impl StoreState) -> Result<Plan> {
         let CommitRequest { timestamp, mut staged } = self;
         staged.check_preconditions(current)?;
         staged.expand_prefix_deletes(current)?;

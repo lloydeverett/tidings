@@ -1,18 +1,19 @@
-//! The record, `.tidings/working-copy`: which Store and Area a Working copy belongs to, each
-//! Path's Base, and which Paths are Diverged.
+//! The record, `.tidings/working-copy`: which Store a Working copy belongs to, each Path's Base,
+//! and which Paths are Diverged.
 //!
 //! It is plain text, in the style of the filesystem journal (ADR 0005): a first line that names
 //! the format and its version, then a line for each item, with fields separated by tabs, and `\`,
 //! tabs and line breaks escaped:
-//! - `root` and the absolute Root override, or `identity` and the App identity;
+//! - `store` and the Store's Location, which is absolute;
 //! - `backend` and the Backend;
-//! - `area` and the Area;
 //! - `base`, a Path, its Base Revision, and the hash of the contents last written to or read from
 //!   the folder for that Base, in hexadecimal;
 //! - `diverged`, a Diverged Path, and the Revision of the Store's File in `theirs` and the hash of
 //!   that File's contents, which are both left out if the Store has no File there.
 //!
-//! This is version 1; any other version is refused.
+//! This is version 1; any other version is refused. So is a record in the shape version 1 had
+//! while a Store held Areas, with `root` or `identity`, and `area`: it is in a format this version
+//! doesn't know.
 //!
 //! It is always replaced whole, with `atomic-write-file`, which writes a new file, forces it to
 //! disk and renames it over the record.
@@ -22,12 +23,10 @@ use std::io::{self, Write};
 use std::path::{Path as FsPath, PathBuf};
 
 use atomic_write_file::AtomicWriteFile;
-use tidings::{Area, File, Path, Revision};
+use tidings::{File, Path, Revision};
 
-use crate::command::AreaName;
 use crate::failure::Failure;
-use crate::location::{BackendName, Identity, StoreAddress, StoreLocation};
-use crate::output::area_name;
+use crate::location::{BackendName, StoreAddress};
 
 /// The first line of every record this version writes, which names its format.
 const FORMAT: &str = "tidings working-copy 1";
@@ -40,8 +39,6 @@ const FORMAT_NAME: &str = "tidings working-copy ";
 pub struct Record {
     /// The Store the Working copy belongs to.
     pub store: StoreAddress,
-    /// The Area whose Files the Working copy holds.
-    pub area: Area,
     /// The Base of each Path that has one.
     pub bases: BTreeMap<Path, Base>,
     /// Each Diverged Path, which may or may not have a Base.
@@ -119,8 +116,8 @@ pub fn is_record(file: &FsPath) -> bool {
 
 impl Record {
     /// A record with no Bases yet.
-    pub fn new(store: StoreAddress, area: Area) -> Record {
-        Record { store, area, bases: BTreeMap::new(), divergences: BTreeMap::new() }
+    pub fn new(store: StoreAddress) -> Record {
+        Record { store, bases: BTreeMap::new(), divergences: BTreeMap::new() }
     }
 
     /// Makes `base` the Base of `path`, or leaves `path` with no Base if `base` is `None`, as when
@@ -163,15 +160,9 @@ impl Record {
             text.push_str(&fields.join("\t"));
             text.push('\n');
         };
-        match &self.store.location {
-            StoreLocation::Root(root) => {
-                // A Root override that isn't UTF-8 can't be given on the command line anyway.
-                line(&["root", &root.to_string_lossy()]);
-            }
-            StoreLocation::Identity(identity) => line(&["identity", &identity.to_string()]),
-        }
+        // A Location that isn't UTF-8 can't be given on the command line anyway.
+        line(&["store", &self.store.location.to_string_lossy()]);
         line(&["backend", &self.store.backend.to_string()]);
-        line(&["area", area_name(self.area)]);
         for (path, base) in &self.bases {
             line(&["base", path.as_str(), &base.revision.to_string(), &base.hash.to_text()]);
         }
@@ -197,19 +188,21 @@ impl Record {
             }
             _ => return Err("is not a Working copy's record".to_owned()),
         }
-        let (mut location, mut backend, mut area) = (None, None, None);
+        let (mut location, mut backend) = (None, None);
         let (mut bases, mut divergences) = (BTreeMap::new(), BTreeMap::new());
         let parse_path = |path: &str| Path::new(path).map_err(|error| error.to_string());
         for line in lines {
             let fields: Vec<String> = line.split('\t').map(unescape).collect();
             let fields: Vec<&str> = fields.iter().map(String::as_str).collect();
             match fields[..] {
-                ["root", root] => location = Some(StoreLocation::Root(PathBuf::from(root))),
-                ["identity", identity] => {
-                    location = Some(StoreLocation::Identity(Identity::parse(identity)?));
-                }
+                ["store", store] => location = Some(PathBuf::from(store)),
                 ["backend", name] => backend = Some(parse_backend(name)?),
-                ["area", name] => area = Some(Area::from(parse_value::<AreaName>(name)?)),
+                [old @ ("root" | "identity" | "area"), ..] => {
+                    return Err(format!(
+                        "is in a format this version doesn't know: it has a line {old:?}, from \
+                         before a Store was one Location"
+                    ));
+                }
                 ["base", path, revision, hash] => {
                     bases.insert(parse_path(path)?, parse_base(revision, hash)?);
                 }
@@ -228,8 +221,7 @@ impl Record {
             location: location.ok_or_else(|| missing("where the Store is"))?,
             backend: backend.ok_or_else(|| missing("the Backend"))?,
         };
-        let area = area.ok_or_else(|| missing("the Area"))?;
-        Ok(Record { store, area, bases, divergences })
+        Ok(Record { store, bases, divergences })
     }
 }
 

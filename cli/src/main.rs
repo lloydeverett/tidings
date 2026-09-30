@@ -13,9 +13,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
-use tidings::Area;
 
-use crate::command::{AreaName, Session, StoreCommand};
+use crate::command::{Session, StoreCommand};
 use crate::failure::Failure;
 use crate::location::StoreArgs;
 use crate::output::{Output, Report, SyncOutput, print_stdout};
@@ -42,15 +41,14 @@ struct Cli {
 /// A top-level command.
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Make a folder a Working copy of an Area, and keep it in step with the Store until Ctrl-C
+    /// Make a folder a Working copy of the Store, and keep it in step with the Store until Ctrl-C
     ///
-    /// The folder must be empty or missing, or a Working copy of the Area, which is resumed: the
-    /// Store flags are needed only to make a new one. Files the Store adds, changes or removes
+    /// The folder must be empty or missing, or a Working copy, which is resumed: the Store flags
+    /// are needed only to make a new one. Files the Store adds, changes or removes
     /// appear in it, but a file changed locally is left alone: if the Store changes it too, it is
     /// Diverged, and the Store's version is put in `.tidings/theirs/` to merge against. Nothing in
     /// the folder reaches the Store until `commit`.
     Sync {
-        area: AreaName,
         /// The folder. The current directory if left out.
         folder: Option<PathBuf>,
         /// Print only divergences, resyncs and errors.
@@ -149,8 +147,8 @@ enum StoreSubcommand {
 enum OneShot {
     #[command(flatten)]
     Store(StoreCommand),
-    /// Print the Changes to the Areas named, or to every Area, until Ctrl-C
-    Watch { areas: Vec<AreaName> },
+    /// Print the Changes to the Store until Ctrl-C
+    Watch,
 }
 
 fn main() -> ExitCode {
@@ -172,9 +170,9 @@ fn main() -> ExitCode {
     };
     let output = Output { json: cli.json, at_prompt: false };
     let result = match cli.command {
-        Command::Sync { area, folder, quiet } => {
+        Command::Sync { folder, quiet } => {
             let output = SyncOutput { output, quiet };
-            runtime.block_on(sync(&cli.store, output, area, folder))
+            runtime.block_on(sync(&cli.store, output, folder))
         }
         Command::Commit { working_copy, paths } => {
             runtime.block_on(commit(&cli.store, output, &working_copy, &paths))
@@ -211,9 +209,8 @@ async fn one_shot(store: &StoreArgs, json: bool, command: OneShot) -> Result<(),
             let report = Session::new(opened.store, false).run(command).await?;
             Ok(output.print(&report)?)
         }
-        OneShot::Watch { areas } => {
+        OneShot::Watch => {
             eprintln!("watching {}", opened.description);
-            let areas: Vec<Area> = areas.into_iter().map(Area::from).collect();
             let mut feed = opened.feed;
             let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
             loop {
@@ -223,7 +220,7 @@ async fn one_shot(store: &StoreArgs, json: bool, command: OneShot) -> Result<(),
                 };
                 // The feed ends only once the Store is dropped, which it isn't until here.
                 let Some(item) = item else { return Ok(()) };
-                for line in output.feed_lines(&item, &areas) {
+                for line in output.feed_lines(&item) {
                     match print_stdout(&format!("{line}\n")) {
                         // Whatever read the lines has gone.
                         Err(error) if error.kind() == ErrorKind::BrokenPipe => return Ok(()),
@@ -235,12 +232,11 @@ async fn one_shot(store: &StoreArgs, json: bool, command: OneShot) -> Result<(),
     }
 }
 
-/// `sync`: makes `folder` a Working copy of `area`, or resumes the one it is, and keeps it in step
-/// with the Store until Ctrl-C.
+/// `sync`: makes `folder` a Working copy of the Store `store` chooses, or resumes the one it is,
+/// and keeps it in step with the Store until Ctrl-C.
 async fn sync(
     store: &StoreArgs,
     output: SyncOutput,
-    area: AreaName,
     folder: Option<PathBuf>,
 ) -> Result<(), Failure> {
     let ctrl_c = listen_for_ctrl_c()?;
@@ -249,7 +245,7 @@ async fn sync(
         None => std::env::current_dir()?,
     };
     let report = |event: &_| output.print(event);
-    WorkingCopy::sync(&folder, Area::from(area), store, ctrl_c, report).await
+    WorkingCopy::sync(&folder, store, ctrl_c, report).await
 }
 
 /// `commit`: commits every local change in the Working copy, or only those at or under `paths`,

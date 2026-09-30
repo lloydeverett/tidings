@@ -7,24 +7,23 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
 
-use clap::{Args, Subcommand, ValueEnum};
+use clap::{Args, Subcommand};
 use tempfile::TempPath;
-use tidings::{Area, Precondition, Prefix, PrefixRevision, Revision, Staging, Store};
+use tidings::{Precondition, Prefix, PrefixRevision, Revision, Staging, Store};
 
 use crate::failure::Failure;
-use crate::output::{Report, area_name};
+use crate::output::Report;
 
 /// The commands shared by one-shot mode and the shell.
 #[derive(Debug, Subcommand)]
 pub enum StoreCommand {
     /// Print a File's contents, exactly as stored
-    Read { area: AreaName, path: String },
+    Read { path: String },
     /// Print a File's Revision and when it was last modified
-    Stat { area: AreaName, path: String },
+    Stat { path: String },
     /// Print the Paths of the Files under a Prefix, in order
     List {
-        area: AreaName,
-        /// Empty, for the whole Area, or ending in `/`.
+        /// Empty, for the whole Store, or ending in `/`.
         #[arg(default_value = "")]
         prefix: String,
     },
@@ -32,14 +31,12 @@ pub enum StoreCommand {
     ///
     /// The shell remembers it for `require-prefix`.
     StatPrefix {
-        area: AreaName,
-        /// Empty, for the whole Area, or ending in `/`.
+        /// Empty, for the whole Store, or ending in `/`.
         #[arg(default_value = "")]
         prefix: String,
     },
     /// Write a File, and print its new Revision
     Write {
-        area: AreaName,
         path: String,
         #[command(flatten)]
         contents: ContentsArgs,
@@ -48,15 +45,13 @@ pub enum StoreCommand {
     },
     /// Delete a File, if there is one
     Delete {
-        area: AreaName,
         path: String,
         #[command(flatten)]
         precondition: PreconditionArgs,
     },
     /// Delete every File under a Prefix
     DeletePrefix {
-        area: AreaName,
-        /// Ending in `/`, or empty for the whole Area.
+        /// Ending in `/`, or empty for the whole Store.
         prefix: String,
     },
     /// Edit a File in $VISUAL or $EDITOR, and write it back unless it changed meanwhile
@@ -64,25 +59,7 @@ pub enum StoreCommand {
     /// A missing File starts empty, and is written only if it is still missing. Quitting the
     /// editor with a failure, as with `:cq` in vim, cancels the edit. On a Conflict, the edited
     /// text is kept in a temporary file, which is named.
-    Edit { area: AreaName, path: String },
-}
-
-/// An Area, as it is named on the command line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum AreaName {
-    Config,
-    Data,
-    Cache,
-}
-
-impl From<AreaName> for Area {
-    fn from(name: AreaName) -> Area {
-        match name {
-            AreaName::Config => Area::Config,
-            AreaName::Data => Area::Data,
-            AreaName::Cache => Area::Cache,
-        }
-    }
+    Edit { path: String },
 }
 
 /// Where `write` takes the contents from: stdin, unless one of these is given.
@@ -128,8 +105,8 @@ pub struct Session {
     shell: bool,
     /// The Staging opened with `stage`, which writes and deletes add to instead of committing.
     staging: Option<OpenStaging>,
-    /// The last Prefix Revision `stat-prefix` gave for each Area and Prefix.
-    prefix_revisions: HashMap<(Area, Prefix), PrefixRevision>,
+    /// The last Prefix Revision `stat-prefix` gave for each Prefix.
+    prefix_revisions: HashMap<Prefix, PrefixRevision>,
 }
 
 /// The shell's open Staging.
@@ -143,8 +120,8 @@ struct OpenStaging {
 }
 
 impl OpenStaging {
-    fn new(area: Area) -> OpenStaging {
-        OpenStaging { staging: Staging::new(area), count: 0, edits: Vec::new() }
+    fn new() -> OpenStaging {
+        OpenStaging { staging: Staging::new(), count: 0, edits: Vec::new() }
     }
 
     /// Stages what `stage` does, and counts it.
@@ -154,7 +131,7 @@ impl OpenStaging {
     ) -> Result<Report, Failure> {
         stage(&mut self.staging)?;
         self.count += 1;
-        Ok(Report::Staged { area: self.staging.area(), count: self.count })
+        Ok(Report::Staged { count: self.count })
     }
 }
 
@@ -164,89 +141,73 @@ impl Session {
         Session { store, shell, staging: None, prefix_revisions: HashMap::new() }
     }
 
-    /// The open Staging's Area, and how many things it holds.
-    pub fn staging(&self) -> Option<(Area, usize)> {
-        self.staging.as_ref().map(|open| (open.staging.area(), open.count))
+    /// How many things the open Staging holds, if one is open.
+    pub fn staging(&self) -> Option<usize> {
+        self.staging.as_ref().map(|open| open.count)
     }
 
     /// Runs `command`.
     pub async fn run(&mut self, command: StoreCommand) -> Result<Report, Failure> {
         match command {
-            StoreCommand::Read { area, path } => {
-                let area = area.into();
-                match self.store.read(area, path.as_str()).await? {
-                    Some(file) => Ok(Report::File(file)),
-                    None => Err(Failure::missing(area, &path)),
-                }
+            StoreCommand::Read { path } => match self.store.read(path.as_str()).await? {
+                Some(file) => Ok(Report::File(file)),
+                None => Err(Failure::missing(&path)),
+            },
+            StoreCommand::Stat { path } => match self.store.stat(path.as_str()).await? {
+                Some(stat) => Ok(Report::Stat(tidings::Path::new(path)?, stat)),
+                None => Err(Failure::missing(&path)),
+            },
+            StoreCommand::List { prefix } => Ok(Report::Paths(self.store.list(prefix).await?)),
+            StoreCommand::StatPrefix { prefix } => {
+                let prefix = Prefix::new(prefix)?;
+                let revision = self.store.stat_prefix(prefix.clone()).await?;
+                self.prefix_revisions.insert(prefix.clone(), revision.clone());
+                Ok(Report::PrefixRevision(prefix, revision))
             }
-            StoreCommand::Stat { area, path } => {
-                let area = area.into();
-                match self.store.stat(area, path.as_str()).await? {
-                    Some(stat) => Ok(Report::Stat(tidings::Path::new(path)?, stat)),
-                    None => Err(Failure::missing(area, &path)),
-                }
-            }
-            StoreCommand::List { area, prefix } => {
-                Ok(Report::Paths(self.store.list(area.into(), prefix).await?))
-            }
-            StoreCommand::StatPrefix { area, prefix } => {
-                let (area, prefix) = (area.into(), Prefix::new(prefix)?);
-                let revision = self.store.stat_prefix(area, prefix.clone()).await?;
-                self.prefix_revisions.insert((area, prefix.clone()), revision.clone());
-                Ok(Report::PrefixRevision(area, prefix, revision))
-            }
-            StoreCommand::Write { area, path, contents, precondition } => {
+            StoreCommand::Write { path, contents, precondition } => {
                 let contents = self.contents(contents)?;
                 let precondition = precondition.precondition();
-                self.stage_or_commit(area.into(), |staging| {
+                self.stage_or_commit(|staging| {
                     staging.write_requiring(path, contents, precondition).map(drop)
                 })
                 .await
             }
-            StoreCommand::Delete { area, path, precondition } => {
+            StoreCommand::Delete { path, precondition } => {
                 let precondition = precondition.precondition();
-                self.stage_or_commit(area.into(), |staging| {
+                self.stage_or_commit(|staging| {
                     staging.delete_requiring(path, precondition).map(drop)
                 })
                 .await
             }
-            StoreCommand::DeletePrefix { area, prefix } => {
-                self.stage_or_commit(area.into(), |staging| staging.delete_prefix(prefix).map(drop))
-                    .await
+            StoreCommand::DeletePrefix { prefix } => {
+                self.stage_or_commit(|staging| staging.delete_prefix(prefix).map(drop)).await
             }
-            StoreCommand::Edit { area, path } => self.edit(area.into(), &path).await,
+            StoreCommand::Edit { path } => self.edit(&path).await,
         }
     }
 
-    /// Adds what `stage` stages to the open Staging, which must be for `area`, or, with none
-    /// open, commits it straight away.
+    /// Adds what `stage` stages to the open Staging, or, with none open, commits it straight
+    /// away.
     async fn stage_or_commit(
         &mut self,
-        area: Area,
         stage: impl FnOnce(&mut Staging) -> tidings::Result<()>,
     ) -> Result<Report, Failure> {
         match &mut self.staging {
-            Some(open) => {
-                check_area(&open.staging, area)?;
-                open.add(stage)
-            }
+            Some(open) => open.add(stage),
             None => {
-                let mut staging = Staging::new(area);
+                let mut staging = Staging::new();
                 stage(&mut staging)?;
                 Ok(Report::Committed(self.store.commit(staging).await?))
             }
         }
     }
 
-    /// `stage`: opens a Staging for `area`.
-    pub fn open_staging(&mut self, area: Area) -> Result<Report, Failure> {
-        if let Some((open, _)) = self.staging() {
-            return Err(Failure::error(format!(
-                "a Staging for {} is open already: commit or discard it first",
-                area_name(open)
-            )));
+    /// `stage`: opens a Staging.
+    pub fn open_staging(&mut self) -> Result<Report, Failure> {
+        if self.staging.is_some() {
+            return Err(Failure::error("a Staging is open already: commit or discard it first"));
         }
-        self.staging = Some(OpenStaging::new(area));
+        self.staging = Some(OpenStaging::new());
         Ok(Report::Nothing)
     }
 
@@ -256,16 +217,14 @@ impl Session {
     }
 
     /// `require-prefix`: requires everything under `prefix` to be unchanged since the last
-    /// `stat-prefix` of it, in the open Staging's Area.
+    /// `stat-prefix` of it, in the open Staging.
     pub fn require_prefix(&mut self, prefix: String) -> Result<Report, Failure> {
         let prefix = Prefix::new(prefix)?;
-        let area = self.open()?.staging.area();
-        let Some(revision) = self.prefix_revisions.get(&(area, prefix.clone())) else {
+        self.open()?;
+        let Some(revision) = self.prefix_revisions.get(&prefix) else {
             return Err(Failure::error(format!(
-                "no Prefix Revision of {} {:?} to require: run `stat-prefix {} {}` first",
-                area_name(area),
+                "no Prefix Revision of {:?} to require: run `stat-prefix {}` first",
                 prefix.as_str(),
-                area_name(area),
                 prefix.as_str(),
             )));
         };
@@ -329,18 +288,6 @@ fn keep_edit(failure: Failure, edit: TempPath) -> Failure {
         Ok(kept) => failure.with_note(format!("your edit is kept in {}", kept.display())),
         Err(error) => failure.with_note(format!("your edit couldn't be kept: {error}")),
     }
-}
-
-/// Fails unless `staging` is for `area`.
-fn check_area(staging: &Staging, area: Area) -> Result<(), Failure> {
-    if staging.area() == area {
-        return Ok(());
-    }
-    Err(Failure::error(format!(
-        "the open Staging is for {}, not {}: commit or discard it first",
-        area_name(staging.area()),
-        area_name(area),
-    )))
 }
 
 /// `text` with `\n`, `\t` and `\\` made a newline, a tab and a backslash. Any other backslash

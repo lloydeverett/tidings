@@ -1,13 +1,13 @@
-//! The filesystem Backend: each Area is a directory, and each File a file in it, so that people
+//! The filesystem Backend: the Location is a directory, and each File a file in it, so that people
 //! can see and edit them with ordinary tools.
 //!
-//! **Where Areas are.** In the platform's standard config, data and cache directories for the App
-//! identity, or under the Root override. Each Area's root has a `.tidings/` directory of tidings'
-//! own, which holds the Backend marker ([`marker`]), the lock and the journal.
+//! **The Location.** The directory the app opened the Store at. Opening marks it for the filesystem
+//! ([`marker`]), and makes it if it doesn't exist. It has a `.tidings/` directory of tidings' own,
+//! which holds the Backend marker, the lock and the journal.
 //!
 //! **Reading.** Reads, stat and listing go straight to the directory tree, so they see Files other
 //! programs made as well. Where the journal holds a Commit that has happened but isn't finished,
-//! they see the Area as finishing it will leave it (see **Commits**). A File's Revision is a hash
+//! they see the Store as finishing it will leave it (see **Commits**). A File's Revision is a hash
 //! of its contents, so stat reads the whole File, and so does working out a Prefix Revision, for
 //! every File under the Prefix. A File that isn't valid UTF-8 is listed and has a Revision, but
 //! reading it gives [`Error::NotText`]. Reads follow symlinks to Files.
@@ -20,27 +20,27 @@
 //! both are listed, as the Files they are, but a Commit can't add another name that clashes with
 //! them.
 //!
-//! **Symlinks to directories.** An Area's root is resolved through any symlinks once, when the
-//! Store opens, so a root that is a link, as to a dotfiles repo, keeps the directory it led to
-//! then. Inside an Area, a symlink to a directory is left out, with everything under it, as names
+//! **Symlinks to directories.** The Location is resolved through any symlinks once, when the Store
+//! opens, so a Location that is a link, as to a dotfiles repo, keeps the directory it led to then.
+//! Inside the Location, a symlink to a directory is left out, with everything under it, as names
 //! that aren't Paths are: so every File has one Path, and every directory that holds Files is in
-//! the Area, and watched. A Commit that would write through one is refused with
+//! the Store, and watched. A Commit that would write through one is refused with
 //! [`DirectoryLink`](InvalidPathReason::DirectoryLink), and finishing a Commit never writes or
 //! deletes through one made since.
 //!
 //! **Exact names.** A Path names only the file on disk with exactly its name. Some filesystems
 //! (macOS's and Windows' by default) also find `Foo` when asked for `foo`. Opening a Store finds
-//! out whether the Area's does, from whether `.tidings/LOCK` finds `.tidings/lock`. Where it does,
-//! each read checks that every name on the way is there exactly, by looking in its directory, so
-//! that reading `foo` gives nothing when only `Foo` is there, as listing shows. That costs a look
-//! through each directory on the way, on those filesystems only. It also makes a Commit that
+//! out whether the Location's does, from whether `.tidings/LOCK` finds `.tidings/lock`. Where it
+//! does, each read checks that every name on the way is there exactly, by looking in its directory,
+//! so that reading `foo` gives nothing when only `Foo` is there, as listing shows. That costs a
+//! look through each directory on the way, on those filesystems only. It also makes a Commit that
 //! renames `Foo` to `foo` write `foo`, rather than find it already there.
 //!
 //! **Commits.** A Commit follows ADR 0005, holding an exclusive lock on `.tidings/lock`, which
-//! keeps out other tidings Commits to the Area, from this process or any other:
+//! keeps out other tidings Commits to the Location, from this process or any other:
 //! 1. finish or discard any Commit a crash left in the journal;
 //! 2. work out what the Commit changes with the rules every Backend shares
-//!    ([`CommitRequest::plan`]), reading the Area from disk. Then refuse what the filesystem
+//!    ([`CommitRequest::plan`]), reading the Store from disk. Then refuse what the filesystem
 //!    couldn't finish, or would get wrong: two Paths that are the same file on disk (through a
 //!    symlink), something that isn't a File where a File or its directory must go, a symlink to
 //!    a directory on the way, and a symlink into a directory that doesn't exist;
@@ -67,20 +67,20 @@
 //! **Temporary files.** Each goes next to the File it replaces, named
 //! `.<name>.tidings-<commit-id>-<n>` for the Commit's `n`th write, so that the rename can't cross a
 //! volume. No Path can have such a name. Where a File's directory doesn't exist yet, its temporary
-//! file goes in the nearest directory above it that does, within the Area, and the directory is
+//! file goes in the nearest directory above it that does, within the Location, and the directory is
 //! made in step 6. That is also how a File can move under its own name in one Commit (`a` to
 //! `a/b`): the directory `a/` can only be made once the file `a` is gone.
 //!
 //! **Symlinks.** A write to a Path that is a symlink goes to the File the link points to, wherever
 //! that is, and the link stays. The directory it points into must exist: a write through a link to
-//! a File never makes a directory, so it can't make one outside the Area. A delete removes the
+//! a File never makes a directory, so it can't make one outside the Location. A delete removes the
 //! link itself.
 //!
 //! **What other programs see.** A program outside tidings can see a Commit half applied, during
 //! step 6. And one that writes a File after step 2 and before step 6 has its edit overwritten if
 //! the Commit writes that File: the filesystem can't replace a File only if it is unchanged.
 //!
-//! **Watching.** Each Area's directory is watched, so that what other programs and other Stores
+//! **Watching.** The Location is watched, so that what other programs and other Stores
 //! change there reaches the Change feed: see [`watch`].
 //!
 //! Every call to the filesystem blocks, so each runs on tokio's blocking threads.
@@ -106,32 +106,24 @@ use xxhash_rust::xxh3::xxh3_128;
 use self::journal::{AsFinished, Journal, Recovery, Remove, Replace, Target};
 pub(crate) use self::watch::FsWatcher;
 use self::watch::Reported;
-use super::{AreaState, CommitOutcome, CommitRequest, Planned, failed, off_runtime};
+use super::{CommitOutcome, CommitRequest, Planned, StoreState, failed, marker, off_runtime};
 use crate::path::{RESERVED, letter_case_fold, temporary_file_name};
 use crate::staging::has_name;
-use crate::{Error, File, InvalidPathReason, Path, Prefix, Result, Revision, Stat};
+use crate::{BackendKind, Error, File, InvalidPathReason, Path, Prefix, Result, Revision, Stat};
 
 /// How to open a Store on the filesystem, with [`Store::open_fs`](crate::Store::open_fs).
 ///
-/// `FsOptions::default()` puts each Area in the platform's standard directory for the app.
+/// `FsOptions::default()` reports edits made outside the Store once their events have settled
+/// for 150 ms.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct FsOptions {
-    pub(crate) root_override: Option<PathBuf>,
     debounce_window: Option<Duration>,
     #[cfg(feature = "testing")]
     failures: FailureSetup,
 }
 
 impl FsOptions {
-    /// A Root override: the Areas go in `config`, `data` and `cache` directories under `root`,
-    /// instead of the standard directories the App identity picks. It is an override, for tests
-    /// and unusual installations: apps normally leave it unset.
-    pub fn root_override(mut self, root: impl Into<PathBuf>) -> FsOptions {
-        self.root_override = Some(root.into());
-        self
-    }
-
     /// How long the events of an edit made outside this Store are held back, once the last of
     /// them, before the edit is reported. Editors save a File with a burst of events, so that a
     /// File can be half written in between: the burst has to settle first. 150 ms by default. A
@@ -148,7 +140,7 @@ impl FsOptions {
     ///
     /// [`FailurePoint::RenameFails`] and [`FailurePoint::CommittedJournalFails`] are different:
     /// each makes a step fail, as described there. [`FailurePoint::WatchingFails`] and
-    /// [`FailurePoint::WatchingAnAreaFails`] make watching fail.
+    /// [`FailurePoint::WatchingTheLocationFails`] make watching fail.
     #[cfg(feature = "testing")]
     pub fn fail_at(mut self, point: FailurePoint) -> FsOptions {
         self.failures.fail_at = Some(point);
@@ -158,7 +150,7 @@ impl FsOptions {
         };
         self.failures.renames_to_fail = Arc::new(AtomicUsize::new(renames));
         let watches = match point {
-            FailurePoint::WatchingAnAreaFails { times } => times,
+            FailurePoint::WatchingTheLocationFails { times } => times,
             _ => 0,
         };
         self.failures.watches_to_fail = Arc::new(AtomicUsize::new(watches));
@@ -228,8 +220,8 @@ impl Pause {
 /// A named point in a filesystem Commit, where [`FsOptions::fail_at`] stops it and
 /// [`FsOptions::pause_at`] holds it, or with [`RenameFails`](Self::RenameFails) and
 /// [`CommittedJournalFails`](Self::CommittedJournalFails), a step that fails, or with
-/// [`WatchingFails`](Self::WatchingFails) and [`WatchingAnAreaFails`](Self::WatchingAnAreaFails),
-/// watching. For tidings' own tests.
+/// [`WatchingFails`](Self::WatchingFails) and
+/// [`WatchingTheLocationFails`](Self::WatchingTheLocationFails), watching. For tidings' own tests.
 #[cfg(feature = "testing")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -258,14 +250,13 @@ pub enum FailurePoint {
     /// Writing the journal as `committed` gives an error once the journal is written, as it would
     /// if forcing its directory to disk failed.
     CommittedJournalFails,
-    /// Watching the Areas' directories fails: the first events that could change a File are
-    /// replaced by an error naming them, as the platform's watcher gives when it fails, and the
-    /// watches of the Areas they are in are lost, as they can be then. Not a point in a Commit.
+    /// Watching the Location fails: the first events that could change a File are replaced by an
+    /// error naming them, as the platform's watcher gives when it fails, and the watch of the
+    /// Location is lost, as it can be then. Not a point in a Commit.
     WatchingFails,
-    /// Watching an Area's directory, when the Store opens or again later, fails the first `times`
-    /// times, as it does once the platform's limit on watches is reached. The Areas are watched
-    /// in order of Area. Not a point in a Commit.
-    WatchingAnAreaFails {
+    /// Watching the Location, when the Store opens or again later, fails the first `times` times,
+    /// as it does once the platform's limit on watches is reached. Not a point in a Commit.
+    WatchingTheLocationFails {
         /// How many times it fails.
         times: usize,
     },
@@ -280,11 +271,11 @@ struct FailureSetup {
     pause_at: Option<(FailurePoint, Pause)>,
     /// How many more times the rename [`FailurePoint::RenameFails`] names fails.
     renames_to_fail: Arc<AtomicUsize>,
-    /// How many more times watching fails, with [`FailurePoint::WatchingAnAreaFails`].
+    /// How many more times watching fails, with [`FailurePoint::WatchingTheLocationFails`].
     watches_to_fail: Arc<AtomicUsize>,
 }
 
-/// The error [`AreaRoot::stop_at`] stops a Commit with, which is never tried again.
+/// The error [`Location::stop_at`] stops a Commit with, which is never tried again.
 #[cfg(feature = "testing")]
 #[derive(Debug, thiserror::Error)]
 #[error("the Commit stopped at the failure point {0:?}")]
@@ -297,10 +288,10 @@ struct Stopped(FailurePoint);
     "this Commit wasn't made, because an earlier Commit to {} that gave `Pending` or was \
      interrupted still can't be finished. Try again later, once nothing holds its Files open, as \
      another program can on Windows",
-    area.display()
+    location.display()
 )]
 struct EarlierCommitLeft {
-    area: PathBuf,
+    location: PathBuf,
     #[source]
     error: Error,
 }
@@ -313,17 +304,21 @@ const RETRY_DELAYS: [Duration; 3] =
 
 #[derive(Debug)]
 pub(crate) struct FsBackend {
-    root: Arc<AreaRoot>,
+    location: Arc<Location>,
     /// What the Change feed has been told of the Files, which the watcher compares events with,
     /// and each Commit updates.
     reported: Arc<Mutex<Reported>>,
 }
 
 impl FsBackend {
-    /// Makes `root` and its `.tidings/` directory if they don't exist, finishes or discards any
+    /// Marks the Location `location` for the filesystem ([`marker`]), or fails if it is SQLite's,
+    /// then makes it and its `.tidings/` directory if they don't exist, finishes or discards any
     /// Commit a crash left in its journal, and starts watching it, giving the watcher for the
     /// Store to run.
-    pub(crate) async fn open(root: PathBuf, options: &FsOptions) -> Result<(FsBackend, FsWatcher)> {
+    pub(crate) async fn open(
+        location: PathBuf,
+        options: &FsOptions,
+    ) -> Result<(FsBackend, FsWatcher)> {
         let window = options.debounce_window.unwrap_or(watch::DEFAULT_WINDOW);
         #[cfg(feature = "testing")]
         let failures = options.failures.clone();
@@ -332,26 +327,27 @@ impl FsBackend {
             first_events: failures.fail_at == Some(FailurePoint::WatchingFails),
             watching: Arc::clone(&failures.watches_to_fail),
         };
-        let root = off_runtime(move || {
+        let location = off_runtime(move || {
+            marker::claim(&location, BackendKind::Fs)?;
             #[cfg_attr(not(feature = "testing"), expect(unused_mut))]
-            let mut root = AreaRoot::open(root)?;
+            let mut location = Location::open(location)?;
             #[cfg(feature = "testing")]
             {
-                root.failures = failures;
+                location.failures = failures;
             }
-            let _locked = root.lock()?;
+            let _locked = location.lock()?;
             // Reads show a Commit that can't be finished yet, so the Store can open.
-            if let Recovery::Left(error) = journal::recover(&root)? {
+            if let Recovery::Left(error) = journal::recover(&location)? {
                 tracing::debug!(
                     "a Commit to {} is left unfinished for now: {error}",
-                    root.root.display(),
+                    location.directory.display(),
                 );
             }
-            Ok(Arc::new(root))
+            Ok(Arc::new(location))
         })
         .await?;
         let reported = Arc::<Mutex<Reported>>::default();
-        let watching = (Arc::clone(&root), Arc::clone(&reported));
+        let watching = (Arc::clone(&location), Arc::clone(&reported));
         let watcher = off_runtime(move || {
             FsWatcher::start(
                 watching,
@@ -361,13 +357,13 @@ impl FsBackend {
             )
         })
         .await?;
-        Ok((FsBackend { root, reported }, watcher))
+        Ok((FsBackend { location, reported }, watcher))
     }
 
     pub(crate) async fn read(&self, path: &Path) -> Result<Option<File>> {
         let path = path.clone();
-        self.off_runtime(move |root| {
-            let Some((contents, modified)) = root.as_finished()?.read(&path)? else {
+        self.off_runtime(move |location| {
+            let Some((contents, modified)) = location.as_finished()?.read(&path)? else {
                 return Ok(None);
             };
             let revision = Revision::of_bytes(&contents);
@@ -380,8 +376,8 @@ impl FsBackend {
 
     pub(crate) async fn stat(&self, path: &Path) -> Result<Option<Stat>> {
         let path = path.clone();
-        self.off_runtime(move |root| {
-            let read = root.as_finished()?.read(&path)?;
+        self.off_runtime(move |location| {
+            let read = location.as_finished()?.read(&path)?;
             Ok(read.map(|(contents, modified)| Stat::new(modified, Revision::of_bytes(&contents))))
         })
         .await
@@ -389,36 +385,36 @@ impl FsBackend {
 
     pub(crate) async fn list(&self, prefix: &Prefix) -> Result<Vec<Path>> {
         let prefix = prefix.clone();
-        self.off_runtime(move |root| root.as_finished()?.paths_under(&prefix)).await
+        self.off_runtime(move |location| location.as_finished()?.paths_under(&prefix)).await
     }
 
     pub(crate) async fn revisions_under(&self, prefix: &Prefix) -> Result<Vec<(Path, Revision)>> {
         let prefix = prefix.clone();
-        self.off_runtime(move |root| root.as_finished()?.revisions_under(&prefix)).await
+        self.off_runtime(move |location| location.as_finished()?.revisions_under(&prefix)).await
     }
 
     /// Commits `request` to the directory, as the module's doc describes, and takes what it
     /// changed as reported, since the Store reports it.
     pub(crate) async fn commit(&self, request: CommitRequest) -> Result<CommitOutcome> {
-        let outcome = self.off_runtime(move |root| root.commit(request)).await?;
+        let outcome = self.off_runtime(move |location| location.commit(request)).await?;
         watch::lock_ignoring_poison(&self.reported).committed(&outcome);
         Ok(outcome)
     }
 
-    /// Runs `call` with the root, on a blocking thread.
+    /// Runs `call` with the Location, on a blocking thread.
     async fn off_runtime<T: Send + 'static>(
         &self,
-        call: impl FnOnce(&AreaRoot) -> Result<T> + Send + 'static,
+        call: impl FnOnce(&Location) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        let root = Arc::clone(&self.root);
-        off_runtime(move || call(&root)).await
+        let location = Arc::clone(&self.location);
+        off_runtime(move || call(&location)).await
     }
 }
 
-/// One Area's root directory, and how its filesystem treats names.
+/// The Location's directory, and how its filesystem treats names.
 #[derive(Debug)]
-struct AreaRoot {
-    root: PathBuf,
+struct Location {
+    directory: PathBuf,
     /// Whether the filesystem finds a file under names that differ from its own, such as `FOO`
     /// for `foo`, so that a Path must be checked against the names really there.
     names_fold: bool,
@@ -426,7 +422,7 @@ struct AreaRoot {
     failures: FailureSetup,
 }
 
-/// The lock on an Area, which keeps out every other tidings Commit to it. Dropping it unlocks.
+/// The lock on the Location, which keeps out every other tidings Commit to it. Dropping it unlocks.
 struct Locked {
     _lock: fs::File,
 }
@@ -437,43 +433,47 @@ struct Writing {
     contents: String,
 }
 
-impl AreaRoot {
-    /// The Area whose root is `root`, which it makes, with its `.tidings/` directory and lock
+impl Location {
+    /// The Location `directory`, which it makes, with its `.tidings/` directory and lock
     /// file, if they don't exist, and then resolves through any symlinks. It finds out whether
     /// the filesystem there treats names that differ in letter case as the same: whether
     /// `.tidings/LOCK` finds the lock file, though no entry has that name.
-    fn open(root: PathBuf) -> Result<AreaRoot> {
-        let mut area = AreaRoot {
-            root,
+    fn open(directory: PathBuf) -> Result<Location> {
+        let mut location = Location {
+            directory,
             names_fold: false,
             #[cfg(feature = "testing")]
             failures: FailureSetup::default(),
         };
-        drop(area.lock_file()?);
-        area.root = fs::canonicalize(&area.root).map_err(|error| failed(&area.root, error))?;
-        let tidings = area.tidings();
+        drop(location.lock_file()?);
+        location.directory = fs::canonicalize(&location.directory)
+            .map_err(|error| failed(&location.directory, error))?;
+        let tidings = location.tidings();
         let upper_case = tidings.join("LOCK");
-        area.names_fold = present_at(fs::symlink_metadata(&upper_case), &upper_case)?.is_some()
+        location.names_fold = present_at(fs::symlink_metadata(&upper_case), &upper_case)?.is_some()
             && !has_entry(&tidings, "LOCK".as_ref())?;
-        Ok(area)
+        Ok(location)
     }
 
     /// Where the File at `path`, or the directory of a Prefix, is on disk, or would be. If it is
     /// a symlink, it is the link.
     fn file(&self, path: &str) -> PathBuf {
-        on_disk(&self.root, path)
+        on_disk(&self.directory, path)
     }
 
-    /// tidings' own directory in the Area.
+    /// tidings' own directory in the Location.
     fn tidings(&self) -> PathBuf {
-        self.root.join(RESERVED)
+        self.directory.join(RESERVED)
     }
 
-    /// Opens the lock file, making the Area's root and `.tidings/` first if they don't exist, as
-    /// they don't once someone clears a Cache.
+    /// Opens the lock file, making the Location, its `.tidings/` and its Backend marker first if
+    /// they don't exist, as they don't once someone removes the Location. Gives
+    /// [`Error::WrongBackend`] if a Store on the other Backend has marked it since.
     fn lock_file(&self) -> Result<fs::File> {
         let tidings = self.tidings();
-        fs::create_dir_all(&tidings).map_err(|error| failed(&tidings, error))?;
+        if !tidings.is_dir() {
+            marker::claim(&self.directory, BackendKind::Fs)?;
+        }
         let lock_file = tidings.join("lock");
         fs::OpenOptions::new()
             .read(true)
@@ -484,15 +484,15 @@ impl AreaRoot {
             .map_err(|error| failed(&lock_file, error))
     }
 
-    /// Takes the lock on the Area.
+    /// Takes the lock on the Location.
     fn lock(&self) -> Result<Locked> {
         let lock = self.lock_file()?;
         lock.lock().map_err(|error| failed(&self.tidings().join("lock"), error))?;
         Ok(Locked { _lock: lock })
     }
 
-    /// Finishes `journal`, a committed Commit's, in the Area, which must be locked. `again` says
-    /// whether the Commit may be partly finished already ([`Journal::finish`]). If finishing
+    /// Finishes `journal`, a committed Commit's, in the Location, which must be locked. `again`
+    /// says whether the Commit may be partly finished already ([`Journal::finish`]). If finishing
     /// fails, it is tried again after each of the [`RETRY_DELAYS`], as finishing again, and the
     /// last error is given if it still fails. A stop at a failure point isn't tried again.
     fn finish(&self, journal: &Journal, again: bool) -> Result<()> {
@@ -504,7 +504,7 @@ impl AreaRoot {
                 Err(error) => {
                     tracing::debug!(
                         "finishing a Commit to {} failed, trying again in {delay:?}: {error}",
-                        self.root.display(),
+                        self.directory.display(),
                     );
                 }
             }
@@ -563,11 +563,11 @@ impl AreaRoot {
         }
     }
 
-    /// Follows `segments` down from the root while each is a directory there under exactly its
-    /// own name, and not a symlink. The one walk from the root that reads, writes and finishing
+    /// Follows `segments` down from the Location while each is a directory there under exactly its
+    /// own name, and not a symlink. The one walk from the Location that reads, writes and finishing
     /// share.
     fn own_directories(&self, segments: &[&str]) -> Result<OwnDirectories> {
-        let mut directory = self.root.clone();
+        let mut directory = self.directory.clone();
         for (count, segment) in segments.iter().enumerate() {
             let next = directory.join(segment);
             let there = present_at(fs::symlink_metadata(&next), &next)?;
@@ -586,7 +586,7 @@ impl AreaRoot {
         Ok(OwnDirectories { directory, count: segments.len(), next_left_out: None })
     }
 
-    /// Why `name`, a Path or a Prefix without its `/`, is left out of the Area, if it is: it, or
+    /// Why `name`, a Path or a Prefix without its `/`, is left out of the Store, if it is: it, or
     /// a directory on the way to it, is found only under another name that the filesystem treats
     /// as the same, or is a symlink to a directory.
     fn left_out(&self, name: &str) -> Result<Option<LeftOut>> {
@@ -603,7 +603,7 @@ impl AreaRoot {
         read_file(&self.file(path.as_str()))
     }
 
-    /// The Area as reads through tidings see it, with the Commit in its journal finished.
+    /// The Store as reads through tidings see it, with the Commit in its journal finished.
     fn as_finished(&self) -> Result<AsFinished<'_>> {
         AsFinished::of(self)
     }
@@ -612,7 +612,10 @@ impl AreaRoot {
     fn commit(&self, request: CommitRequest) -> Result<CommitOutcome> {
         let _locked = self.lock()?;
         if let Recovery::Left(error) = journal::recover(self)? {
-            return Err(Error::backend(EarlierCommitLeft { area: self.root.clone(), error }));
+            return Err(Error::backend(EarlierCommitLeft {
+                location: self.directory.clone(),
+                error,
+            }));
         }
         let timestamp = request.timestamp;
         let plan = request.plan(self)?;
@@ -635,7 +638,7 @@ impl AreaRoot {
         let mut same_file = SameFile::default();
         for Remove { path, .. } in &removes {
             let file = self.file(path.as_str());
-            let directory = file.parent().unwrap_or(&self.root);
+            let directory = file.parent().unwrap_or(&self.directory);
             let identity = self.identity(directory, file.file_name().unwrap_or_default())?;
             same_file.deleted(path, identity);
         }
@@ -694,7 +697,7 @@ impl AreaRoot {
             Err(error) => {
                 tracing::debug!(
                     "a Commit to {} is pending, since it can't be finished yet: {error}",
-                    self.root.display(),
+                    self.directory.display(),
                 );
                 Ok(CommitOutcome { pending: true, ..outcome })
             }
@@ -718,7 +721,7 @@ impl AreaRoot {
             Ok(true) => {
                 tracing::debug!(
                     "writing a Commit's journal in {} as committed failed, but it is: {error}",
-                    self.root.display(),
+                    self.directory.display(),
                 );
                 return Ok(());
             }
@@ -821,16 +824,16 @@ impl AreaRoot {
         if self.names_fold { letter_case_fold(path) } else { path.to_owned() }
     }
 
-    /// The [`deleted_form`](Self::deleted_form) of `file`, a place on disk under the root, if its
+    /// The [`deleted_form`](Self::deleted_form) of `file`, a place on disk in the Location, if its
     /// name is Unicode.
     fn deleted_form_on_disk(&self, file: &FsPath) -> Option<String> {
-        let relative = file.strip_prefix(&self.root).ok()?;
+        let relative = file.strip_prefix(&self.directory).ok()?;
         let segments: Option<Vec<&str>> = relative.iter().map(|segment| segment.to_str()).collect();
         Some(self.deleted_form(&segments?.join("/")))
     }
 
     /// Which file on disk `name` in `directory` is, whichever symlinks to directories led there,
-    /// as they can to the File a symlink points to, outside the Area: the directory as
+    /// as they can to the File a symlink points to, outside the Location: the directory as
     /// [`fs::canonicalize`] gives it, and `name`, which may go on through
     /// directories that don't exist yet. Where names fold, it is folded as a whole, since two
     /// names that differ only in letter case are then one file. (If a symlink leads from there to
@@ -846,8 +849,8 @@ impl AreaRoot {
     }
 
     /// Makes the directories the File at `path` goes in that don't exist under their own names,
-    /// from the root down, adding each directory changed to `changed`. Something else with one of
-    /// their names is removed first: a directory the Commit's deletes emptied, which on a
+    /// from the Location down, adding each directory changed to `changed`. Something else with one
+    /// of their names is removed first: a directory the Commit's deletes emptied, which on a
     /// filesystem that ignores letter case can differ from it in case.
     fn make_directories(&self, path: &Path, changed: &mut BTreeSet<PathBuf>) -> Result<()> {
         let segments: Vec<&str> = path.as_str().split('/').collect();
@@ -913,7 +916,7 @@ enum OnDisk {
 
 impl OnDisk {
     /// What `entry` is, or `None` if it is neither a File nor a directory, as a symlink to nothing
-    /// isn't. A symlink to a directory is `None` too, since it is left out of the Area.
+    /// isn't. A symlink to a directory is `None` too, since it is left out of the Store.
     fn of(entry: &fs::DirEntry) -> Result<Option<OnDisk>> {
         let file_type = entry.file_type().map_err(|error| failed(&entry.path(), error))?;
         if file_type.is_dir() {
@@ -931,7 +934,7 @@ impl OnDisk {
     }
 }
 
-impl AreaState for AreaRoot {
+impl StoreState for Location {
     fn revision(&self, path: &Path) -> Result<Option<Revision>> {
         Ok(self.read(path)?.map(|(contents, _)| Revision::of_bytes(&contents)))
     }
@@ -942,7 +945,7 @@ impl AreaState for AreaRoot {
     }
 
     fn paths_under(&self, prefix: &Prefix) -> Result<Vec<Path>> {
-        AreaRoot::paths_under(self, prefix)
+        Location::paths_under(self, prefix)
     }
 
     /// Lists only the directories along the way to `name`: for each of its segments, the entries
@@ -976,7 +979,7 @@ impl AreaState for AreaRoot {
                         OnDisk::Directory if format!("{named}/") == name => {}
                         OnDisk::Directory => {
                             if let Ok(under) = Prefix::new(format!("{named}/")) {
-                                found.extend(AreaRoot::paths_under(self, &under)?);
+                                found.extend(Location::paths_under(self, &under)?);
                             }
                         }
                         OnDisk::File if last => found.extend(Path::new(named)),
@@ -991,28 +994,28 @@ impl AreaState for AreaRoot {
     }
 }
 
-/// Where a write goes, as [`AreaRoot::where_to_write`] works it out.
+/// Where a write goes, as [`Location::where_to_write`] works it out.
 struct Destination {
     /// The directory its temporary file goes in.
     directory: PathBuf,
     /// What it replaces.
     target: Target,
-    /// Which file on disk that is, as [`AreaRoot::identity`] gives it.
+    /// Which file on disk that is, as [`Location::identity`] gives it.
     identity: PathBuf,
 }
 
-/// How far a Path's segments lead down from the root through directories there under exactly
-/// their own names, as [`AreaRoot::own_directories`] gives it.
+/// How far a Path's segments lead down from the Location through directories there under exactly
+/// their own names, as [`Location::own_directories`] gives it.
 struct OwnDirectories {
-    /// The last of those directories, or the root.
+    /// The last of those directories, or the Location.
     directory: PathBuf,
     /// How many segments they are.
     count: usize,
-    /// Why the segment after them is left out of the Area, if it is there but left out.
+    /// Why the segment after them is left out of the Store, if it is there but left out.
     next_left_out: Option<LeftOut>,
 }
 
-/// Why something on disk is left out of the Area, as [`AreaRoot::left_out`] gives it.
+/// Why something on disk is left out of the Store, as [`Location::left_out`] gives it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LeftOut {
     /// It is there only under another name that the filesystem treats as the same.
@@ -1026,7 +1029,7 @@ enum LeftOut {
 /// they land in, and finishing the Commit again after a crash could lose the write.
 #[derive(Default)]
 struct SameFile {
-    /// Each file on disk a Path the Commit writes is, as [`AreaRoot::identity`] gives it.
+    /// Each file on disk a Path the Commit writes is, as [`Location::identity`] gives it.
     written: HashSet<PathBuf>,
     /// Each file on disk a Path the Commit deletes is, with the letter-case fold of each such
     /// Path.
@@ -1060,7 +1063,7 @@ impl SameFile {
     }
 }
 
-/// Whether `error` is from [`AreaRoot::stop_at`], which is never tried again.
+/// Whether `error` is from [`Location::stop_at`], which is never tried again.
 fn stopped(error: &Error) -> bool {
     #[cfg(feature = "testing")]
     if let Error::Backend(error) = error {
@@ -1097,10 +1100,10 @@ fn has_entry(directory: &FsPath, name: &std::ffi::OsStr) -> Result<bool> {
     Ok(false)
 }
 
-/// Where the File at `path`, or the directory of a Prefix, is on disk in the Area whose root is
-/// `root`, or would be, one segment at a time.
-fn on_disk(root: &FsPath, path: &str) -> PathBuf {
-    let mut file = root.to_path_buf();
+/// Where the File at `path`, or the directory of a Prefix, is on disk in the Location
+/// `location`, or would be, one segment at a time.
+fn on_disk(location: &FsPath, path: &str) -> PathBuf {
+    let mut file = location.to_path_buf();
     file.extend(path.split('/'));
     file
 }
@@ -1132,14 +1135,14 @@ fn read_file(file: &FsPath) -> Result<Option<(Vec<u8>, Timestamp)>> {
 /// of the File it replaces, if there is one, and `modified` as its modification time, and forces
 /// it to disk.
 fn write_temporary_file(
-    area: &AreaRoot,
+    location: &Location,
     replace: &Replace,
     contents: &str,
     modified: Timestamp,
 ) -> io::Result<()> {
     let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&replace.temporary)?;
     file.write_all(contents.as_bytes())?;
-    if let Some(replaced) = present(fs::metadata(replace.on_disk(&area.root)))? {
+    if let Some(replaced) = present(fs::metadata(replace.on_disk(&location.directory)))? {
         file.set_permissions(replaced.permissions())?;
     }
     file.set_modified(SystemTime::from(modified))?;
@@ -1147,7 +1150,7 @@ fn write_temporary_file(
 }
 
 /// Removes `directory`, which holds nothing but directories that hold nothing. It fails if there
-/// is anything else in it, or if it is a symlink, so that nothing outside the Area is removed.
+/// is anything else in it, or if it is a symlink, so that nothing outside the Location is removed.
 fn remove_empty_directories(directory: &FsPath) -> io::Result<()> {
     if !fs::symlink_metadata(directory)?.is_dir() {
         return Err(io::Error::other("it isn't a directory"));

@@ -7,11 +7,9 @@ mod common;
 use std::thread;
 use std::time::Duration;
 
-#[cfg(any(feature = "fs", feature = "sqlite"))]
-use common::app;
 use common::paths_and_origins;
 use tidings::blocking::{ChangeFeed, Snapshot, Store};
-use tidings::{Area, Change, ChangeKind, FeedItem, Origin, Staging};
+use tidings::{Change, ChangeKind, FeedItem, Origin, Staging};
 
 #[test]
 fn a_blocking_store_and_what_it_gives_can_be_shared_between_threads() {
@@ -58,7 +56,7 @@ fn the_blocking_api_works_in_block_in_place() {
 #[test]
 fn a_blocking_store_can_be_dropped_within_an_async_runtime() {
     let (store, feed) = Store::open_memory();
-    let snapshot = store.snapshot(Area::Data).unwrap();
+    let snapshot = store.snapshot().unwrap();
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async move {
@@ -75,7 +73,7 @@ fn the_change_feed_is_an_iterator_that_ends_once_every_store_handle_is_dropped()
     let reader = thread::spawn(move || feed.flat_map(batch_of).collect::<Vec<_>>());
 
     for path in ["a.txt", "b.txt"] {
-        let mut staging = Staging::new(Area::Data);
+        let mut staging = Staging::new();
         staging.write(path, "x").unwrap();
         store.commit(staging).unwrap();
     }
@@ -90,14 +88,14 @@ fn the_change_feed_is_an_iterator_that_ends_once_every_store_handle_is_dropped()
 fn an_injected_external_change_reaches_the_change_feed() {
     let (store, mut feed) = Store::open_memory();
 
-    store.inject_external_change(Area::Config, "a.toml", ChangeKind::Removed).unwrap();
+    store.inject_external_change("a.toml", ChangeKind::Removed).unwrap();
 
     let item = feed.next_timeout(Duration::from_secs(5)).unwrap().unwrap();
     let batch = batch_of(item);
     assert_eq!(batch.len(), 1);
     assert_eq!(
-        (batch[0].area, batch[0].path.as_str(), batch[0].kind, batch[0].origin),
-        (Area::Config, "a.toml", ChangeKind::Removed, Origin::External),
+        (batch[0].path.as_str(), batch[0].kind, batch[0].origin),
+        ("a.toml", ChangeKind::Removed, Origin::External),
     );
 }
 
@@ -106,12 +104,12 @@ fn an_injected_external_change_reaches_the_change_feed() {
 #[cfg(feature = "sqlite")]
 #[test]
 fn another_stores_commits_arrive_while_the_app_is_not_calling_the_store() {
-    let root = tempfile::tempdir().unwrap();
-    let options = || sqlite_options(root.path()).poll_interval(Duration::from_millis(10));
-    let (_store, mut feed) = Store::open_sqlite(&app(), options()).unwrap();
-    let (other, _other_feed) = Store::open_sqlite(&app(), options()).unwrap();
+    let location = tempfile::tempdir().unwrap();
+    let options = || tidings::SqliteOptions::default().poll_interval(Duration::from_millis(10));
+    let (_store, mut feed) = Store::open_sqlite(location.path(), options()).unwrap();
+    let (other, _other_feed) = Store::open_sqlite(location.path(), options()).unwrap();
 
-    let mut staging = Staging::new(Area::Data);
+    let mut staging = Staging::new();
     staging.write("elsewhere.txt", "x").unwrap();
     other.commit(staging).unwrap();
     thread::sleep(Duration::from_secs(1));
@@ -121,16 +119,16 @@ fn another_stores_commits_arrive_while_the_app_is_not_calling_the_store() {
     assert_eq!(paths_and_origins(&batch), [("elsewhere.txt", Origin::External)],);
 }
 
-/// Edits in an Area's directory are watched for while the app isn't calling the Store: they are
-/// on the Change feed before the app next looks, and it needn't wait at all.
+/// Edits in the Location are watched for while the app isn't calling the Store: they are on the
+/// Change feed before the app next looks, and it needn't wait at all.
 #[cfg(feature = "fs")]
 #[test]
-fn edits_in_an_area_arrive_while_the_app_is_not_calling_the_store() {
-    let root = tempfile::tempdir().unwrap();
-    let options = fs_options(root.path()).debounce_window(Duration::from_millis(20));
-    let (_store, mut feed) = Store::open_fs(&app(), options).unwrap();
+fn edits_in_the_location_arrive_while_the_app_is_not_calling_the_store() {
+    let location = tempfile::tempdir().unwrap();
+    let options = tidings::FsOptions::default().debounce_window(Duration::from_millis(20));
+    let (_store, mut feed) = Store::open_fs(location.path(), options).unwrap();
 
-    std::fs::write(root.path().join("config").join("settings.toml"), "a = 1\n").unwrap();
+    std::fs::write(location.path().join("settings.toml"), "a = 1\n").unwrap();
     thread::sleep(Duration::from_secs(1));
 
     let item = feed.next_timeout(Duration::ZERO).expect("it should have arrived by now");
@@ -145,15 +143,16 @@ fn edits_in_an_area_arrive_while_the_app_is_not_calling_the_store() {
 fn a_commit_in_progress_finishes_and_is_reported_when_every_other_handle_is_dropped() {
     use tidings::{FailurePoint, Pause};
 
-    let root = tempfile::tempdir().unwrap();
+    let location = tempfile::tempdir().unwrap();
     let pause = Pause::new();
-    let options = fs_options(root.path()).pause_at(FailurePoint::AfterCommittedJournal, &pause);
-    let (store, mut feed) = Store::open_fs(&app(), options).unwrap();
+    let options =
+        tidings::FsOptions::default().pause_at(FailurePoint::AfterCommittedJournal, &pause);
+    let (store, mut feed) = Store::open_fs(location.path(), options).unwrap();
 
     let committing = {
         let store = store.clone();
         thread::spawn(move || {
-            let mut staging = Staging::new(Area::Data);
+            let mut staging = Staging::new();
             staging.write("in-progress.txt", "x").unwrap();
             store.commit(staging)
         })
@@ -168,29 +167,18 @@ fn a_commit_in_progress_finishes_and_is_reported_when_every_other_handle_is_drop
     let batch = batch_of(item);
     assert_eq!(paths_and_origins(&batch), [("in-progress.txt", Origin::Local)],);
     assert_eq!(feed.next_timeout(Duration::from_secs(5)), Ok(None));
-    let (store, _feed) = Store::open_fs(&app(), fs_options(root.path())).unwrap();
-    assert_eq!(store.read(Area::Data, "in-progress.txt").unwrap().unwrap().contents(), "x");
+    let (store, _feed) = Store::open_fs(location.path(), tidings::FsOptions::default()).unwrap();
+    assert_eq!(store.read("in-progress.txt").unwrap().unwrap().contents(), "x");
 }
 
 // Helpers shared by the tests above.
 
-/// Options that open a filesystem Store on `root`.
-#[cfg(feature = "fs")]
-fn fs_options(root: &std::path::Path) -> tidings::FsOptions {
-    tidings::FsOptions::default().root_override(root)
-}
-
-/// Options that open a SQLite Store on `root`.
-#[cfg(feature = "sqlite")]
-fn sqlite_options(root: &std::path::Path) -> tidings::SqliteOptions {
-    tidings::SqliteOptions::default().root_override(root)
-}
-
 /// A Store opened through the blocking API, with a Snapshot and its Change feed, to call in
 /// places where blocking isn't allowed.
 struct Handles {
+    /// Where a Store on the filesystem or SQLite would be opened.
     #[cfg(any(feature = "fs", feature = "sqlite"))]
-    root: tempfile::TempDir,
+    directory: tempfile::TempDir,
     store: Store,
     snapshot: Snapshot,
     feed: ChangeFeed,
@@ -199,10 +187,10 @@ struct Handles {
 impl Handles {
     fn new() -> Handles {
         let (store, feed) = Store::open_memory();
-        let snapshot = store.snapshot(Area::Data).unwrap();
+        let snapshot = store.snapshot().unwrap();
         Handles {
             #[cfg(any(feature = "fs", feature = "sqlite"))]
-            root: tempfile::tempdir().unwrap(),
+            directory: tempfile::tempdir().unwrap(),
             store,
             snapshot,
             feed,
@@ -214,17 +202,20 @@ impl Handles {
 fn every_wait_panics(handles: Handles) {
     let Handles { store, snapshot, mut feed, .. } = handles;
     #[cfg(feature = "fs")]
-    assert_panics_here("open_fs", || Store::open_fs(&app(), fs_options(handles.root.path())));
+    let (location, options) = (handles.directory.path().join("fs"), tidings::FsOptions::default());
+    #[cfg(feature = "fs")]
+    assert_panics_here("open_fs", || Store::open_fs(location, options));
     #[cfg(feature = "sqlite")]
-    let sqlite_options = sqlite_options(handles.root.path());
+    let (location, options) =
+        (handles.directory.path().join("sqlite"), tidings::SqliteOptions::default());
     #[cfg(feature = "sqlite")]
-    assert_panics_here("open_sqlite", || Store::open_sqlite(&app(), sqlite_options));
-    assert_panics_here("read", || store.read(Area::Data, "a.txt"));
-    assert_panics_here("stat", || store.stat(Area::Data, "a.txt"));
-    assert_panics_here("list", || store.list(Area::Data, ""));
-    assert_panics_here("stat_prefix", || store.stat_prefix(Area::Data, ""));
-    assert_panics_here("snapshot", || store.snapshot(Area::Data));
-    assert_panics_here("commit", || store.commit(Staging::new(Area::Data)));
+    assert_panics_here("open_sqlite", || Store::open_sqlite(location, options));
+    assert_panics_here("read", || store.read("a.txt"));
+    assert_panics_here("stat", || store.stat("a.txt"));
+    assert_panics_here("list", || store.list(""));
+    assert_panics_here("stat_prefix", || store.stat_prefix(""));
+    assert_panics_here("snapshot", || store.snapshot());
+    assert_panics_here("commit", || store.commit(Staging::new()));
     assert_panics_here("reading a Snapshot", || snapshot.read("a.txt"));
     assert_panics_here("stat through a Snapshot", || snapshot.stat("a.txt"));
     assert_panics_here("listing a Snapshot", || snapshot.list(""));
@@ -232,32 +223,36 @@ fn every_wait_panics(handles: Handles) {
     assert_panics_here("next_timeout", || feed.next_timeout(Duration::ZERO));
 
     assert!(store.supports_snapshots());
-    store.inject_external_change(Area::Data, "a.txt", ChangeKind::Changed).unwrap();
+    store.inject_external_change("a.txt", ChangeKind::Changed).unwrap();
     drop(Store::open_memory());
 }
 
 /// Uses every method that waits, where it is called, and checks each gives what it should.
 fn every_wait_works() {
     #[cfg(any(feature = "fs", feature = "sqlite"))]
-    let root = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().unwrap();
     let mut opened = Vec::new();
     opened.push(Store::open_memory());
     #[cfg(feature = "fs")]
-    opened.push(Store::open_fs(&app(), fs_options(&root.path().join("fs"))).unwrap());
+    let options = tidings::FsOptions::default();
+    #[cfg(feature = "fs")]
+    opened.push(Store::open_fs(directory.path().join("fs"), options).unwrap());
     #[cfg(feature = "sqlite")]
-    opened.push(Store::open_sqlite(&app(), sqlite_options(&root.path().join("sqlite"))).unwrap());
+    let options = tidings::SqliteOptions::default();
+    #[cfg(feature = "sqlite")]
+    opened.push(Store::open_sqlite(directory.path().join("sqlite"), options).unwrap());
 
     for (store, mut feed) in opened {
-        let mut staging = Staging::new(Area::Data);
+        let mut staging = Staging::new();
         staging.write("a.txt", "a").unwrap();
         let committed = store.commit(staging).unwrap();
         let revision = committed.revisions().values().next().copied();
-        assert_eq!(store.read(Area::Data, "a.txt").unwrap().unwrap().contents(), "a");
-        assert_eq!(store.stat(Area::Data, "a.txt").unwrap().map(|stat| stat.revision()), revision);
-        assert_eq!(store.list(Area::Data, "").unwrap().len(), 1);
-        store.stat_prefix(Area::Data, "").unwrap();
+        assert_eq!(store.read("a.txt").unwrap().unwrap().contents(), "a");
+        assert_eq!(store.stat("a.txt").unwrap().map(|stat| stat.revision()), revision);
+        assert_eq!(store.list("").unwrap().len(), 1);
+        store.stat_prefix("").unwrap();
         if store.supports_snapshots() {
-            let snapshot = store.snapshot(Area::Data).unwrap();
+            let snapshot = store.snapshot().unwrap();
             assert_eq!(snapshot.read("a.txt").unwrap().unwrap().contents(), "a");
             assert_eq!(snapshot.stat("a.txt").unwrap().map(|stat| stat.revision()), revision);
             assert_eq!(snapshot.list("").unwrap().len(), 1);

@@ -4,23 +4,23 @@
 use std::io::Write;
 use std::process::Command;
 
-use tidings::{Area, Precondition};
+use tidings::Precondition;
 
 use super::{Session, keep_edit};
 use crate::failure::Failure;
 use crate::output::Report;
 
 impl Session {
-    /// Edits the File at `path` in `area`, or a new one if there is none, then writes it back,
+    /// Edits the File at `path`, or a new one if there is none, then writes it back,
     /// requiring it to be unchanged since it was read, or still absent. In an open Staging, the
     /// write is staged instead. If the text wasn't changed, or the editor quit with a failure,
     /// nothing is.
     ///
     /// If the write fails, now or when the Staging is committed, the edited text is kept in the
     /// temporary file it was edited in, which the failure names.
-    pub(super) async fn edit(&mut self, area: Area, path: &str) -> Result<Report, Failure> {
+    pub(super) async fn edit(&mut self, path: &str) -> Result<Report, Failure> {
         let editor = editor()?;
-        let file = self.store.read(area, path).await?;
+        let file = self.store.read(path).await?;
         let original = file.as_ref().map_or("", |file| file.contents());
 
         let mut buffer =
@@ -44,7 +44,7 @@ impl Session {
 
         let buffer = buffer.into_temp_path();
         let written = self
-            .stage_or_commit(area, |staging| match &file {
+            .stage_or_commit(|staging| match &file {
                 Some(file) => {
                     staging.write_back(file, edited);
                     Ok(())

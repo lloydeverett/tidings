@@ -7,7 +7,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::{Error, Result};
 
-/// A File's name within its Area, known to be valid.
+/// A File's name within its Store, known to be valid.
 ///
 /// A Path follows the strictest platform's rules, on every Backend, so a Path that works on one
 /// platform works on all of them. It is relative and `/`-separated, with no empty, `.` or `..`
@@ -43,8 +43,8 @@ impl Path {
     }
 }
 
-/// The top-level name tidings keeps its own bookkeeping under: the directory in each Area's root
-/// that holds everything a Backend keeps there. It is its own [`letter_case_fold`].
+/// The top-level name tidings keeps its own bookkeeping under: the directory in a Location that
+/// holds everything a Backend keeps there. It is its own [`letter_case_fold`].
 pub(crate) const RESERVED: &str = ".tidings";
 
 /// Why `path` is refused, if it is.
@@ -204,7 +204,7 @@ pub enum InvalidPathReason {
     /// A Prefix other than the empty one doesn't end with `/`.
     NoTrailingSlash,
     /// A Commit would create a Path that differs only in letter case from another Path in the
-    /// Area, or from another Path in the same Commit, or would put it under a Prefix that does,
+    /// Store, or from another Path in the same Commit, or would put it under a Prefix that does,
     /// as with `Themes/a` beside `themes/b`. Some platforms treat them as the same name, so only
     /// one is allowed.
     LetterCaseClash,
@@ -222,7 +222,7 @@ pub enum InvalidPathReason {
     /// both is fine.
     SameFile,
     /// A filesystem Commit would write a Path that is, or is under, a symlink to a directory. A
-    /// symlink to a directory is left out of the Area, with everything under it, so nothing is
+    /// symlink to a directory is left out of the Store, with everything under it, so nothing is
     /// written through one.
     DirectoryLink,
 }
@@ -242,7 +242,7 @@ impl fmt::Display for InvalidPathReason {
             }
             InvalidPathReason::NoTrailingSlash => "it is a Prefix that doesn't end with `/`",
             InvalidPathReason::LetterCaseClash => {
-                "it differs only in letter case from another Path in the Area"
+                "it differs only in letter case from another Path in the Store"
             }
             InvalidPathReason::FileUnderFile => {
                 "it would be under another File, or have other Files under it"
@@ -252,7 +252,7 @@ impl fmt::Display for InvalidPathReason {
                  deletes"
             }
             InvalidPathReason::DirectoryLink => {
-                "it is, or is under, a symlink to a directory, which is left out of the Area"
+                "it is, or is under, a symlink to a directory, which is left out of the Store"
             }
         })
     }

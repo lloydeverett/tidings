@@ -1,11 +1,10 @@
-//! Tests for Backends where a second Store can be opened on the same storage, standing in for
+//! Tests for Backends where a second Store can be opened on the same Location, standing in for
 //! another process: SQLite and the filesystem. Each test calls its Fixture's `open` more than
-//! once, and the Stores share the Fixture's Root override. Each is listed in
-//! [`two_stores_suite!`].
+//! once, and the Stores share the Fixture's Location. Each is listed in [`two_stores_suite!`].
 
 use std::collections::BTreeMap;
 
-use tidings::{Area, Change, ChangeKind, Error, FeedItem, Origin, Staging};
+use tidings::{Change, ChangeKind, Error, FeedItem, Origin, Staging};
 
 use crate::api::{ChangeFeed, Store};
 use crate::common::{assert_nothing_more, changes_in_full, next_batch, next_item};
@@ -57,7 +56,7 @@ pub async fn another_stores_commit_arrives_as_one_batch_of_external_changes(
     let Opened { store: first, feed: mut first_feed } = fixture.open().await;
     let Opened { store: second, feed: mut second_feed } = fixture.open().await;
 
-    let mut staging = Staging::new(Area::Config);
+    let mut staging = Staging::new();
     staging.write("settings.toml", "a = 1\n").unwrap();
     staging.write("themes/dark.toml", "b = 2\n").unwrap();
     first.commit(staging).await.unwrap();
@@ -66,33 +65,33 @@ pub async fn another_stores_commit_arrives_as_one_batch_of_external_changes(
     assert_eq!(
         changes_in_full(&next_batch(&mut second_feed).await),
         [
-            (Area::Config, "settings.toml", ChangeKind::Changed, Origin::External),
-            (Area::Config, "themes/dark.toml", ChangeKind::Changed, Origin::External),
+            ("settings.toml", ChangeKind::Changed, Origin::External),
+            ("themes/dark.toml", ChangeKind::Changed, Origin::External),
         ],
     );
-    let file = second.read(Area::Config, "settings.toml").await.unwrap().unwrap();
+    let file = second.read("settings.toml").await.unwrap().unwrap();
     assert_eq!(file.contents(), "a = 1\n");
     // The first Store is told once, as local.
     assert_eq!(
         changes_in_full(&next_batch(&mut first_feed).await),
         [
-            (Area::Config, "settings.toml", ChangeKind::Changed, Origin::Local),
-            (Area::Config, "themes/dark.toml", ChangeKind::Changed, Origin::Local),
+            ("settings.toml", ChangeKind::Changed, Origin::Local),
+            ("themes/dark.toml", ChangeKind::Changed, Origin::Local),
         ],
     );
 
     // And the other way round.
-    let mut staging = Staging::new(Area::Data);
+    let mut staging = Staging::new();
     staging.delete("missing.txt").unwrap();
     staging.write("from-second.txt", "x").unwrap();
     second.commit(staging).await.unwrap();
     assert_eq!(
         changes_in_full(&next_batch(&mut first_feed).await),
-        [(Area::Data, "from-second.txt", ChangeKind::Changed, Origin::External)],
+        [("from-second.txt", ChangeKind::Changed, Origin::External)],
     );
     assert_eq!(
         changes_in_full(&next_batch(&mut second_feed).await),
-        [(Area::Data, "from-second.txt", ChangeKind::Changed, Origin::Local)],
+        [("from-second.txt", ChangeKind::Changed, Origin::Local)],
     );
 
     assert_nothing_more(&mut first_feed).await;
@@ -101,22 +100,22 @@ pub async fn another_stores_commit_arrives_as_one_batch_of_external_changes(
 
 pub async fn commits_made_before_a_store_is_opened_are_not_reported_to_it(fixture: &impl Fixture) {
     let Opened { store: first, feed: _first_feed } = fixture.open().await;
-    let mut staging = Staging::new(Area::Data);
+    let mut staging = Staging::new();
     staging.write("before.txt", "x").unwrap();
     first.commit(staging).await.unwrap();
 
     let Opened { store: second, feed: mut second_feed } = fixture.open().await;
-    let mut staging = Staging::new(Area::Data);
+    let mut staging = Staging::new();
     staging.write("after.txt", "x").unwrap();
     first.commit(staging).await.unwrap();
 
     assert_eq!(
         changes_in_full(&next_batch(&mut second_feed).await),
-        [(Area::Data, "after.txt", ChangeKind::Changed, Origin::External)],
+        [("after.txt", ChangeKind::Changed, Origin::External)],
     );
     assert_nothing_more(&mut second_feed).await;
     // It still sees what was there.
-    assert!(second.read(Area::Data, "before.txt").await.unwrap().is_some());
+    assert!(second.read("before.txt").await.unwrap().is_some());
 }
 
 pub async fn another_stores_commits_made_apart_each_arrive_in_one_batch(fixture: &impl Fixture) {
@@ -127,7 +126,7 @@ pub async fn another_stores_commits_made_apart_each_arrive_in_one_batch(fixture:
     const FILES: usize = 20;
 
     for commit in 0..10 {
-        let mut staging = Staging::new(Area::Data);
+        let mut staging = Staging::new();
         for file in 0..FILES {
             staging.write(format!("{commit}/{file}"), "x").unwrap();
         }
@@ -171,7 +170,7 @@ pub async fn another_stores_commits_are_never_split_across_batches(fixture: &imp
         })
     });
     for commit in 0..COMMITS {
-        let mut staging = Staging::new(Area::Data);
+        let mut staging = Staging::new();
         for file in 0..FILES {
             staging.write(format!("{commit}/{file}"), "x").unwrap();
         }
@@ -236,7 +235,7 @@ async fn race_then_mark(fixture: &impl Fixture, marked_by: Marker) {
                 let store = if task % 2 == 0 { first.clone() } else { second.clone() };
                 tokio::spawn(async move {
                     for step in 0..4 {
-                        let mut staging = Staging::new(Area::Data);
+                        let mut staging = Staging::new();
                         if (task / 2 + step) % 2 == 0 {
                             staging.write("raced.txt", format!("{round} {task} {step}")).unwrap();
                         } else {
@@ -251,11 +250,11 @@ async fn race_then_mark(fixture: &impl Fixture, marked_by: Marker) {
             task.await.unwrap();
         }
         let marker = format!("round-{round}.txt");
-        let mut staging = Staging::new(Area::Data);
+        let mut staging = Staging::new();
         staging.write(marker.as_str(), "x").unwrap();
         marking.commit(staging).await.unwrap();
 
-        let there = first.read(Area::Data, "raced.txt").await.unwrap().is_some();
+        let there = first.read("raced.txt").await.unwrap().is_some();
         let expected = if there { ChangeKind::Changed } else { ChangeKind::Removed };
         let mut feeds = vec![&mut first_feed, &mut second_feed];
         if marked_by == Marker::BySecondStore {
@@ -271,7 +270,7 @@ async fn race_then_mark(fixture: &impl Fixture, marked_by: Marker) {
 pub async fn concurrent_commits_from_both_stores_keep_preconditions_exact(fixture: &impl Fixture) {
     let Opened { store: first, feed: _first_feed } = fixture.open().await;
     let Opened { store: second, feed: _second_feed } = fixture.open().await;
-    let mut staging = Staging::new(Area::Data);
+    let mut staging = Staging::new();
     staging.write("counter.txt", "0").unwrap();
     first.commit(staging).await.unwrap();
 
@@ -298,7 +297,7 @@ pub async fn concurrent_commits_from_both_stores_keep_preconditions_exact(fixtur
         task.await.unwrap();
     }
 
-    let counter = second.read(Area::Data, "counter.txt").await.unwrap().unwrap();
+    let counter = second.read("counter.txt").await.unwrap().unwrap();
     assert_eq!(counter.contents(), (TASKS * ADDITIONS).to_string());
 }
 
@@ -306,9 +305,9 @@ pub async fn concurrent_commits_from_both_stores_keep_preconditions_exact(fixtur
 
 /// Adds one to the counter, if nobody changed it in between. Gives whether it did.
 async fn add_one(store: &Store) -> bool {
-    let counter = store.read(Area::Data, "counter.txt").await.unwrap().unwrap();
+    let counter = store.read("counter.txt").await.unwrap().unwrap();
     let next = counter.contents().parse::<usize>().unwrap() + 1;
-    let mut staging = Staging::new(Area::Data);
+    let mut staging = Staging::new();
     staging.write_back(&counter, next.to_string());
     match store.commit(staging).await {
         Ok(_) => true,

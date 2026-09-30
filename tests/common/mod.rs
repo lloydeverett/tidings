@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use tidings::blocking::TimedOut;
-use tidings::{Area, Change, ChangeFeed, ChangeKind, FeedItem, Origin};
+use tidings::{Change, ChangeFeed, ChangeKind, FeedItem, Origin};
 
 /// A Change feed the helpers can wait on: the async one, or the behaviour suite's stand-in, which
 /// can also be the blocking one. tidings' own tests always have the `blocking` feature, so the
@@ -41,11 +41,11 @@ pub async fn next_item(feed: &mut impl Feed) -> FeedItem {
         .expect("the Change feed should not have ended")
 }
 
-/// Waits for the next batch of Changes, sorted by Area and Path so it can be compared.
+/// Waits for the next batch of Changes, sorted by Path so it can be compared.
 pub async fn next_batch(feed: &mut impl Feed) -> Vec<Change> {
     match next_item(feed).await {
         FeedItem::Changes(mut batch) => {
-            batch.sort_by(|a, b| (a.area, &a.path).cmp(&(b.area, &b.path)));
+            batch.sort_by(|a, b| a.path.cmp(&b.path));
             batch
         }
         other => panic!("expected a batch of Changes, got {other:?}"),
@@ -53,25 +53,25 @@ pub async fn next_batch(feed: &mut impl Feed) -> Vec<Change> {
 }
 
 /// Reads the Change feed until a batch holds a Change to `marker`, and gives every Change read,
-/// merged as the feed merges unread Changes to a Path, sorted by Area and Path. Events arrive in
-/// order, so a Change still to come for what was done in `marker`'s Area before it was written
-/// comes before it or with it: what this gives doesn't depend on how long the watcher takes. A
-/// Resync fails the test, unless it is for `resyncing`, which is then skipped.
+/// merged as the feed merges unread Changes to a Path, sorted by Path. Events arrive in order, so
+/// a Change still to come for what was done before `marker` was written comes before it or with
+/// it: what this gives doesn't depend on how long the watcher takes. A Resync fails the test,
+/// unless `skipping_resyncs`, when it is skipped.
 pub async fn changes_until(
     feed: &mut impl Feed,
     marker: &str,
-    resyncing: Option<Area>,
+    skipping_resyncs: bool,
 ) -> Vec<Change> {
     let mut merged = BTreeMap::new();
     loop {
         let batch = match next_item(feed).await {
             FeedItem::Changes(batch) => batch,
-            FeedItem::Resync(area) if Some(area) == resyncing => continue,
+            FeedItem::Resync if skipping_resyncs => continue,
             other => panic!("expected a batch of Changes, got {other:?}"),
         };
         let marked = batch.iter().any(|change| change.path.as_str() == marker);
         for change in batch {
-            merged.insert((change.area, change.path.clone()), change);
+            merged.insert(change.path.clone(), change);
         }
         if marked {
             return merged.into_values().collect();
@@ -79,28 +79,19 @@ pub async fn changes_until(
     }
 }
 
-/// Each Change's Path and kind, for comparing, where the Area and Origin go without saying.
+/// Each Change's Path and kind, for comparing, where the Origin goes without saying.
 pub fn changes(batch: &[Change]) -> Vec<(&str, ChangeKind)> {
     batch.iter().map(|change| (change.path.as_str(), change.kind)).collect()
 }
 
-/// Each Change's Path and Origin, for comparing, where the Area and kind go without saying.
+/// Each Change's Path and Origin, for comparing, where the kind goes without saying.
 pub fn paths_and_origins(batch: &[Change]) -> Vec<(&str, Origin)> {
     batch.iter().map(|change| (change.path.as_str(), change.origin)).collect()
 }
 
 /// Everything about each Change, for comparing.
-pub fn changes_in_full(batch: &[Change]) -> Vec<(Area, &str, ChangeKind, Origin)> {
-    batch
-        .iter()
-        .map(|change| (change.area, change.path.as_str(), change.kind, change.origin))
-        .collect()
-}
-
-/// The App identity every test opens its Stores for, each on a Root override of its own.
-#[cfg(any(feature = "fs", feature = "sqlite"))]
-pub fn app() -> tidings::AppIdentity {
-    tidings::AppIdentity::new("tidings tests", "tidings", "org")
+pub fn changes_in_full(batch: &[Change]) -> Vec<(&str, ChangeKind, Origin)> {
+    batch.iter().map(|change| (change.path.as_str(), change.kind, change.origin)).collect()
 }
 
 /// Checks that nothing more arrives on the Change feed for a short while.

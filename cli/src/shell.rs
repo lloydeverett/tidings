@@ -11,10 +11,10 @@ use rustyline::{DefaultEditor, ExternalPrinter};
 use tidings::{ChangeFeed, FeedItem, Precondition};
 use tokio::runtime::Runtime;
 
-use crate::command::{AreaName, Session, StoreCommand};
+use crate::command::{Session, StoreCommand};
 use crate::failure::Failure;
 use crate::location::{BackendName, StoreArgs};
-use crate::output::{Output, Report, area_name};
+use crate::output::{Output, Report};
 
 /// One line typed in the shell.
 #[derive(Debug, Parser)]
@@ -35,11 +35,11 @@ struct ShellLine {
 enum ShellCommand {
     #[command(flatten)]
     Store(StoreCommand),
-    /// Open a Staging for an Area, to build up a Commit
+    /// Open a Staging, to build up a Commit
     ///
     /// `write`, `delete`, `delete-prefix`, `edit`, `require` and `require-prefix` add to it,
     /// instead of committing, until `commit` or `discard`.
-    Stage { area: AreaName },
+    Stage,
     /// Require a File to be absent, or unchanged since a Revision, in the open Staging
     Require {
         path: String,
@@ -162,7 +162,7 @@ impl Shell {
             let flow = self.execute(runtime, &line, |switch| on = switch);
             for item in std::iter::from_fn(|| next_ready(&mut feed)) {
                 if on {
-                    self.output.feed_lines(&item, &[]).iter().for_each(|line| eprintln!("{line}"));
+                    self.output.feed_lines(&item).iter().for_each(|line| eprintln!("{line}"));
                 }
             }
             match flow {
@@ -206,7 +206,7 @@ impl Shell {
         };
         let report = match command {
             ShellCommand::Store(command) => runtime.block_on(self.session.run(command))?,
-            ShellCommand::Stage { area } => self.session.open_staging(area.into())?,
+            ShellCommand::Stage => self.session.open_staging()?,
             ShellCommand::Require { path, precondition } => {
                 self.session.require(&path, precondition)?
             }
@@ -223,20 +223,18 @@ impl Shell {
         Ok(Flow::Continue)
     }
 
-    /// `tidings[fs]> `, or with a Staging open, `tidings[fs data +2]> `.
+    /// `tidings[fs]> `, or with a Staging open, `tidings[fs +2]> `.
     fn prompt(&self) -> String {
         match self.session.staging() {
-            Some((area, count)) => {
-                format!("tidings[{} {} +{count}]> ", self.backend, area_name(area))
-            }
+            Some(count) => format!("tidings[{} +{count}]> ", self.backend),
             None => format!("tidings[{}]> ", self.backend),
         }
     }
 
     /// Says so if an open Staging is being discarded as the shell ends.
     fn leave(&self) {
-        if let Some((area, count)) = self.session.staging() {
-            eprintln!("discarded the open Staging for {} ({count} staged)", area_name(area));
+        if let Some(count) = self.session.staging() {
+            eprintln!("discarded the open Staging ({count} staged)");
         }
     }
 }
@@ -283,7 +281,7 @@ async fn print_feed(
         if !lines.on {
             continue;
         }
-        for line in output.feed_lines(&item, &[]) {
+        for line in output.feed_lines(&item) {
             if lines.at_prompt {
                 let _ = printer.print(format!("{line}\n"));
             } else {

@@ -5,28 +5,18 @@ use std::fs;
 use std::path::{self, Path, PathBuf};
 
 use clap::{Args, ValueEnum};
-use tidings::{AppIdentity, BackendKind, ChangeFeed, FsOptions, SqliteOptions, Store};
+use tidings::{BackendKind, ChangeFeed, FsOptions, SqliteOptions, Store};
 
 use crate::failure::Failure;
 
 /// The flags that choose a Store, which every command takes.
 #[derive(Debug, Args)]
 pub struct StoreArgs {
-    /// The directory holding the Store's Areas, as `config`, `data` and `cache` in it.
-    #[arg(long, global = true, env = "TIDINGS_ROOT", value_name = "DIR")]
-    root: Option<PathBuf>,
+    /// The Store's Location: the directory the app opens it at.
+    #[arg(long, global = true, env = "TIDINGS_STORE", value_name = "DIR")]
+    store: Option<PathBuf>,
 
-    /// The App identity whose standard directories hold the Store, as in `com.example.myapp`.
-    #[arg(
-        long,
-        global = true,
-        env = "TIDINGS_IDENTITY",
-        value_name = "TLD.AUTHOR.APP",
-        value_parser = Identity::parse,
-    )]
-    identity: Option<Identity>,
-
-    /// The Backend that holds the Store. Found from the Store's location when left out.
+    /// The Backend that holds the Store. Found from the Store's Location when left out.
     #[arg(long, global = true, env = "TIDINGS_BACKEND")]
     backend: Option<BackendName>,
 
@@ -59,97 +49,26 @@ impl fmt::Display for BackendName {
     }
 }
 
-/// An App identity written as `tld.author.app`, in the order of a reverse domain name.
-#[derive(Debug, Clone)]
-pub struct Identity {
-    text: String,
-    identity: AppIdentity,
+/// The Backend that holds the Store at `location`, or `None` if there is no Store there.
+async fn detect(location: &Path) -> Result<Option<BackendName>, Failure> {
+    let detected = Store::detect(location).await?;
+    Ok(detected.map(BackendName::from))
 }
 
-impl Identity {
-    /// Parses `tld.author.app`: exactly three parts, none of them empty.
-    pub fn parse(text: &str) -> Result<Identity, String> {
-        let parts: Vec<&str> = text.split('.').collect();
-        match parts[..] {
-            [tld, author, app] if parts.iter().all(|part| !part.is_empty()) => {
-                Ok(Identity { text: text.to_owned(), identity: AppIdentity::new(app, author, tld) })
-            }
-            _ => Err("an identity is written TLD.AUTHOR.APP, as in com.example.myapp".to_owned()),
-        }
-    }
+/// The failure for there being no Store at `location`.
+fn missing(location: &Path) -> Failure {
+    Failure::error(format!(
+        "there is no Store at {}: pass --create and --backend to make one",
+        location.display(),
+    ))
 }
 
-impl fmt::Display for Identity {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.text)
-    }
-}
-
-/// Where a Store on the filesystem or SQLite is.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StoreLocation {
-    /// A Root override, always absolute, so that it means the same from any directory.
-    Root(PathBuf),
-    /// The standard directories of an App identity.
-    Identity(Identity),
-}
-
-impl StoreLocation {
-    /// For a person to read.
-    fn description(&self) -> String {
-        match self {
-            StoreLocation::Root(root) => root.display().to_string(),
-            StoreLocation::Identity(identity) => format!("the directories of {identity}"),
-        }
-    }
-
-    /// The App identity to open the Store with.
-    fn app_identity(&self) -> AppIdentity {
-        match self {
-            // The Root override replaces every directory the App identity would give, so any
-            // identity will do.
-            StoreLocation::Root(_) => AppIdentity::new("tidings", "tidings", "cli"),
-            StoreLocation::Identity(identity) => identity.identity.clone(),
-        }
-    }
-
-    /// The Root override, if there is one.
-    fn root(&self) -> Option<&Path> {
-        match self {
-            StoreLocation::Root(root) => Some(root),
-            StoreLocation::Identity(_) => None,
-        }
-    }
-
-    /// The Backend that holds the Store here, or `None` if there is no Store here.
-    async fn detect(&self) -> Result<Option<BackendName>, Failure> {
-        let detected = Store::detect(&self.app_identity(), self.root()).await?;
-        Ok(detected.map(BackendName::from))
-    }
-
-    /// The failure for there being no Store here.
-    fn missing(&self) -> Failure {
-        Failure::error(format!(
-            "there is no Store at {}: pass --create and --backend to make one",
-            self.description(),
-        ))
-    }
-}
-
-impl PartialEq for Identity {
-    fn eq(&self, other: &Identity) -> bool {
-        self.text == other.text
-    }
-}
-
-impl Eq for Identity {}
-
-/// Which Store: where it is and the Backend that holds it, which is all it takes to open it again.
-/// Two are equal when they name the same Store in the same way.
+/// Which Store: its Location and the Backend that holds it, which is all it takes to open it
+/// again. Two are equal when they name the same Store in the same way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreAddress {
-    /// Where the Store is.
-    pub location: StoreLocation,
+    /// The Store's Location, always absolute, so that it means the same from any directory.
+    pub location: PathBuf,
     /// The Backend that holds the Store, which is never the memory Backend, since a Store in
     /// memory has no address to open it by again.
     pub backend: BackendName,
@@ -158,7 +77,7 @@ pub struct StoreAddress {
 impl StoreAddress {
     /// Opens the Store, or gives `None` if there is none there: it never makes one.
     pub async fn open(&self) -> Result<Option<Opened>, Failure> {
-        if self.location.detect().await?.is_none() {
+        if detect(&self.location).await?.is_none() {
             return Ok(None);
         }
         Ok(Some(self.open_or_make().await?))
@@ -166,25 +85,14 @@ impl StoreAddress {
 
     /// Opens the Store, making a new one if there is none, without looking for it first.
     pub async fn open_or_make(&self) -> Result<Opened, Failure> {
-        let (identity, root) = (self.location.app_identity(), self.location.root());
         // A Backend that doesn't match the one found gives the library's `WrongBackend` when it
         // opens.
         let (store, feed) = match self.backend {
-            BackendName::Fs => {
-                let mut options = FsOptions::default();
-                if let Some(root) = root {
-                    options = options.root_override(root);
-                }
-                Store::open_fs(&identity, options).await?
-            }
+            BackendName::Fs => Store::open_fs(&self.location, FsOptions::default()).await?,
             BackendName::Sqlite => {
-                let mut options = SqliteOptions::default();
-                if let Some(root) = root {
-                    options = options.root_override(root);
-                }
-                Store::open_sqlite(&identity, options).await?
+                Store::open_sqlite(&self.location, SqliteOptions::default()).await?
             }
-            BackendName::Memory => unreachable!("the memory Backend has no location"),
+            BackendName::Memory => unreachable!("the memory Backend has no Location"),
         };
         let description = self.to_string();
         Ok(Opened { store, feed, backend: self.backend, description })
@@ -192,9 +100,9 @@ impl StoreAddress {
 }
 
 impl fmt::Display for StoreAddress {
-    /// Where the Store is and its Backend, for a person to read.
+    /// The Store's Location and its Backend, for a person to read.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} ({})", self.location.description(), self.backend)
+        write!(f, "{} ({})", self.location.display(), self.backend)
     }
 }
 
@@ -203,9 +111,9 @@ pub struct Opened {
     pub store: Store,
     /// The Store's one Change feed.
     pub feed: ChangeFeed,
-    /// The Backend it was opened on, which may have been found from its location.
+    /// The Backend it was opened on, which may have been found from its Location.
     pub backend: BackendName,
-    /// Where the Store is and its Backend, for a person to read.
+    /// The Store's Location and its Backend, for a person to read.
     pub description: String,
 }
 
@@ -219,7 +127,7 @@ impl StoreArgs {
         self.address().await?.open_or_make().await
     }
 
-    /// Where the Store the flags choose for a new Working copy is, and its Backend: the one
+    /// The Location of the Store the flags choose for a new Working copy, and its Backend: the one
     /// `--backend` names, or the one found there. It can't be a Store in memory. The Store is
     /// looked for but neither opened nor made, so a Working copy refused after this leaves no
     /// Store behind.
@@ -230,13 +138,13 @@ impl StoreArgs {
         self.address().await
     }
 
-    /// Where the Store the flags choose, which isn't one in memory, is, and its Backend: the one
-    /// `--backend` names, or the one found there. Fails if there is no Store there and `--create`
-    /// is left out, but never makes one.
+    /// The Location of the Store the flags choose, which isn't one in memory, and its Backend: the
+    /// one `--backend` names, or the one found there. Fails if there is no Store there and
+    /// `--create` is left out, but never makes one.
     async fn address(&self) -> Result<StoreAddress, Failure> {
         let location = self.location()?;
-        let backend = match (self.backend, location.detect().await?) {
-            (_, None) if !self.create => return Err(location.missing()),
+        let backend = match (self.backend, detect(&location).await?) {
+            (_, None) if !self.create => return Err(missing(&location)),
             (Some(backend), _) | (None, Some(backend)) => backend,
             (None, None) => {
                 return Err(Failure::error("--create needs --backend, to say which one to make"));
@@ -266,19 +174,10 @@ impl StoreArgs {
                  the Working copy knows its Store"
             ))
         };
-        if let Some(root) = &self.root {
-            let same = match &address.location {
-                StoreLocation::Root(recorded) => same_directory(root, recorded),
-                StoreLocation::Identity(_) => false,
-            };
-            if !same {
-                return Err(mismatch(format!("--root (or TIDINGS_ROOT) {}", root.display())));
-            }
-        }
-        if let Some(identity) = &self.identity
-            && address.location != StoreLocation::Identity(identity.clone())
+        if let Some(store) = &self.store
+            && !same_directory(store, &address.location)
         {
-            return Err(mismatch(format!("--identity (or TIDINGS_IDENTITY) {identity}")));
+            return Err(mismatch(format!("--store (or TIDINGS_STORE) {}", store.display())));
         }
         if let Some(backend) = self.backend
             && backend != address.backend
@@ -293,10 +192,10 @@ impl StoreArgs {
         if !in_shell {
             return Err(memory_outside_the_shell());
         }
-        if self.root.is_some() || self.identity.is_some() || self.create {
+        if self.store.is_some() || self.create {
             return Err(Failure::error(
-                "the memory Backend has no location, and is always new: leave out --root, \
-                 --identity and --create",
+                "the memory Backend has no Location, and is always new: leave out --store and \
+                 --create",
             ));
         }
         let (store, feed) = Store::open_memory();
@@ -304,27 +203,18 @@ impl StoreArgs {
         Ok(Opened { store, feed, backend: BackendName::Memory, description })
     }
 
-    /// Where the Store on the filesystem or SQLite is, from exactly one of `--root` and
-    /// `--identity`.
-    pub fn location(&self) -> Result<StoreLocation, Failure> {
-        match (&self.root, &self.identity) {
-            (Some(root), None) => match path::absolute(root) {
-                Ok(root) => Ok(StoreLocation::Root(root)),
-                Err(error) => {
-                    Err(Failure::error(format!("can't use --root {}: {error}", root.display())))
-                }
-            },
-            (None, Some(identity)) => Ok(StoreLocation::Identity(identity.clone())),
-            (Some(_), Some(_)) => Err(Failure::error("give either --root or --identity, not both")),
-            (None, None) => Err(Failure::error(
-                "say where the Store is, with --root or --identity (or TIDINGS_ROOT or \
-                 TIDINGS_IDENTITY)",
-            )),
-        }
+    /// The Location of the Store on the filesystem or SQLite, from `--store`, made absolute.
+    pub fn location(&self) -> Result<PathBuf, Failure> {
+        let Some(store) = &self.store else {
+            return Err(Failure::error("say where the Store is, with --store (or TIDINGS_STORE)"));
+        };
+        path::absolute(store).map_err(|error| {
+            Failure::error(format!("can't use --store {}: {error}", store.display()))
+        })
     }
 }
 
-/// Whether `given`, as `--root` gave it, is the directory `recorded`, an absolute path: the same
+/// Whether `given`, as `--store` gave it, is the directory `recorded`, an absolute path: the same
 /// path once made absolute, or the same directory once symlinks are followed.
 fn same_directory(given: &Path, recorded: &Path) -> bool {
     if path::absolute(given).is_ok_and(|given| given == recorded) {

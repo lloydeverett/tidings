@@ -5,7 +5,7 @@ use std::path::Path as FsPath;
 
 use serde_json::{Value, json};
 use tidings::{
-    Area, Change, ChangeKind, Committed, FeedItem, File, Origin, Path, Prefix, PrefixRevision, Stat,
+    Change, ChangeKind, Committed, FeedItem, File, Origin, Path, Prefix, PrefixRevision, Stat,
 };
 
 use crate::working_copy::{
@@ -23,12 +23,12 @@ pub enum Report {
     Stat(Path, Stat),
     /// The Paths `list` gave.
     Paths(Vec<Path>),
-    /// What `stat-prefix` gave for the Prefix in the Area.
-    PrefixRevision(Area, Prefix, PrefixRevision),
+    /// What `stat-prefix` gave for the Prefix.
+    PrefixRevision(Prefix, PrefixRevision),
     /// A successful Commit.
     Committed(Committed),
     /// Something was added to the open Staging, which now holds `count` things.
-    Staged { area: Area, count: usize },
+    Staged { count: usize },
     /// `edit` changed nothing, so nothing was committed.
     Unchanged,
     /// The editor `edit` ran quit with a failure, so the edit was dropped.
@@ -81,7 +81,7 @@ impl Output {
             Report::Paths(paths) => {
                 print_stdout(&paths.iter().map(|path| format!("{path}\n")).collect::<String>())
             }
-            Report::PrefixRevision(_, _, revision) => print_stdout(&format!("{revision}\n")),
+            Report::PrefixRevision(_, revision) => print_stdout(&format!("{revision}\n")),
             Report::Committed(committed) => {
                 let lines = committed.revisions().iter();
                 print_stdout(
@@ -144,21 +144,14 @@ impl Output {
         }
     }
 
-    /// The lines that show `item` for the Areas in `areas`, or every Area if it is empty.
-    pub fn feed_lines(self, item: &FeedItem, areas: &[Area]) -> Vec<String> {
-        let shown = |area: Area| areas.is_empty() || areas.contains(&area);
+    /// The lines that show `item`.
+    pub fn feed_lines(self, item: &FeedItem) -> Vec<String> {
         match item {
-            FeedItem::Changes(changes) => changes
-                .iter()
-                .filter(|change| shown(change.area))
-                .map(|change| self.change_line(change))
-                .collect(),
-            FeedItem::Resync(area) if shown(*area) => vec![if self.json {
-                json!({"resync": area_name(*area)}).to_string()
-            } else {
-                format!("resync {}", area_name(*area))
-            }],
-            _ => Vec::new(),
+            FeedItem::Changes(changes) => {
+                changes.iter().map(|change| self.change_line(change)).collect()
+            }
+            FeedItem::Resync if self.json => vec![json!({"resync": true}).to_string()],
+            FeedItem::Resync => vec!["resync".to_owned()],
         }
     }
 
@@ -171,12 +164,10 @@ impl Output {
             ChangeKind::Changed => "changed",
             ChangeKind::Removed => "removed",
         };
-        let area = area_name(change.area);
         if self.json {
-            json!({"origin": origin, "kind": kind, "area": area, "path": change.path.as_str()})
-                .to_string()
+            json!({"origin": origin, "kind": kind, "path": change.path.as_str()}).to_string()
         } else {
-            format!("{origin} {kind} {area} {}", change.path)
+            format!("{origin} {kind} {}", change.path)
         }
     }
 }
@@ -419,8 +410,7 @@ fn as_json(report: &Report) -> Option<Value> {
             "modified": stat.modified().to_string(),
         }),
         Report::Paths(paths) => json!(paths.iter().map(Path::as_str).collect::<Vec<_>>()),
-        Report::PrefixRevision(area, prefix, revision) => json!({
-            "area": area_name(*area),
+        Report::PrefixRevision(prefix, revision) => json!({
             "prefix": prefix.as_str(),
             "revision": revision.to_string(),
         }),
@@ -432,9 +422,7 @@ fn as_json(report: &Report) -> Option<Value> {
                 .map(|(path, revision)| (path.as_str().to_owned(), json!(revision.to_string())))
                 .collect::<serde_json::Map<_, _>>(),
         }),
-        Report::Staged { area, count } => {
-            json!({"staged": {"area": area_name(*area), "count": count}})
-        }
+        Report::Staged { count } => json!({"staged": {"count": count}}),
         Report::Unchanged => json!({"unchanged": true}),
         Report::Cancelled => json!({"cancelled": true}),
         Report::WorkingCopyCommit(report) => json!({
@@ -479,8 +467,8 @@ fn as_json(report: &Report) -> Option<Value> {
 
 /// What `commit` says after a Commit that gave `Pending`.
 const PENDING_NOTE: &str = "the Commit happened, but isn't finished yet: a File in the Store \
-                            couldn't be replaced, and the next Commit to the Area, or opening the \
-                            Store, finishes it";
+                            couldn't be replaced, and the next Commit to the Store, or opening \
+                            it, finishes it";
 
 /// A local change's name, as `commit` prints it.
 fn change_name(change: LocalChange) -> &'static str {
@@ -496,15 +484,6 @@ pub fn print_stdout(text: &str) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     stdout.write_all(text.as_bytes())?;
     stdout.flush()
-}
-
-/// An Area's name on the command line.
-pub fn area_name(area: Area) -> &'static str {
-    match area {
-        Area::Config => "config",
-        Area::Data => "data",
-        Area::Cache => "cache",
-    }
 }
 
 #[cfg(test)]

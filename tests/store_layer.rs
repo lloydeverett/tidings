@@ -5,7 +5,7 @@
 mod common;
 
 use common::{assert_nothing_more, changes_in_full, next_batch};
-use tidings::{Area, ChangeFeed, ChangeKind, Origin, Snapshot, Staging, Store};
+use tidings::{ChangeFeed, ChangeKind, Origin, Snapshot, Staging, Store};
 
 #[test]
 fn a_store_and_its_futures_can_be_shared_between_threads() {
@@ -18,20 +18,24 @@ fn a_store_and_its_futures_can_be_shared_between_threads() {
 
     // Every future a Store or its Change feed gives, without running it.
     let (store, mut feed) = Store::open_memory();
-    send(store.read(Area::Config, "a"));
-    send(store.stat(Area::Config, "a"));
-    send(store.list(Area::Config, ""));
-    send(store.stat_prefix(Area::Config, ""));
-    send(store.commit(Staging::new(Area::Config)));
-    send(store.snapshot(Area::Config));
+    send(store.read("a"));
+    send(store.stat("a"));
+    send(store.list(""));
+    send(store.stat_prefix(""));
+    send(store.commit(Staging::new()));
+    send(store.snapshot());
     send(feed.next());
     #[cfg(feature = "fs")]
     {
-        send(Store::open_fs(&common::app(), tidings::FsOptions::default()));
+        send(Store::open_fs("location", tidings::FsOptions::default()));
     }
     #[cfg(feature = "sqlite")]
     {
-        send(Store::open_sqlite(&common::app(), tidings::SqliteOptions::default()));
+        send(Store::open_sqlite("location", tidings::SqliteOptions::default()));
+    }
+    #[cfg(any(feature = "fs", feature = "sqlite"))]
+    {
+        send(Store::detect("location"));
     }
 }
 
@@ -40,7 +44,7 @@ fn a_store_and_its_futures_can_be_shared_between_threads() {
 async fn a_snapshots_futures_can_be_sent_between_threads() {
     fn send<T: Send>(_: T) {}
     let (store, _feed) = Store::open_memory();
-    let snapshot = store.snapshot(Area::Config).await.unwrap();
+    let snapshot = store.snapshot().await.unwrap();
     send(snapshot.read("a"));
     send(snapshot.stat("a"));
     send(snapshot.list(""));
@@ -51,8 +55,8 @@ async fn a_snapshots_futures_can_be_sent_between_threads() {
 #[tokio::test]
 async fn a_merged_change_is_external_if_any_change_merged_into_it_was() {
     let (store, mut feed) = Store::open_memory();
-    let commit = async |area: Area, path: &str, write: bool| {
-        let mut staging = Staging::new(area);
+    let commit = async |path: &str, write: bool| {
+        let mut staging = Staging::new();
         if write {
             staging.write(path, "local").unwrap();
         } else {
@@ -62,32 +66,29 @@ async fn a_merged_change_is_external_if_any_change_merged_into_it_was() {
     };
 
     // External, then local: the local kind is the latest, but it stays external.
-    store.inject_external_change(Area::Config, "external-first.toml", ChangeKind::Changed).unwrap();
-    commit(Area::Config, "external-first.toml", true).await;
-    commit(Area::Config, "external-first.toml", false).await;
+    store.inject_external_change("external-first.toml", ChangeKind::Changed).unwrap();
+    commit("external-first.toml", true).await;
+    commit("external-first.toml", false).await;
     // Local, then external.
-    commit(Area::Config, "local-first.toml", true).await;
-    store.inject_external_change(Area::Config, "local-first.toml", ChangeKind::Changed).unwrap();
+    commit("local-first.toml", true).await;
+    store.inject_external_change("local-first.toml", ChangeKind::Changed).unwrap();
     // Only local, beside them.
-    commit(Area::Config, "only-local.toml", true).await;
-    // The same Path in another Area is merged apart.
-    commit(Area::Data, "local-first.toml", true).await;
+    commit("only-local.toml", true).await;
 
     assert_eq!(
         changes_in_full(&next_batch(&mut feed).await),
         [
-            (Area::Config, "external-first.toml", ChangeKind::Removed, Origin::External),
-            (Area::Config, "local-first.toml", ChangeKind::Changed, Origin::External),
-            (Area::Config, "only-local.toml", ChangeKind::Changed, Origin::Local),
-            (Area::Data, "local-first.toml", ChangeKind::Changed, Origin::Local),
+            ("external-first.toml", ChangeKind::Removed, Origin::External),
+            ("local-first.toml", ChangeKind::Changed, Origin::External),
+            ("only-local.toml", ChangeKind::Changed, Origin::Local),
         ],
     );
 
     // Once read, a Path starts again: a new local Change to it is local.
-    commit(Area::Config, "local-first.toml", false).await;
+    commit("local-first.toml", false).await;
     assert_eq!(
         changes_in_full(&next_batch(&mut feed).await),
-        [(Area::Config, "local-first.toml", ChangeKind::Removed, Origin::Local)],
+        [("local-first.toml", ChangeKind::Removed, Origin::Local)],
     );
     assert_nothing_more(&mut feed).await;
 }

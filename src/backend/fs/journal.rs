@@ -1,5 +1,5 @@
 //! The journal of ADR 0005: `.tidings/journal`, which says what a filesystem Commit is doing, so
-//! that one a crash interrupts can be finished or discarded the next time the Area is locked.
+//! that one a crash interrupts can be finished or discarded the next time the Location is locked.
 //!
 //! It lists each temporary file with the Path it writes and the File it replaces, and each Path
 //! the Commit deletes with the Revision of the File it deletes. A File a write replaces is either
@@ -9,10 +9,10 @@
 //!   is discarded: its temporary files are removed.
 //! - **committed**: every temporary file is written and on disk, and the Commit has happened. It
 //!   is finished: the deletes are made and the temporary files renamed. Until it is, reads through
-//!   tidings see the Area as it will be once it is ([`AsFinished`]).
+//!   tidings see the Store as it will be once it is ([`AsFinished`]).
 //!
 //! Finishing a Commit again, after a crash part way through or just before the journal was
-//! removed, leaves the Area as finishing it once did:
+//! removed, leaves the Store as finishing it once did:
 //! - a temporary file that is gone was renamed already, so it is skipped, with the directories it
 //!   needed;
 //! - a delete is made only if the File is still there, under exactly its name, with the Revision
@@ -44,10 +44,10 @@ use super::FailurePoint;
 use jiff::Timestamp;
 
 use super::{
-    AreaRoot, LeftOut, failed, on_disk, present, present_at, read_file, remove_empty_directories,
+    LeftOut, Location, failed, on_disk, present, present_at, read_file, remove_empty_directories,
     revisions,
 };
-use crate::backend::{AreaState, sync_directory};
+use crate::backend::{StoreState, sync_directory};
 use crate::{Error, Path, Prefix, Result, Revision};
 
 /// The first line of every journal, which names its format.
@@ -93,12 +93,12 @@ pub(super) struct Remove {
     pub(super) revision: Revision,
 }
 
-/// An Area as reads through tidings see it: as finishing the Commit in its journal will leave it,
+/// The Store as reads through tidings see it: as finishing the Commit in its journal will leave it,
 /// if the journal is committed. Each Path the Commit writes is its temporary file, until that is
 /// renamed, and each Path it deletes is absent, if the File there is the one it deletes, as
-/// finishing deletes only that one. With no committed journal, it is the Area as it is on disk.
+/// finishing deletes only that one. With no committed journal, it is the Store as it is on disk.
 pub(super) struct AsFinished<'a> {
-    area: &'a AreaRoot,
+    location: &'a Location,
     /// The temporary file of each Path the Commit writes.
     written: BTreeMap<Path, PathBuf>,
     /// Each Path the Commit deletes, with the Revision of the File it deletes.
@@ -106,20 +106,21 @@ pub(super) struct AsFinished<'a> {
 }
 
 impl Replace {
-    /// Where the file this replaces is on disk, in the Area whose root is `root`.
-    pub(super) fn on_disk(&self, root: &FsPath) -> PathBuf {
+    /// Where the file this replaces is on disk, in the Location `location`.
+    pub(super) fn on_disk(&self, location: &FsPath) -> PathBuf {
         match &self.target {
-            Target::AtPath => on_disk(root, self.path.as_str()),
+            Target::AtPath => on_disk(location, self.path.as_str()),
             Target::Linked(target) => target.clone(),
         }
     }
 }
 
 impl AsFinished<'_> {
-    /// `area`, as finishing the Commit in its journal will leave it.
-    pub(super) fn of(area: &AreaRoot) -> Result<AsFinished<'_>> {
-        let mut finished = AsFinished { area, written: BTreeMap::new(), removed: BTreeMap::new() };
-        if let Some(journal) = Journal::read(&area.tidings())?
+    /// `location`, as finishing the Commit in its journal will leave it.
+    pub(super) fn of(location: &Location) -> Result<AsFinished<'_>> {
+        let mut finished =
+            AsFinished { location, written: BTreeMap::new(), removed: BTreeMap::new() };
+        if let Some(journal) = Journal::read(&location.tidings())?
             && journal.state == State::Committed
         {
             let written =
@@ -135,7 +136,7 @@ impl AsFinished<'_> {
         self.written.keys().chain(self.removed.keys())
     }
 
-    /// What [`AreaRoot::read`] gives for `path`, once the Commit is finished.
+    /// What [`Location::read`] gives for `path`, once the Commit is finished.
     pub(super) fn read(&self, path: &Path) -> Result<Option<(Vec<u8>, Timestamp)>> {
         // A temporary file that is gone was renamed over the File already.
         if let Some(temporary) = self.written.get(path)
@@ -143,17 +144,17 @@ impl AsFinished<'_> {
         {
             return Ok(Some(read));
         }
-        let read = self.area.read(path)?;
+        let read = self.location.read(path)?;
         let removed = self.removed.get(path).is_some_and(|revision| {
             read.as_ref().is_some_and(|(contents, _)| Revision::of_bytes(contents) == *revision)
         });
         Ok(if removed { None } else { read })
     }
 
-    /// What [`AreaRoot::paths_under`] gives for `prefix`, once the Commit is finished.
+    /// What [`Location::paths_under`] gives for `prefix`, once the Commit is finished.
     pub(super) fn paths_under(&self, prefix: &Prefix) -> Result<Vec<Path>> {
         let mut paths = Vec::new();
-        for path in self.area.paths_under(prefix)? {
+        for path in self.location.paths_under(prefix)? {
             if !self.removed.contains_key(&path) || self.read(&path)?.is_some() {
                 paths.push(path);
             }
@@ -186,20 +187,26 @@ pub(super) enum Recovery {
     Left(Error),
 }
 
-/// Finishes or discards the Commit left in the journal of `area`, by a crash or by a Commit that
-/// couldn't finish, if there is one. It must be called with the Area locked. It gives an error
-/// only if the journal can't be read.
-pub(super) fn recover(area: &AreaRoot) -> Result<Recovery> {
-    let tidings = area.tidings();
+/// Finishes or discards the Commit left in the journal of `location`, by a crash or by a Commit
+/// that couldn't finish, if there is one. It must be called with the Location locked. It gives an
+/// error only if the journal can't be read.
+pub(super) fn recover(location: &Location) -> Result<Recovery> {
+    let tidings = location.tidings();
     let Some(journal) = Journal::read(&tidings)? else { return Ok(Recovery::Done) };
     let recovered = match journal.state {
         State::Prepared => {
-            tracing::debug!("discarding a Commit to {} that never happened", area.root.display());
+            tracing::debug!(
+                "discarding a Commit to {} that never happened",
+                location.directory.display()
+            );
             journal.discard(&tidings)
         }
         State::Committed => {
-            tracing::debug!("finishing a Commit to {} left unfinished", area.root.display());
-            area.finish(&journal, true)
+            tracing::debug!(
+                "finishing a Commit to {} left unfinished",
+                location.directory.display()
+            );
+            location.finish(&journal, true)
         }
     };
     Ok(match recovered {
@@ -241,7 +248,7 @@ impl Journal {
         remove(tidings)
     }
 
-    /// Finishes the Commit in `area`, then removes the journal. `again` says whether this is
+    /// Finishes the Commit in `location`, then removes the journal. `again` says whether this is
     /// finishing a Commit a crash interrupted, which may be partly finished already:
     /// 1. deletes each File, and removes each directory that leaves empty, so that a File can
     ///    take the directory's name (`d/e` to `d`). Finishing again, a File is deleted only if it
@@ -253,29 +260,29 @@ impl Journal {
     ///    journal is removed.
     ///
     /// A Path that is under a symlink to a directory, made since the Commit checked its Paths, is
-    /// outside the Area, so it is neither deleted nor written, and its temporary file is removed.
-    pub(super) fn finish(&self, area: &AreaRoot, again: bool) -> Result<()> {
-        let root = &area.root;
+    /// outside the Store, so it is neither deleted nor written, and its temporary file is removed.
+    pub(super) fn finish(&self, location: &Location, again: bool) -> Result<()> {
+        let directory = &location.directory;
         let under_link =
-            |path: &Path| Ok(area.left_out(path.as_str())? == Some(LeftOut::DirectoryLink));
+            |path: &Path| Ok(location.left_out(path.as_str())? == Some(LeftOut::DirectoryLink));
         let mut changed = BTreeSet::new();
         for Remove { path, revision } in &self.removes {
             if under_link(path)? {
                 continue;
             }
-            let file = on_disk(root, path.as_str());
+            let file = on_disk(directory, path.as_str());
             let there = present_at(fs::symlink_metadata(&file), &file)?;
             // A directory there now was made by one of the writes.
             let file_there = there.is_some_and(|there| !there.is_dir());
-            if file_there && (!again || area.revision(path)? == Some(*revision)) {
+            if file_there && (!again || location.revision(path)? == Some(*revision)) {
                 fs::remove_file(&file).map_err(|error| failed(&file, error))?;
                 changed.extend(file.parent().map(FsPath::to_path_buf));
             }
-            remove_emptied_directories(root, &file, &mut changed);
+            remove_emptied_directories(directory, &file, &mut changed);
         }
         #[cfg(feature = "testing")]
         if !again {
-            area.stop_at(FailurePoint::AfterDeletes)?;
+            location.stop_at(FailurePoint::AfterDeletes)?;
         }
         #[cfg_attr(
             not(feature = "testing"),
@@ -291,26 +298,26 @@ impl Journal {
                     fs::remove_file(temporary).map_err(|error| failed(temporary, error))?;
                     continue;
                 }
-                area.make_directories(path, &mut changed)?;
+                location.make_directories(path, &mut changed)?;
             }
-            let target = replace.on_disk(root);
+            let target = replace.on_disk(directory);
             if fs::symlink_metadata(&target).is_ok_and(|there| there.is_dir()) {
                 remove_empty_directories(&target).map_err(|error| failed(&target, error))?;
             }
             #[cfg(feature = "testing")]
-            area.rename_fails(_n).map_err(|error| failed(temporary, error))?;
+            location.rename_fails(_n).map_err(|error| failed(temporary, error))?;
             fs::rename(temporary, &target).map_err(|error| failed(temporary, error))?;
             changed.extend(temporary.parent().map(FsPath::to_path_buf));
             changed.extend(target.parent().map(FsPath::to_path_buf));
             #[cfg(feature = "testing")]
             if !again {
-                area.stop_at(FailurePoint::AfterRename(_n))?;
+                location.stop_at(FailurePoint::AfterRename(_n))?;
             }
         }
         for directory in &changed {
             sync_directory(directory)?;
         }
-        remove(&area.tidings())
+        remove(&location.tidings())
     }
 
     /// Reads the journal in `tidings`, if there is one.
@@ -381,22 +388,22 @@ impl Journal {
 /// Removes the journal in `tidings`.
 ///
 /// That isn't forced to disk, which would cost every Commit another wait for the disk. If a power
-/// cut loses it, the Commit is finished again when the Area is next locked, which leaves the Area
-/// as it is, as the module's doc explains. The next Commit's journal replaces this one on disk
-/// before that Commit changes anything.
+/// cut loses it, the Commit is finished again when the Location is next locked, which leaves the
+/// Store as it is, as the module's doc explains. The next Commit's journal replaces this one on
+/// disk before that Commit changes anything.
 fn remove(tidings: &FsPath) -> Result<()> {
     let path = tidings.join("journal");
     present_at(fs::remove_file(&path), &path)?;
     Ok(())
 }
 
-/// Removes the directory `file` was in, in the Area whose root is `root`, if that left it empty,
-/// then the one above it if that leaves it empty, and so on up to the root, which stays. Each
+/// Removes the directory `file` was in, in the Location `location`, if that left it empty, then
+/// the one above it if that leaves it empty, and so on up to the Location, which stays. Each
 /// directory that changed is added to `changed`.
-fn remove_emptied_directories(root: &FsPath, file: &FsPath, changed: &mut BTreeSet<PathBuf>) {
+fn remove_emptied_directories(location: &FsPath, file: &FsPath, changed: &mut BTreeSet<PathBuf>) {
     let mut directory = file.parent();
-    while let Some(emptied) = directory.filter(|directory| directory.starts_with(root)) {
-        if emptied == root {
+    while let Some(emptied) = directory.filter(|directory| directory.starts_with(location)) {
+        if emptied == location {
             break;
         }
         match present(fs::remove_dir(emptied)) {

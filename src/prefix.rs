@@ -6,7 +6,7 @@ use crate::{Error, InvalidPathReason, Path, Result};
 /// The leading part of a Path, up to a `/`, known to be valid. It names a group of Files, such as
 /// every File under `themes/`.
 ///
-/// A Prefix is either empty, meaning the whole Area, or a valid Path followed by `/`. It is kept
+/// A Prefix is either empty, meaning the whole Store, or a valid Path followed by `/`. It is kept
 /// in that form, with its `/`, so it can't be mistaken for the Path of a File, and so it matches
 /// whole segments only: `themes/` covers `themes/dark.toml` but not `themes2/dark.toml`.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -42,7 +42,7 @@ fn prefix_refusal(prefix: &str) -> Option<InvalidPathReason> {
     }
     match prefix.strip_suffix('/') {
         None => Some(InvalidPathReason::NoTrailingSlash),
-        // Just `/`: the root, not a part of the Area.
+        // Just `/`: the root, not a part of the Store.
         Some("") => Some(InvalidPathReason::NotRelative),
         Some(path) => refusal(path),
     }

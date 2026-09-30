@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use xxhash_rust::xxh3::{Xxh3, xxh3_128};
 
-use crate::{Area, Path, Prefix};
+use crate::store::StoreId;
+use crate::{Path, Prefix};
 
 /// An opaque value identifying one state of a File, as returned when it is read.
 ///
@@ -79,9 +80,14 @@ pub struct ParseRevisionError;
 /// and the Revision of each. It is given by [`Store::stat_prefix`](crate::Store::stat_prefix), and
 /// [`Staging::require_prefix`](crate::Staging::require_prefix) makes a Commit depend on it.
 ///
+/// It belongs to the Store that took it and to its Prefix: requiring it in a Staging committed to
+/// another Store, or for another Prefix, makes the Commit fail with
+/// [`Error::WrongPrefixRevision`](crate::Error::WrongPrefixRevision). Each Store opened is
+/// another Store, even on the same Location, while its clones are the same Store.
+///
 /// Adding, removing or changing a File under the Prefix changes it. Two Prefix Revisions are equal
-/// when they were taken for the same Area and Prefix, and cover the same Paths with the same
-/// Revisions.
+/// when they were taken from the same Store for the same Prefix, and cover the same Paths with the
+/// same Revisions.
 ///
 /// It is written as the 32 lowercase hexadecimal digits of that hash, for a person to compare. It
 /// doesn't parse back, since the Paths and Revisions it covers can't be recovered from the hash.
@@ -91,8 +97,8 @@ pub struct ParseRevisionError;
 /// under its Prefix.
 #[derive(Clone)]
 pub struct PrefixRevision {
-    /// The Area and Prefix it was taken for.
-    area: Area,
+    /// The Store that took it, and the Prefix it was taken for.
+    store: StoreId,
     prefix: Prefix,
     /// A 128-bit hash (XXH3) over each Path and its Revision, in order of Path.
     hash: u128,
@@ -102,9 +108,14 @@ pub struct PrefixRevision {
 }
 
 impl PrefixRevision {
-    /// The Prefix Revision of `prefix` in `area`, given the Files under it in order of Path.
-    pub(crate) fn of(area: Area, prefix: Prefix, files: Vec<(Path, Revision)>) -> PrefixRevision {
-        PrefixRevision { area, prefix, hash: hash(&files), files: files.into() }
+    /// The Prefix Revision of `prefix` in the Store `store`, given the Files under it in order of
+    /// Path.
+    pub(crate) fn of(
+        store: StoreId,
+        prefix: Prefix,
+        files: Vec<(Path, Revision)>,
+    ) -> PrefixRevision {
+        PrefixRevision { store, prefix, hash: hash(&files), files: files.into() }
     }
 
     /// The Prefix it was taken for.
@@ -112,9 +123,9 @@ impl PrefixRevision {
         &self.prefix
     }
 
-    /// Whether it was taken for `prefix` in `area`.
-    pub(crate) fn is_for(&self, area: Area, prefix: &Prefix) -> bool {
-        self.area == area && self.prefix == *prefix
+    /// Whether it was taken from the Store `store` for `prefix`.
+    pub(crate) fn is_for(&self, store: StoreId, prefix: &Prefix) -> bool {
+        self.store == store && self.prefix == *prefix
     }
 
     /// The Paths added, removed or changed since, given the Files under its Prefix now, in order
@@ -149,7 +160,7 @@ fn hash(files: &[(Path, Revision)]) -> u128 {
 
 impl PartialEq for PrefixRevision {
     fn eq(&self, other: &Self) -> bool {
-        (self.area, &self.prefix, self.hash) == (other.area, &other.prefix, other.hash)
+        (self.store, &self.prefix, self.hash) == (other.store, &other.prefix, other.hash)
     }
 }
 
@@ -157,11 +168,11 @@ impl Eq for PrefixRevision {}
 
 impl std::hash::Hash for PrefixRevision {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        (self.area, &self.prefix, self.hash).hash(state);
+        (self.store, &self.prefix, self.hash).hash(state);
     }
 }
 
-/// The 32 lowercase hexadecimal digits of its hash. The Area and Prefix aren't written.
+/// The 32 lowercase hexadecimal digits of its hash. The Store and Prefix aren't written.
 impl fmt::Display for PrefixRevision {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:032x}", self.hash)
@@ -170,6 +181,6 @@ impl fmt::Display for PrefixRevision {
 
 impl fmt::Debug for PrefixRevision {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "PrefixRevision({:?} {:?} {:032x})", self.area, self.prefix, self.hash)
+        write!(f, "PrefixRevision({:?} {:032x})", self.prefix, self.hash)
     }
 }

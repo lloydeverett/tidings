@@ -1,7 +1,7 @@
 use crate::backend::BackendSnapshot;
 use crate::{File, IntoPath, IntoPrefix, Path, Result, Stat};
 
-/// A view of one Area as it stood when it was taken, from
+/// A view of a Store as it stood when it was taken, from
 /// [`Store::snapshot`](crate::Store::snapshot). Reading several Files through it never mixes the
 /// results of different Commits: Commits made after it was taken don't show in it.
 ///
@@ -31,7 +31,7 @@ impl Snapshot {
     }
 
     /// Lists the Paths of the Files that were under `prefix`, in order. The empty Prefix lists the
-    /// whole Area.
+    /// whole Store.
     pub async fn list(&self, prefix: impl IntoPrefix) -> Result<Vec<Path>> {
         let prefix = prefix.into_prefix()?;
         self.view.list(&prefix).await

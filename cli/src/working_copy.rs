@@ -1,4 +1,4 @@
-//! A Working copy: a folder holding one Area's Files as ordinary files, with its record in
+//! A Working copy: a folder holding one Store's Files as ordinary files, with its record in
 //! `.tidings/` (ADR 0008). It owns everything about the folder and the record: creating and
 //! opening one, locking it, reading the folder, reconciling Paths against the Store, committing
 //! local changes, and reporting how the folder stands. Each operation gives a report for the
@@ -16,12 +16,11 @@ use std::path::{Component, Path as FsPath, PathBuf};
 use std::pin::{Pin, pin};
 
 use tidings::{
-    Area, ChangeFeed, Committed, FeedItem, File, Path, Precondition, Revision, Staging, Store,
+    ChangeFeed, Committed, FeedItem, File, Path, Precondition, Revision, Staging, Store,
 };
 
 use crate::failure::Failure;
 use crate::location::{Opened, StoreAddress, StoreArgs};
-use crate::output::area_name;
 use record::{Base, Divergence, Record};
 use scan::{Difference, IGNORE_FILE, Scan, is_record_directory};
 pub use scan::{LocalName, Unfit};
@@ -50,12 +49,11 @@ const TMP_DIRECTORY: &str = "tmp";
 /// its Path.
 const THEIRS_DIRECTORY: &str = "theirs";
 
-/// A folder that is a Working copy, and the Store and Area its record names, which never change.
-/// Its Bases are read from the record only under [`Lock`], since another command may change them.
+/// A folder that is a Working copy, and the Store its record names, which never changes. Its Bases
+/// are read from the record only under [`Lock`], since another command may change them.
 pub struct WorkingCopy {
     folder: PathBuf,
     store: StoreAddress,
-    area: Area,
 }
 
 /// Held for as long as a `sync` runs: the lock on `.tidings/sync.lock`.
@@ -96,7 +94,7 @@ pub enum SyncEvent {
         /// .tidings/theirs/a: Is a directory (os error 21)".
         message: String,
     },
-    /// Changes to the Area may have been missed, so it reconciles every Path.
+    /// Changes to the Store may have been missed, so it reconciles every Path.
     Resync,
     /// It has applied everything it knows of.
     CaughtUp,
@@ -193,7 +191,7 @@ pub enum LocalChange {
 
 /// Which Paths a reconcile covers.
 enum Paths {
-    /// Every Path in the Area and in the record.
+    /// Every Path in the Store and in the record.
     All,
     /// Only these.
     Only(BTreeSet<Path>),
@@ -315,13 +313,13 @@ impl NamingCommand {
 }
 
 /// A file or directory the person named to `commit`: as they gave it, and where it is in the
-/// Area.
+/// Store.
 struct NamedPath {
     given: PathBuf,
     target: Target,
 }
 
-/// Where a named file or directory is in the Area.
+/// Where a named file or directory is in the Store.
 enum Target {
     /// The whole folder, which covers every Path.
     Folder,
@@ -382,22 +380,21 @@ enum Local {
 }
 
 impl WorkingCopy {
-    /// `sync`: makes `folder` a Working copy of `area` in the Store `flags` choose, or resumes the
-    /// Working copy it is, which must be of `area`, and keeps it in step with its Store until
-    /// `stop` finishes, giving each [`SyncEvent`] to `report` as it happens. `stop` is acted on
-    /// only between reconciles, so each one finishes and saves the record.
+    /// `sync`: makes `folder` a Working copy of the Store `flags` choose, or resumes the Working
+    /// copy it is, and keeps it in step with its Store until `stop` finishes, giving each
+    /// [`SyncEvent`] to `report` as it happens. `stop` is acted on only between reconciles, so each
+    /// one finishes and saves the record.
     ///
     /// Only one `sync` of a Working copy runs at a time: a second is refused before it opens the
     /// Store.
     pub async fn sync(
         folder: &FsPath,
-        area: Area,
         flags: &StoreArgs,
         stop: impl Future<Output = ()>,
         report: impl FnMut(&SyncEvent) -> io::Result<()>,
     ) -> Result<(), Failure> {
         let (working_copy, _syncing, mut opened) =
-            WorkingCopy::open_or_create(folder, area, flags).await?;
+            WorkingCopy::open_or_create(folder, flags).await?;
         working_copy.follow(&opened.store, &mut opened.feed, stop, report).await
     }
 
@@ -406,12 +403,10 @@ impl WorkingCopy {
     /// Store, opened with its Change feed before anything is reconciled.
     async fn open_or_create(
         folder: &FsPath,
-        area: Area,
         flags: &StoreArgs,
     ) -> Result<(WorkingCopy, SyncLock, Opened), Failure> {
         if WorkingCopy::exists(folder) {
             let working_copy = WorkingCopy::open(folder)?;
-            working_copy.check_area(area)?;
             let syncing = working_copy.lock_for_sync()?;
             let opened = working_copy.open_store(flags).await?;
             return Ok((working_copy, syncing, opened));
@@ -421,7 +416,7 @@ impl WorkingCopy {
         let store = flags.address_for_working_copy().await?;
         WorkingCopy::check_can_create(folder)?;
         fs::create_dir_all(folder.join(RECORD_DIRECTORY)).map_err(failed_at(folder))?;
-        let working_copy = WorkingCopy { folder: folder.to_owned(), store, area };
+        let working_copy = WorkingCopy { folder: folder.to_owned(), store };
         let syncing = working_copy.lock_for_sync()?;
         // Checked again under the lock, since another `sync` may have made it a Working copy
         // meanwhile.
@@ -454,7 +449,7 @@ impl WorkingCopy {
     fn save_new_record(&self) -> Result<(), Failure> {
         let _lock = self.lock_waiting(LOCK_FILE)?;
         scan::create_ignore_file(&self.folder)?;
-        self.save(&Record::new(self.store.clone(), self.area))
+        self.save(&Record::new(self.store.clone()))
     }
 
     /// Whether `folder` is a Working copy: whether it has a record, of this version or another.
@@ -462,7 +457,7 @@ impl WorkingCopy {
         record::is_record(&record_file(folder))
     }
 
-    /// Opens the Working copy that is `folder`, reading which Store and Area it belongs to.
+    /// Opens the Working copy that is `folder`, reading which Store it belongs to.
     pub fn open(folder: &FsPath) -> Result<WorkingCopy, Failure> {
         let file = record_file(folder);
         if !record::is_record(&file) {
@@ -471,12 +466,12 @@ impl WorkingCopy {
                 folder.display()
             )));
         }
-        let Record { store, area, .. } = Record::read(&file)?;
-        Ok(WorkingCopy { folder: folder.to_owned(), store, area })
+        let Record { store, .. } = Record::read(&file)?;
+        Ok(WorkingCopy { folder: folder.to_owned(), store })
     }
 
     /// Opens the Working copy `start` is in: the first folder from `start` up that has a record.
-    /// A `.tidings/` directory alone, as in a filesystem Area, doesn't make one.
+    /// A `.tidings/` directory alone, as in a filesystem Store's Location, doesn't make one.
     pub fn find(start: &FsPath) -> Result<WorkingCopy, Failure> {
         match start.ancestors().find(|folder| record::is_record(&record_file(folder))) {
             Some(folder) => WorkingCopy::open(folder),
@@ -485,19 +480,6 @@ impl WorkingCopy {
                 start.display()
             ))),
         }
-    }
-
-    /// Fails unless the Working copy is of `area`.
-    fn check_area(&self, area: Area) -> Result<(), Failure> {
-        if area == self.area {
-            return Ok(());
-        }
-        Err(Failure::error(format!(
-            "{} is a Working copy of the {} Area, not {}",
-            self.folder.display(),
-            area_name(self.area),
-            area_name(area),
-        )))
     }
 
     /// Opens the Store the record names. Any Store flags given in `flags` must match it, and
@@ -520,8 +502,8 @@ impl WorkingCopy {
     }
 
     /// Keeps the folder in step with the Store until `stop` finishes, as [`WorkingCopy::sync`]
-    /// says. It reconciles every Path first, then the Paths of each batch of Changes to the Area
-    /// on `feed`, and every Path again on a Resync for the Area. `feed` must have been taken when
+    /// says. It reconciles every Path first, then the Paths of each batch of Changes on `feed`,
+    /// and every Path again on a Resync. `feed` must have been taken when
     /// `store` was opened, so that nothing committed since is missed.
     async fn follow(
         &self,
@@ -545,8 +527,8 @@ impl WorkingCopy {
         }
     }
 
-    /// Waits on `feed` for the Paths to reconcile next: those of a batch of Changes to the Area, or
-    /// every Path on a Resync for it, which is reported. Before waiting on an empty feed, reports
+    /// Waits on `feed` for the Paths to reconcile next: those of a batch of Changes, or every Path
+    /// on a Resync, which is reported. Before waiting on an empty feed, reports
     /// that `sync` is caught up, so anything already waiting is reconciled first. Gives `None`
     /// once `stop` finishes.
     async fn wait_for_paths(
@@ -571,20 +553,16 @@ impl WorkingCopy {
             let Some(item) = item else { return Ok(None) };
             match item {
                 FeedItem::Changes(changes) => {
-                    let paths: BTreeSet<Path> = changes
-                        .into_iter()
-                        .filter(|change| change.area == self.area)
-                        .map(|change| change.path)
-                        .collect();
+                    let paths: BTreeSet<Path> =
+                        changes.into_iter().map(|change| change.path).collect();
                     if !paths.is_empty() {
                         return Ok(Some(Paths::Only(paths)));
                     }
                 }
-                FeedItem::Resync(area) if area == self.area => {
+                FeedItem::Resync => {
                     report(&SyncEvent::Resync)?;
                     return Ok(Some(Paths::All));
                 }
-                FeedItem::Resync(_) => {}
             }
         }
     }
@@ -645,8 +623,7 @@ impl WorkingCopy {
         let record = &mut lock.record;
         let mut paths = match paths {
             Paths::All => {
-                let mut paths: BTreeSet<Path> =
-                    store.list(self.area, "").await?.into_iter().collect();
+                let mut paths: BTreeSet<Path> = store.list("").await?.into_iter().collect();
                 paths.extend(record.bases.keys().cloned());
                 paths
             }
@@ -683,7 +660,7 @@ impl WorkingCopy {
         let mut removed = Vec::new();
         let mut written = Vec::new();
         for path in paths {
-            let store_file = store.read(self.area, &path).await?;
+            let store_file = store.read(&path).await?;
             let base = record.bases.get(&path).map(|base| base.revision);
             if store_file.as_ref().map(File::revision) != base
                 || record.divergences.contains_key(&path)
@@ -1080,7 +1057,7 @@ impl WorkingCopy {
         scan: &Scan,
         selection: &Selection,
     ) -> Result<(Staging, Vec<(Path, LocalChange)>), Failure> {
-        let mut staging = Staging::new(self.area);
+        let mut staging = Staging::new();
         let mut changes = Vec::new();
         for (path, difference) in scan.changes() {
             if !selection.covers(path.as_str()) {
