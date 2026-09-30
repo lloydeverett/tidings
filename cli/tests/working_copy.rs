@@ -2892,18 +2892,13 @@ fn discard_resolve_and_a_resync_remove_every_stale_theirs_without_following_syml
 }
 
 #[test]
-fn a_record_in_version_1_is_read_and_one_in_an_unknown_format_or_version_refused_and_kept() {
+fn a_record_in_an_unknown_format_or_version_is_refused_and_kept() {
     let location = store_with_config("fs");
     let folder = TempDir::new().unwrap();
     synced(&location, "config", folder.path());
     let record = folder.path().join(".tidings/working-copy");
     let text = fs::read_to_string(&record).unwrap();
-    // Version 2 can leave a Base's hash out, which version 1 can't read.
-    let rest = text.strip_prefix("tidings working-copy 2\n").unwrap_or_else(|| panic!("{text}"));
-
-    fs::write(&record, format!("tidings working-copy 1\n{rest}")).unwrap();
-    let run = run_in("status", folder.path(), &[]).expect_success();
-    assert!(run.stdout.starts_with("nothing to commit\n"), "{run:?}");
+    let rest = text.strip_prefix("tidings working-copy 1\n").unwrap_or_else(|| panic!("{text}"));
 
     fs::write(folder.path().join("app.toml"), "a = 2\n").unwrap();
     let folder_arg = folder.path().to_str().unwrap();
@@ -2916,12 +2911,12 @@ fn a_record_in_version_1_is_read_and_one_in_an_unknown_format_or_version_refused
         (&["resolve", "-C", folder_arg, "app.toml"], "is not a Working copy"),
         (&["sync", "config", folder_arg], "isn't empty"),
     ];
-    for first_line in ["tidings working-copy 3", "tidings working-copy-next 1"] {
+    for first_line in ["tidings working-copy 2", "tidings working-copy-next 1"] {
         let unknown = format!("{first_line}\n{rest}");
         fs::write(&record, &unknown).unwrap();
         for (args, not_a_record) in commands {
             let run = location.run(args).expect_code(1);
-            let why = if first_line.ends_with(" 3") {
+            let why = if first_line.ends_with(" 2") {
                 "in a format this version doesn't know"
             } else {
                 not_a_record

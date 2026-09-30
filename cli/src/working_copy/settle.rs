@@ -184,12 +184,7 @@ impl WorkingCopy {
     ///
     /// Refused, resolving nothing, unless each of `named` is a Diverged Path; a directory isn't
     /// one, so that nothing is marked resolved by mistake.
-    pub async fn resolve(
-        &self,
-        store: &Store,
-        named: &[PathBuf],
-        current: &FsPath,
-    ) -> Result<ResolveReport, Failure> {
+    pub fn resolve(&self, named: &[PathBuf], current: &FsPath) -> Result<ResolveReport, Failure> {
         let mut lock = self.lock()?;
         let record = &mut lock.record;
         let named = match self.select(named, current)? {
@@ -219,13 +214,7 @@ impl WorkingCopy {
         let mut report = ResolveReport { resolved: Vec::new(), events: Vec::new() };
         for path in paths {
             let Some(divergence) = record.divergences.remove(&path) else { continue };
-            let base = match divergence.theirs {
-                Some(Base { revision, hash: None }) => {
-                    Some(self.base_of(store, &path, revision).await?)
-                }
-                theirs => theirs,
-            };
-            record.set_base(&path, base);
+            record.set_base(&path, divergence.theirs);
             report.resolved.push(Resolved { path, revision: divergence.theirs_revision() });
         }
         // The record is saved first, so that a saved record never names a `theirs` file that is
@@ -233,25 +222,6 @@ impl WorkingCopy {
         self.save(record)?;
         report.events = self.remove_stale_theirs(record);
         Ok(report)
-    }
-
-    /// The Base of the Diverged `path` at `revision`, the Revision recorded for its `theirs` file,
-    /// when the hash of its contents wasn't recorded with it, as for a Divergence read from a
-    /// version-1 record: the hash of those the Store holds, if it is still at `revision`. The
-    /// `theirs` file's contents are never taken, since the person may have merged in it. Otherwise
-    /// the contents aren't known, so any local file counts as changed since the Base: were it
-    /// taken as unchanged, `sync` would put the Store's newer File over it.
-    async fn base_of(
-        &self,
-        store: &Store,
-        path: &Path,
-        revision: Revision,
-    ) -> Result<Base, Failure> {
-        let store_file = store.read(self.area, path).await?;
-        Ok(match store_file.filter(|file| file.revision() == revision) {
-            Some(file) => Base::of_file(&file),
-            None => Base { revision, hash: None },
-        })
     }
 }
 

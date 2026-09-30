@@ -701,7 +701,6 @@ impl WorkingCopy {
                 |record: &Record| record.divergences.get(&path).map(Divergence::theirs_revision);
             let before = theirs_revision(record);
             let event = self.reconcile_path(record, &path, store_file.as_ref())?;
-            // Not when only a hash was recorded, which leaves `theirs` as it is.
             let changed = theirs_revision(record) != before;
             let retrying = theirs_failures.remove(&path);
             // The Store's version for `theirs` to hold, if the Path is Diverged.
@@ -1435,7 +1434,6 @@ fn diverge(
     blocked: Option<Blocked>,
 ) -> Option<SyncEvent> {
     let divergence = Divergence { theirs: store_file.map(Base::of_file) };
-    // Always recorded, so that one read from a version-1 record gains its hash.
     let was = record.divergences.insert(path.clone(), divergence);
     if was.map(|was| was.theirs_revision()) == Some(divergence.theirs_revision()) {
         return None;

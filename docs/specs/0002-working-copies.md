@@ -267,8 +267,9 @@ A **Working copy**: a folder holding one Area's Files as ordinary files.
   the Store's location (an absolute Root override or an App identity), its Backend, the Area, and
   one entry per Path with a Base. Each entry holds the Base Revision (written as text, ADR 0007),
   a hash of the contents last written to or read from the folder for that Base, and whether the
-  Path is Diverged. A Diverged entry also records the Revision of the Store's version in `theirs`,
-  or that the Store has no File there. An unknown format or version is refused.
+  Path is Diverged. A Diverged entry also records the Revision of the Store's version in `theirs`
+  and a hash of its contents, or that the Store has no File there. An unknown format or version is
+  refused.
 - The record is always replaced whole: written to a temporary file in `.tidings/`, forced to disk,
   and renamed into place (`atomic-write-file`, as the filesystem Backend uses).
 - `ignore`: the ignore file, created with the defaults when the Working copy is created, and read
@@ -376,7 +377,8 @@ Revision) and its local state `L`:
 - `resolve <path…>`, under `lock`: each must be Diverged. The Base becomes the Store version
   recorded for `theirs`: its Revision, or no Base if the Store had removed it. The Divergence is
   cleared and `theirs` removed. The folder is untouched. A later commit therefore still conflicts
-  if the Store has changed since the version merged against.
+  if the Store has changed since the version merged against. Like `status`, it reads the Store
+  only to open it.
 - `status`: the classification above for every Path that isn't unchanged, plus whether `sync` is
   running. Text for a person, or JSON with `--json`. It reads the Store only to open it (to check
   the record's Store is still there), not to reconcile: it reports the folder against the record.

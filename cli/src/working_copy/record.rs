@@ -8,14 +8,11 @@
 //! - `backend` and the Backend;
 //! - `area` and the Area;
 //! - `base`, a Path, its Base Revision, and the hash of the contents last written to or read from
-//!   the folder for that Base, in hexadecimal, which is left out if they aren't known;
-//! - `diverged`, a Diverged Path, the Revision of the Store's File in `theirs`, which is left out
-//!   if the Store has no File there, and the hash of that File's contents, which is left out if
-//!   they aren't known.
+//!   the folder for that Base, in hexadecimal;
+//! - `diverged`, a Diverged Path, and the Revision of the Store's File in `theirs` and the hash of
+//!   that File's contents, which are both left out if the Store has no File there.
 //!
-//! This is version 2, which may leave a Base's hash out, and gives a Diverged Path's hash.
-//! Version 1, which always gives a Base's hash and never a Diverged Path's, is read as well, since
-//! it is otherwise the same; any other version is refused.
+//! This is version 1; any other version is refused.
 //!
 //! It is always replaced whole, with `atomic-write-file`, which writes a new file, forces it to
 //! disk and renames it over the record.
@@ -33,11 +30,7 @@ use crate::location::{BackendName, Identity, StoreAddress, StoreLocation};
 use crate::output::area_name;
 
 /// The first line of every record this version writes, which names its format.
-const FORMAT: &str = "tidings working-copy 2";
-
-/// The first line of a record in version 1, which this version reads as well: it is the same, but
-/// always gives a Base's hash, and never a Diverged Path's.
-const FORMAT_1: &str = "tidings working-copy 1";
+const FORMAT: &str = "tidings working-copy 1";
 
 /// What the first line of a record in any version starts with.
 const FORMAT_NAME: &str = "tidings working-copy ";
@@ -59,16 +52,14 @@ pub struct Record {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Base {
     pub revision: Revision,
-    /// The hash of the Base's contents, or `None` if they aren't known, as when `resolve` takes a
-    /// Revision whose hash wasn't recorded and that the Store no longer holds: every local file
-    /// then counts as changed since the Base.
-    pub hash: Option<Hash>,
+    /// The hash of the Base's contents.
+    pub hash: Hash,
 }
 
 impl Base {
     /// The Base of the Revision `revision`, which holds `contents`.
     pub fn of(revision: Revision, contents: &str) -> Base {
-        Base { revision, hash: Some(Hash::of(contents)) }
+        Base { revision, hash: Hash::of(contents) }
     }
 
     /// The Base of the Store's File `file`: its Revision, which holds its contents.
@@ -76,9 +67,9 @@ impl Base {
         Base::of(file.revision(), file.contents())
     }
 
-    /// Whether `contents` are the Base's, as far as is known.
+    /// Whether `contents` are the Base's.
     pub fn holds(&self, contents: &str) -> bool {
-        self.hash == Some(Hash::of(contents))
+        self.hash == Hash::of(contents)
     }
 }
 
@@ -181,21 +172,17 @@ impl Record {
         }
         line(&["backend", &self.store.backend.to_string()]);
         line(&["area", area_name(self.area)]);
-        // A Base, as the fields after the Path.
-        let base_fields = |base: &Base| {
-            let mut fields = vec![base.revision.to_string()];
-            fields.extend(base.hash.map(Hash::to_text));
-            fields
-        };
         for (path, base) in &self.bases {
-            let fields = base_fields(base);
-            let fields: Vec<&str> = fields.iter().map(String::as_str).collect();
-            line(&[&["base", path.as_str()], &fields[..]].concat());
+            line(&["base", path.as_str(), &base.revision.to_string(), &base.hash.to_text()]);
         }
         for (path, divergence) in &self.divergences {
-            let fields = divergence.theirs.as_ref().map(base_fields).unwrap_or_default();
-            let fields: Vec<&str> = fields.iter().map(String::as_str).collect();
-            line(&[&["diverged", path.as_str()], &fields[..]].concat());
+            match &divergence.theirs {
+                Some(theirs) => {
+                    let (revision, hash) = (theirs.revision.to_string(), theirs.hash.to_text());
+                    line(&["diverged", path.as_str(), &revision, &hash]);
+                }
+                None => line(&["diverged", path.as_str()]),
+            }
         }
         text
     }
@@ -204,7 +191,7 @@ impl Record {
     fn parse(text: &str) -> Result<Record, String> {
         let mut lines = text.lines();
         match lines.next() {
-            Some(FORMAT | FORMAT_1) => {}
+            Some(FORMAT) => {}
             Some(first) if first.starts_with(FORMAT_NAME) => {
                 return Err(format!("is in a format this version doesn't know: {first:?}"));
             }
@@ -223,21 +210,14 @@ impl Record {
                 }
                 ["backend", name] => backend = Some(parse_backend(name)?),
                 ["area", name] => area = Some(Area::from(parse_value::<AreaName>(name)?)),
-                ["base", path, revision] => {
-                    bases.insert(parse_path(path)?, parse_base(revision, None)?);
-                }
                 ["base", path, revision, hash] => {
-                    bases.insert(parse_path(path)?, parse_base(revision, Some(hash))?);
+                    bases.insert(parse_path(path)?, parse_base(revision, hash)?);
                 }
                 ["diverged", path] => {
                     divergences.insert(parse_path(path)?, Divergence { theirs: None });
                 }
-                ["diverged", path, revision] => {
-                    let theirs = Some(parse_base(revision, None)?);
-                    divergences.insert(parse_path(path)?, Divergence { theirs });
-                }
                 ["diverged", path, revision, hash] => {
-                    let theirs = Some(parse_base(revision, Some(hash))?);
+                    let theirs = Some(parse_base(revision, hash)?);
                     divergences.insert(parse_path(path)?, Divergence { theirs });
                 }
                 _ => return Err(format!("has a line it can't read: {line:?}")),
@@ -253,10 +233,10 @@ impl Record {
     }
 }
 
-/// The Base the record gives as `revision` and, if it is known, `hash`.
-fn parse_base(revision: &str, hash: Option<&str>) -> Result<Base, String> {
+/// The Base the record gives as `revision` and `hash`.
+fn parse_base(revision: &str, hash: &str) -> Result<Base, String> {
     let revision = revision.parse().map_err(|_| bad("Revision", revision))?;
-    Ok(Base { revision, hash: hash.map(Hash::parse).transpose()? })
+    Ok(Base { revision, hash: Hash::parse(hash)? })
 }
 
 /// The Backend named `name`, which can't be the memory Backend.

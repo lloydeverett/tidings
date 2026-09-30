@@ -295,7 +295,8 @@ async fn discard(
 }
 
 /// `resolve`: takes what is in the Working copy at each of `paths`, Diverged Paths relative to the
-/// current directory, as their merge. Any Store flags in `store` must match its record.
+/// current directory, as their merge. Any Store flags in `store` must match its record, and the
+/// Store must still be there.
 async fn resolve(
     store: &StoreArgs,
     output: Output,
@@ -303,8 +304,8 @@ async fn resolve(
     paths: &[PathBuf],
 ) -> Result<(), Failure> {
     let working_copy = working_copy.open()?;
-    let opened = working_copy.open_store(store).await?;
-    let report = working_copy.resolve(&opened.store, paths, &std::env::current_dir()?).await?;
+    working_copy.open_store(store).await?;
+    let report = working_copy.resolve(paths, &std::env::current_dir()?)?;
     Ok(output.print(&Report::WorkingCopyResolve(report))?)
 }
 
