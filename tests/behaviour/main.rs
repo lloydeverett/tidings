@@ -1358,6 +1358,42 @@ mod fs {
         assert!(link.is_symlink());
     }
 
+    /// A directory in the Location that holds a `.tidings/`, as another Store's Location or a
+    /// Working copy does, is outside the Store, as a symlink to a directory is: what is under it
+    /// isn't listed, read, or in a Prefix Revision.
+    #[tokio::test]
+    async fn a_directory_holding_another_store_or_a_working_copy_is_left_out() {
+        let fixture = Fs::new();
+        let (inner, _inner_feed) =
+            tidings::Store::open_fs(fixture.on_disk("inner"), fixture.usual_options())
+                .await
+                .unwrap();
+        let mut staging = Staging::new();
+        staging.write("a.txt", "a").unwrap();
+        inner.commit(staging).await.unwrap();
+        std::fs::create_dir_all(fixture.on_disk("themes/copy/.tidings")).unwrap();
+        fixture.write_directly("themes/copy/b.txt", "b");
+        fixture.write_directly("themes/dark.toml", "dark");
+        let Opened { store, feed: _feed } = fixture.open().await;
+
+        assert_eq!(list(&store).await, ["themes/dark.toml"]);
+        assert_eq!(store.list("inner/").await.unwrap(), Vec::<tidings::Path>::new());
+        assert_eq!(store.list("themes/copy/").await.unwrap(), Vec::<tidings::Path>::new());
+        assert_eq!(store.read("inner/a.txt").await.unwrap(), None);
+        assert_eq!(store.stat("themes/copy/b.txt").await.unwrap(), None);
+
+        let prefix_revisions = async || {
+            let all = store.stat_prefix("").await.unwrap().to_string();
+            (all, store.stat_prefix("themes/").await.unwrap().to_string())
+        };
+        let before = prefix_revisions().await;
+        let mut staging = Staging::new();
+        staging.write("c.txt", "c").unwrap();
+        inner.commit(staging).await.unwrap();
+        fixture.write_directly("themes/copy/b.txt", "edited");
+        assert_eq!(prefix_revisions().await, before);
+    }
+
     /// The Location can itself be a symlink to a directory, as when a person keeps an app's config
     /// in a dotfiles repo. It is followed once, when the Store opens.
     #[cfg(unix)]

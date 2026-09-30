@@ -28,6 +28,13 @@
 //! [`DirectoryLink`](InvalidPathReason::DirectoryLink), and finishing a Commit never writes or
 //! deletes through one made since.
 //!
+//! **Other Stores and Working copies.** A directory in the Location that holds a `.tidings/`
+//! directory is another Store's Location, or a Working copy, and is left out, with everything
+//! under it, as a symlink to a directory is: so two Stores, or a Store and a Working copy, never
+//! claim the same files. A Commit that would write or delete under one is refused with
+//! [`Nested`](InvalidPathReason::Nested), and finishing a Commit never writes or deletes under one
+//! made since. One made while the Store is open drops out of it: see [`watch`].
+//!
 //! **Exact names.** A Path names only the file on disk with exactly its name. Some filesystems
 //! (macOS's and Windows' by default) also find `Foo` when asked for `foo`. Opening a Store finds
 //! out whether the Location's does, from whether `.tidings/LOCK` finds `.tidings/lock`. Where it
@@ -565,7 +572,7 @@ impl Location {
     }
 
     /// Follows `segments` down from the Location while each is a directory there under exactly its
-    /// own name, and not a symlink. The one walk from the Location that reads, writes and finishing
+    /// own name, not a symlink, and not holding a `.tidings/`. The one walk from the Location that reads, writes and finishing
     /// share.
     fn own_directories(&self, segments: &[&str]) -> Result<OwnDirectories> {
         let mut directory = self.directory.clone();
@@ -573,6 +580,10 @@ impl Location {
             let next = directory.join(segment);
             let there = present_at(fs::symlink_metadata(&next), &next)?;
             if there.as_ref().is_some_and(fs::Metadata::is_dir) && self.named_exactly(&next)? {
+                if holds_tidings(&next)? {
+                    let next_left_out = Some(LeftOut::Nested);
+                    return Ok(OwnDirectories { directory, count, next_left_out });
+                }
                 directory = next;
                 continue;
             }
@@ -589,7 +600,7 @@ impl Location {
 
     /// Why `name`, a Path or a Prefix without its `/`, is left out of the Store, if it is: it, or
     /// a directory on the way to it, is found only under another name that the filesystem treats
-    /// as the same, or is a symlink to a directory.
+    /// as the same, is a symlink to a directory, or is a directory holding a `.tidings/`.
     fn left_out(&self, name: &str) -> Result<Option<LeftOut>> {
         let segments: Vec<&str> = name.split('/').collect();
         Ok(self.own_directories(&segments)?.next_left_out)
@@ -917,11 +928,12 @@ enum OnDisk {
 
 impl OnDisk {
     /// What `entry` is, or `None` if it is neither a File nor a directory, as a symlink to nothing
-    /// isn't. A symlink to a directory is `None` too, since it is left out of the Store.
+    /// isn't. A symlink to a directory is `None` too, since it is left out of the Store, and so
+    /// is a directory holding a `.tidings/`.
     fn of(entry: &fs::DirEntry) -> Result<Option<OnDisk>> {
         let file_type = entry.file_type().map_err(|error| failed(&entry.path(), error))?;
         if file_type.is_dir() {
-            return Ok(Some(OnDisk::Directory));
+            return Ok((!holds_tidings(&entry.path())?).then_some(OnDisk::Directory));
         }
         let file_type = if file_type.is_symlink() {
             match present_at(fs::metadata(entry.path()), &entry.path())? {
@@ -1023,6 +1035,8 @@ enum LeftOut {
     UnderOtherName,
     /// It is a symlink to a directory.
     DirectoryLink,
+    /// It is a directory holding a `.tidings/`: another Store's Location, or a Working copy.
+    Nested,
 }
 
 /// Refuses a write to a file on disk that another Path of the Commit writes or deletes too, as
@@ -1088,6 +1102,13 @@ fn revisions(
         }
     }
     Ok(files)
+}
+
+/// Whether `directory`, in the Location, holds a `.tidings/` directory, as another Store's
+/// Location and a Working copy do, and so is left out of the Store, with everything under it.
+fn holds_tidings(directory: &FsPath) -> Result<bool> {
+    let tidings = directory.join(RESERVED);
+    Ok(present_at(fs::metadata(&tidings), &tidings)?.is_some_and(|there| there.is_dir()))
 }
 
 /// Whether `directory` has an entry named exactly `name`.
