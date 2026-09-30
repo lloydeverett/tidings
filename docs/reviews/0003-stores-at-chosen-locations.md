@@ -105,3 +105,109 @@ Fixed in 8d06632:
 `cargo fmt` and clippy are clean. `cargo test -p tidings --all-features` passes, and so do the
 CLI's shell and working-copy tests. No re-review: the fixes are small, except the SQLite check,
 which is covered by its new test.
+
+---
+
+## Ticket 02: Nested Locations
+
+Reviewed: `git diff 9441707...e3a14b3` (commits 4e6f08f to e3a14b3).
+
+### Standards
+
+**(a) Documented-standard violations:**
+
+- **Comments wrapped too early:** `src/backend/fs/watch.rs:27` (a module doc) and
+  `src/backend/fs/journal.rs:174`.
+- **An earlier fix undone:** `src/backend/fs.rs:725` wrote out
+  `given.strip_suffix('/').unwrap_or(given)` again. That is what `without_trailing_slash`, added
+  after review 0001, was meant to stop.
+
+No _Avoid_ words are used as domain terms. "Event" in `watch.rs` means a filesystem event, as it
+did before.
+
+**(b) Baseline smells (judgement calls):**
+
+1. **Duplicated Code: the check on disk for "does this directory hold `.tidings/`?"** It was
+   written twice, in `fs.rs` (`holds_tidings`, which passes I/O errors up) and in `marker.rs`
+   (`is_ok_and`, which hides every error). So an ancestor that couldn't be read was not refused.
+2. **Duplicated Code:** `watch.rs` copied `path::is_reserved`.
+3. **Duplicated Code:** `left_out(..)? == Some(LeftOut::Nested)` was written out three times.
+4. **Mysterious Name:** `holds_tidings` (a check on disk) and `holding_tidings` (which parses an
+   event's path) were named almost alike.
+5. **Mysterious Name:** `written_outside` covered only nested directories, while the `outside`
+   closure beside it covered directory links too.
+6. **Primitive Obsession (minor):** `Staged::changed_names` gave Paths and Prefixes as one kind of
+   `&str`.
+
+### Spec
+
+The reviewer ran the 18 nested-location, symlink and two-Store behaviour tests; all pass. The
+edge cases checked out:
+- the ancestor walk works on the resolved path, including for a Location that doesn't exist yet
+  and one that is a symlink;
+- SQLite runs the ancestor check, and has no boundaries below its Location;
+- every Backend refuses `.tidings` at any depth of a Path;
+- the same Location can still be opened twice;
+- Prefix deletes and finishing a Commit leave nested directories alone.
+
+- **(a) Missing or partial:**
+  1. No test that an inner Store's Commits give the outer Store no Changes: the test bound the
+     outer feed as `_feed` and never checked it.
+  2. No test that Files come back when `.tidings/` is removed from a subdirectory, as the
+     implementation claims.
+- **(b) Scope creep:** none. The reviewer judged each decision not in the spec to be acceptable:
+  - `Error::NestedLocation { outer }`;
+  - only a directory named `.tidings` counts as one;
+  - `InvalidPathReason::Nested`, checked before Preconditions;
+  - pending writes under a new boundary hidden from reads;
+  - Files under a new boundary reported Removed.
+- **(c) Looks wrong:**
+  1. A Store could be opened at a Working copy's own folder. That follows the letter of the spec
+     ("the Location itself holding `.tidings/` is the normal case"), but it then writes a Backend
+     marker into the Working copy's `.tidings/`, against story 28's intent.
+  2. The ancestor check treated an I/O error as "not nested", the same as smell 1.
+
+### Summary
+
+Standards: 2 lines wrapped wrong, 1 earlier fix undone, 6 judgement-call smells (worst: the check
+for `.tidings/` written twice, with different error handling). Spec: 2 missing tests, 2 findings
+(worst: a Store could be opened at a Working copy's folder).
+
+### Resolution
+
+1. **Wrapping:** fixed in 6bac34e. The `journal.rs` comment was reworded, since its old wrap was
+   right for its words.
+2. **Slash stripping:** fixed in 6bac34e, using the shared helper again.
+3. **The check for `.tidings/`:** fixed in 6bac34e (smell 1 and spec (c) 2). There is one
+   `marker::holds_tidings`, used both when opening and by the filesystem Store. It gives `false`
+   only when nothing is there, and any other I/O error makes opening fail. The duplicated
+   `is_absent` moved to the Backend module.
+4. **`is_reserved`:** fixed in 6bac34e. It is shared, not copied.
+5. **The repeated `Nested` test:** partly fixed in 6bac34e. Two uses now call `is_nested`. The
+   `outside` closure in `Journal::finish` still matches on `left_out`, because it handles directory
+   links too, and `is_nested` would walk the directories on disk a second time.
+6. **Names:** fixed in 6bac34e. The event parser and `written_outside` are renamed for what they
+   do.
+7. **Primitive Obsession:** not fixed. Using `without_trailing_slash` again covers the one caller
+   that suffered, and a new type for one iterator isn't worth it.
+8. **Missing tests:** fixed in f5c60cf. The outer Store's feed is checked to stay quiet while the
+   inner Store commits. A new test checks that Files come back, as Changes, when a
+   subdirectory's `.tidings/` is removed.
+9. **A Store at a Working copy's folder:** fixed in ff47178.
+   - `open_fs`, `open_sqlite` and `detect` refuse a Location whose `.tidings/` holds a Working copy
+     record, with a new `Error::LocationIsWorkingCopy`. The library knows the record only by its
+     file name, and says why in a comment. The check runs before anything is made.
+   - In the other direction, a folder that is already a Store's Location was refused as not empty.
+     But `sync <dir> --store <dir> --create` got through, making the Store and then the Working
+     copy in one `.tidings/`. `sync` now refuses it.
+   - Both directions are tested, and CONTEXT.md's Location entry and spec 0003 are updated.
+
+Also fixed, from ticket 01, in c6bf0fc: the intermittently failing test
+`removing_one_stores_location_resyncs_only_that_store`. The code was right and the test was wrong.
+Sometimes the watcher reads `kept.txt`'s events from the Commit only after the Location has been
+moved away, and then rightly reports `kept.txt` Removed before the Resync. The single-Store test
+already allows for this. The test now accepts exactly that Change first. It passed 12 runs under
+load and four full-suite runs.
+
+`cargo fmt` and clippy are clean, and the full `cargo test --workspace --all-features` passes. No
+re-review: item 9 is small and tested in both directions, and the rest are mechanical.
