@@ -96,7 +96,7 @@ pub async fn a_prefix_revision_from_one_store_is_refused_by_a_commit_to_another(
 }
 
 /// Removing one Store's Location, as the OS clears a cache, gives that Store a Resync and nothing
-/// to the other, which keeps its Files.
+/// to the other, which keeps its Files. Its Files can be reported removed before the Resync.
 pub async fn removing_one_stores_location_resyncs_only_that_store(
     first: &impl Located,
     second: &impl Located,
@@ -112,7 +112,17 @@ pub async fn removing_one_stores_location_resyncs_only_that_store(
     next_batch(&mut other_feed).await;
 
     remove_the_location(&first.location());
-    assert_eq!(next_item(&mut one_feed).await, FeedItem::Resync);
+    // The filesystem's watcher may look at the Commit's own events only once the Location is gone,
+    // before it has the Location's, and so rightly report the File removed before the Resync.
+    loop {
+        match next_item(&mut one_feed).await {
+            FeedItem::Resync => break,
+            FeedItem::Changes(batch) => assert_eq!(
+                changes_in_full(&batch),
+                [("kept.txt", ChangeKind::Removed, Origin::External)],
+            ),
+        }
+    }
     // Committed to again once made again. The filesystem's watcher can report the removal again,
     // late: see the README's Consistency section.
     let mut staging = Staging::new();
