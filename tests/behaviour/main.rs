@@ -185,11 +185,11 @@ mod fs {
 
     use tempfile::TempDir;
     use tidings::{
-        Area, ChangeKind, Error, FailurePoint, FeedItem, FsOptions, InvalidPathReason, Origin,
-        Pause, PrefixRevision, Revision, Staging,
+        Area, Change, ChangeKind, Error, FailurePoint, FeedItem, FsOptions, InvalidPathReason,
+        Origin, Pause, PrefixRevision, Revision, Staging,
     };
 
-    use crate::api::Store;
+    use crate::api::{ChangeFeed, Store};
     use crate::common::{
         app, assert_nothing_more, changes, changes_in_full, changes_until, next_batch, next_item,
     };
@@ -338,16 +338,20 @@ mod fs {
     /// or permissions changed, or its contents written again as they were. Some of those events
     /// look like writes, so they are told apart by comparing Revisions. Only a File that has
     /// changed since the Store opened has a known Revision, so a File there before gets only the
-    /// events that can't be writes: see the README's Consistency section. On macOS, FSEvents
-    /// reports changing a File's times or permissions as its creation, so a File there before
-    /// gets a Change for that, and nothing after, since its Revision is then known.
+    /// events that can't be writes: see the README's Consistency section. On macOS, FSEvents can
+    /// give an event for a File made a moment before as its creation again, or give its creation
+    /// late: so a File there before can get one Change, and nothing after, since its Revision is
+    /// then known. Whether it does depends on how busy the machine is.
     #[tokio::test]
     async fn events_that_leave_a_files_contents_as_they_were_are_dropped() {
         let fixture = Fs::new();
         fixture.write_directly(Area::Data, "before.txt", "there before");
         let Opened { store: _store, mut feed } = fixture.open().await;
+        // How many Changes before.txt got: see the doc.
+        let mut before = 0;
         fixture.write_directly(Area::Data, "during.txt", "a");
-        assert_eq!(changes(&next_batch(&mut feed).await), [("during.txt", ChangeKind::Changed)]);
+        let read = changes_leaving_out_before(&mut feed, "during.txt", &mut before).await;
+        assert_eq!(changes(&read), [("during.txt", ChangeKind::Changed)]);
 
         let set_readonly = |path: &str, readonly: bool| {
             let file = fixture.on_disk(Area::Data, path);
@@ -368,20 +372,43 @@ mod fs {
         };
         touch_without_writing("before.txt");
         touch_without_writing("during.txt");
-        #[cfg(target_os = "macos")]
-        {
-            assert_eq!(
-                changes(&next_batch(&mut feed).await),
-                [("before.txt", ChangeKind::Changed)]
-            );
-            touch_without_writing("before.txt");
-        }
         // The modification time alone, which is also how a write shows, and the contents as
         // they were.
         let file = std::fs::File::open(fixture.on_disk(Area::Data, "during.txt")).unwrap();
         file.set_modified(SystemTime::UNIX_EPOCH).unwrap();
         fixture.write_directly(Area::Data, "during.txt", "a");
-        assert_nothing_more(&mut feed).await;
+        fixture.write_directly(Area::Data, "marker.txt", "1");
+        let read = changes_leaving_out_before(&mut feed, "marker.txt", &mut before).await;
+        assert_eq!(changes(&read), [("marker.txt", ChangeKind::Changed)]);
+        // Again, once before.txt's Revision may be known.
+        touch_without_writing("before.txt");
+        fixture.write_directly(Area::Data, "marker.txt", "2");
+        let read = changes_leaving_out_before(&mut feed, "marker.txt", &mut before).await;
+        assert_eq!(changes(&read), [("marker.txt", ChangeKind::Changed)]);
+        assert!(before <= 1, "before.txt got {before} Changes");
+        if !cfg!(target_os = "macos") {
+            assert_eq!(before, 0);
+        }
+    }
+
+    /// Reads up to `marker` as [`changes_until`] does, leaving out a Change to before.txt, which
+    /// it adds to `before`, for
+    /// [`events_that_leave_a_files_contents_as_they_were_are_dropped`].
+    async fn changes_leaving_out_before(
+        feed: &mut ChangeFeed,
+        marker: &str,
+        before: &mut usize,
+    ) -> Vec<Change> {
+        let mut read = changes_until(feed, marker, None).await;
+        read.retain(|change| {
+            let is_before = change.path.as_str() == "before.txt";
+            if is_before {
+                assert_eq!(change.kind, ChangeKind::Changed);
+                *before += 1;
+            }
+            !is_before
+        });
+        read
     }
 
     /// Names on disk that no Path has give no Change: tidings' own `.tidings/`, names like its

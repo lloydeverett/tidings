@@ -319,8 +319,9 @@ Ways you could lose data or see confusing behaviour, and why.
     before it, and a commit can be split across batches if its files keep changing.
 - **Some changes are reported that didn't happen.** On the filesystem, after the store opens,
   the first rewrite (or `touch`) of a file with unchanged contents reports a change. On macOS,
-  so does the first change to its permissions. *Why:* avoiding it means reading every file when
-  the store opens, and they can be large.
+  so can the first change to its permissions, or nothing at all, if the file was made shortly
+  before the store opened: FSEvents can report a recent creation again, or late. *Why:* avoiding
+  it means reading every file when the store opens, and they can be large.
 
 ## Limitations
 
