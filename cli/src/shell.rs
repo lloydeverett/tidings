@@ -225,7 +225,7 @@ impl Shell {
 
     /// `tidings[fs]> `, or with a Staging open, `tidings[fs +2]> `.
     fn prompt(&self) -> String {
-        match self.session.staging() {
+        match self.session.staged_count() {
             Some(count) => format!("tidings[{} +{count}]> ", self.backend),
             None => format!("tidings[{}]> ", self.backend),
         }
@@ -233,7 +233,7 @@ impl Shell {
 
     /// Says so if an open Staging is being discarded as the shell ends.
     fn leave(&self) {
-        if let Some(count) = self.session.staging() {
+        if let Some(count) = self.session.staged_count() {
             eprintln!("discarded the open Staging ({count} staged)");
         }
     }

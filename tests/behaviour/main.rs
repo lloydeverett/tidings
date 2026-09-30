@@ -65,7 +65,7 @@ mod sqlite {
 
     use crate::api::Store;
     use crate::common::{assert_nothing_more, changes_in_full, next_batch, next_item};
-    use crate::separate_stores::Located;
+    use crate::separate_stores::{Located, remove_the_location};
     use crate::suite::{Fixture, Opened};
 
     /// Opens each test's Store at a Location in a temporary directory of its own, removed when
@@ -213,10 +213,7 @@ mod sqlite {
         store.commit(staging).await.unwrap();
         next_batch(&mut feed).await;
 
-        // Moved away first, so that the Store never sees it half removed.
-        let moved = fixture.directory.path().join("removed");
-        std::fs::rename(fixture.location(), &moved).unwrap();
-        std::fs::remove_dir_all(&moved).unwrap();
+        remove_the_location(&fixture.location());
         assert_eq!(next_item(&mut feed).await, FeedItem::Resync);
         assert!(fixture.location().join(".tidings/store.sqlite3").is_file());
         let detected = tidings::Store::detect(fixture.location()).await.unwrap();
@@ -249,9 +246,7 @@ mod sqlite {
         let revision = store.commit(staging).await.unwrap().revisions().values().next().copied();
         next_batch(&mut feed).await;
 
-        let moved = fixture.directory.path().join("removed");
-        std::fs::rename(fixture.location(), &moved).unwrap();
-        std::fs::remove_dir_all(&moved).unwrap();
+        remove_the_location(&fixture.location());
         let mut staging = Staging::new();
         let unchanged = Precondition::UnchangedSince(revision.unwrap());
         staging.write_requiring("a.txt", "b", unchanged).unwrap();
@@ -261,6 +256,32 @@ mod sqlite {
         staging.write("b.txt", "b").unwrap();
         store.commit(staging).await.unwrap();
         // The Resync takes the place of the Commit's Change.
+        assert_eq!(next_item(&mut feed).await, FeedItem::Resync);
+        assert_nothing_more(&mut feed).await;
+    }
+
+    /// A Snapshot, and a read, notice a removed Location before polling does too: the Snapshot is
+    /// of the database made again, and the read reads it, rather than the removed one.
+    #[tokio::test]
+    async fn a_snapshot_and_a_read_after_the_location_is_removed_see_the_database_made_again() {
+        let fixture = Sqlite::new();
+        // It never polls, so only its Snapshots, reads and Commits look.
+        let Opened { store, mut feed } =
+            fixture.open_with(|options| options.poll_interval(Duration::from_secs(3600))).await;
+        let mut staging = Staging::new();
+        staging.write("a.txt", "a").unwrap();
+        store.commit(staging).await.unwrap();
+        next_batch(&mut feed).await;
+
+        remove_the_location(&fixture.location());
+        let snapshot = store.snapshot().await.unwrap();
+        assert_eq!(snapshot.read("a.txt").await.unwrap(), None);
+        assert!(fixture.location().join(".tidings/store.sqlite3").is_file());
+        assert_eq!(store.read("a.txt").await.unwrap(), None);
+
+        let mut staging = Staging::new();
+        staging.write("b.txt", "b").unwrap();
+        store.commit(staging).await.unwrap();
         assert_eq!(next_item(&mut feed).await, FeedItem::Resync);
         assert_nothing_more(&mut feed).await;
     }

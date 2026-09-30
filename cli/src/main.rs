@@ -44,10 +44,10 @@ enum Command {
     /// Make a folder a Working copy of the Store, and keep it in step with the Store until Ctrl-C
     ///
     /// The folder must be empty or missing, or a Working copy, which is resumed: the Store flags
-    /// are needed only to make a new one. Files the Store adds, changes or removes
-    /// appear in it, but a file changed locally is left alone: if the Store changes it too, it is
-    /// Diverged, and the Store's version is put in `.tidings/theirs/` to merge against. Nothing in
-    /// the folder reaches the Store until `commit`.
+    /// are needed only to make a new one. Files the Store adds, changes or removes appear in it,
+    /// but a file changed locally is left alone: if the Store changes it too, it is Diverged, and
+    /// the Store's version is put in `.tidings/theirs/` to merge against. Nothing in the folder
+    /// reaches the Store until `commit`.
     Sync {
         /// The folder. The current directory if left out.
         folder: Option<PathBuf>,

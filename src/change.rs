@@ -43,9 +43,9 @@ pub enum Origin {
 /// One item on the Change feed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedItem {
-    /// Every Change recorded since the last item, merged per Path. The Changes of a
-    /// Commit through this Store always arrive in the same batch, and so do another Store's on
-    /// SQLite, and usually on the filesystem. A batch may hold several Commits' Changes.
+    /// Every Change recorded since the last item, merged per Path. The Changes of a Commit through
+    /// this Store always arrive in the same batch, and so do another Store's on SQLite, and usually
+    /// on the filesystem. A batch may hold several Commits' Changes.
     Changes(Vec<Change>),
     /// Changes to the Store may have been missed: read everything you rely on in it again.
     Resync,
@@ -56,9 +56,9 @@ pub enum FeedItem {
 /// There is exactly one, and no way to get another later, so every Change after the Store is
 /// opened is reported. If it is dropped, the Store keeps working and stops recording Changes.
 ///
-/// Changes wait here until they are read, merged per Path: a Path changed many times
-/// before [`next`](Self::next) is called gives one Change, so falling behind never loses a Path
-/// and the memory held grows only with the number of Paths changed.
+/// Changes wait here until they are read, merged per Path: a Path changed many times before
+/// [`next`](Self::next) is called gives one Change, so falling behind never loses a Path and the
+/// memory held grows only with the number of Paths changed.
 #[derive(Debug)]
 pub struct ChangeFeed {
     shared: Arc<Shared>,
@@ -66,9 +66,9 @@ pub struct ChangeFeed {
 
 impl ChangeFeed {
     /// Waits for the next item: every Change recorded since the last one, merged per Path, in one
-    /// batch. The Changes of a Commit through this Store are never split across
-    /// batches, and neither are another Store's on SQLite (on the filesystem, see
-    /// `Store::open_fs`, with the `fs` feature). A batch may hold several Commits' Changes.
+    /// batch. The Changes of a Commit through this Store are never split across batches, and
+    /// neither are another Store's on SQLite (on the filesystem, see `Store::open_fs`, with the
+    /// `fs` feature). A batch may hold several Commits' Changes.
     ///
     /// Gives `None` once every handle to the Store has been dropped and everything recorded
     /// before has been read.
@@ -106,7 +106,7 @@ struct Shared {
 /// many Changes were recorded.
 #[derive(Debug, Default)]
 struct Unread {
-    /// What is unread.
+    /// The unread Changes, merged per Path, or a Resync that took their place.
     pending: Pending,
     /// Every Store handle has been dropped: once what is unread has been read, the Change feed
     /// ends.
@@ -115,7 +115,8 @@ struct Unread {
     feed_dropped: bool,
 }
 
-/// What is unread.
+/// What the Change feed will give next: either the unread Changes, merged per Path (none, while
+/// nothing is unread), or a Resync, once Changes may have been missed.
 #[derive(Debug)]
 enum Pending {
     /// The merged Changes to each Path.

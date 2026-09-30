@@ -280,7 +280,7 @@ impl Store {
     /// Unlike [`list`](Self::list), it needs the Revision of every File under `prefix`. On the
     /// filesystem that means reading them all. The Prefix Revision keeps each Path and its
     /// Revision, so that a Conflict can name the Files that changed: holding one costs memory in
-    /// proportion to the number of Files under `prefix`, which can be large for a cache.
+    /// proportion to the number of Files under `prefix`, which can be large.
     pub async fn stat_prefix(&self, prefix: impl IntoPrefix) -> Result<PrefixRevision> {
         let prefix = prefix.into_prefix()?;
         let files = self.inner.backend.revisions_under(&prefix).await?;

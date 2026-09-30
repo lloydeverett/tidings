@@ -134,7 +134,8 @@ read a.txt
 #[test]
 fn changes_are_printed_on_stderr_once_the_feed_is_on() {
     let run = in_memory(
-        "write a.txt --contents a\nfeed on\nwrite b.txt --contents b\ndelete b.txt\nfeed off\nwrite c.txt --contents c\n",
+        "write a.txt --contents a\nfeed on\nwrite b.txt --contents b\ndelete b.txt\n\
+         feed off\nwrite c.txt --contents c\n",
     );
     let run = run.expect_success();
     assert_eq!(run.stderr, "local changed b.txt\nlocal removed b.txt\n");

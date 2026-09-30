@@ -1,9 +1,9 @@
 //! The memory Backend: a Store's Files live in process memory, shared by every clone of the Store.
 //!
 //! The Files are behind an `Arc`, and each File behind one too, so a Snapshot is a clone of that
-//! `Arc`: taking one copies nothing. A Commit that changes the Files copies the map
-//! first only if a Snapshot still shares it (`Arc::make_mut`), and even then copies each Path and
-//! a pointer to each File, never a File's contents. A Commit that changes nothing copies nothing.
+//! `Arc`: taking one copies nothing. A Commit that changes the Files copies the map first only if a
+//! Snapshot still shares it (`Arc::make_mut`), and even then copies each Path and a pointer to each
+//! File, never a File's contents. A Commit that changes nothing copies nothing.
 //! Once copied, the map is the Backend's alone again, so later Commits copy nothing until the next
 //! Snapshot. A Snapshot never takes the Backend's lock, so holding or reading one never holds up a
 //! Commit.

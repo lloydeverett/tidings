@@ -13,8 +13,7 @@ use crate::{
 /// with [`Store::commit`](crate::Store::commit).
 ///
 /// A Staging is an ordinary value, built without the Store: it belongs to whichever Store it is
-/// committed to. Dropping it without committing
-/// writes nothing.
+/// committed to. Dropping it without committing writes nothing.
 ///
 /// A Commit can be made to depend on what was read, with a [`Precondition`] on a File it writes,
 /// deletes or only [`require`](Self::require)s, and with a [`PrefixRevision`] on everything under

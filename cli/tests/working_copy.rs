@@ -811,7 +811,7 @@ fn a_resync_reconciles_every_path() {
 }
 
 #[test]
-fn clearing_the_cache_removes_the_unchanged_local_files() {
+fn deleting_every_file_in_the_store_removes_the_unchanged_local_files() {
     for backend in BACKENDS {
         let location = Location::with_store(backend);
         location.write("thumbnails/a.png", "a");

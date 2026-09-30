@@ -42,7 +42,7 @@ fn prefix_refusal(prefix: &str) -> Option<InvalidPathReason> {
     }
     match prefix.strip_suffix('/') {
         None => Some(InvalidPathReason::NoTrailingSlash),
-        // Just `/`: the root, not a part of the Store.
+        // Just `/`, which names no File or Prefix in the Store.
         Some("") => Some(InvalidPathReason::NotRelative),
         Some(path) => refusal(path),
     }

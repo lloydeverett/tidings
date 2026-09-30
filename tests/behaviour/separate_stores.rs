@@ -3,7 +3,7 @@
 //! filesystem and SQLite together. Each test takes a Fixture for each Store, and is listed in
 //! [`separate_stores_suite!`].
 
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 
 use tidings::{ChangeKind, Error, FeedItem, Origin, Staging};
 
@@ -13,6 +13,14 @@ use crate::suite::{Fixture, Opened};
 /// A Fixture whose Stores are at a Location on disk, which a test can remove.
 pub trait Located: Fixture {
     fn location(&self) -> PathBuf;
+}
+
+/// Removes the Location, as the OS does when it clears a cache. It is moved away first, so that
+/// the Store never sees it half removed.
+pub fn remove_the_location(location: &FsPath) {
+    let moved = location.with_extension("removed");
+    std::fs::rename(location, &moved).unwrap();
+    std::fs::remove_dir_all(&moved).unwrap();
 }
 
 /// Instantiates every test here for two Fixtures, each opening its Stores at a Location of its
@@ -103,10 +111,7 @@ pub async fn removing_one_stores_location_resyncs_only_that_store(
     next_batch(&mut one_feed).await;
     next_batch(&mut other_feed).await;
 
-    // Moved away first, so that the Store never sees it half removed.
-    let moved = first.location().with_extension("removed");
-    std::fs::rename(first.location(), &moved).unwrap();
-    std::fs::remove_dir_all(&moved).unwrap();
+    remove_the_location(&first.location());
     assert_eq!(next_item(&mut one_feed).await, FeedItem::Resync);
     // Committed to again once made again. The filesystem's watcher can report the removal again,
     // late: see the README's Consistency section.

@@ -32,10 +32,12 @@
 //!   keeping track of which Stores are open.
 //!
 //! **A Location removed.** The database is open, so a Store would go on reading and committing to
-//! it after someone removed the Location, and no other Store would see that. So each poll, and
-//! each Commit, first checks that the database at its place in the Location is the one the Store
-//! has open. If it isn't, the Store makes the Location, marks it and makes the database again, as
-//! opening does, and sends a Resync: what the old database held is gone.
+//! it after someone removed the Location, and no other Store would see that. So each poll, each
+//! read and Commit through the Store, and each Snapshot taken, first checks that the database at
+//! its place in the Location is the one the Store has open: one `stat` of the database. If it
+//! isn't, the Store makes the Location, marks it and makes the database again, as opening does,
+//! and sends a Resync: what the old database held is gone. A Snapshot taken before then goes on
+//! reading the old database.
 //!
 //! The Store reads and commits through one connection. A Snapshot is a read transaction on a
 //! connection of its own, which in WAL mode neither waits for Commits nor holds them up. Every
@@ -256,25 +258,29 @@ impl SqliteBackend {
     }
 
     pub(crate) async fn read(&self, path: &Path) -> Result<Option<File>> {
-        self.store.connection.read(path).await
+        let path = path.clone();
+        self.store.call(move |connection| read(connection, &path)).await
     }
 
     pub(crate) async fn stat(&self, path: &Path) -> Result<Option<Stat>> {
-        self.store.connection.stat(path).await
+        let path = path.clone();
+        self.store.call(move |connection| stat(connection, &path)).await
     }
 
     pub(crate) async fn list(&self, prefix: &Prefix) -> Result<Vec<Path>> {
-        self.store.connection.list(prefix).await
+        let prefix = prefix.clone();
+        self.store.call(move |connection| InDatabase(connection).paths_under(&prefix)).await
     }
 
     pub(crate) async fn revisions_under(&self, prefix: &Prefix) -> Result<Vec<(Path, Revision)>> {
         let prefix = prefix.clone();
-        let connection = &self.store.connection;
-        connection.call(move |connection| InDatabase(connection).revisions_under(&prefix)).await
+        self.store.call(move |connection| InDatabase(connection).revisions_under(&prefix)).await
     }
 
-    /// Begins a read transaction on a new connection to the database.
+    /// Begins a read transaction on a new connection to the database, once the Store has made the
+    /// database again if the Location was removed, so that the Snapshot is of the database there.
     pub(crate) async fn snapshot(&self) -> Result<SqliteSnapshot> {
+        self.store.call(|_| Ok(())).await?;
         let path = database_path(&self.store.location);
         off_runtime(move || {
             let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
@@ -362,6 +368,21 @@ fn open_again_if_removed(
 }
 
 impl StoreConnection {
+    /// Runs `call` with the Store's connection, on a blocking thread, once it has opened the
+    /// database again if the Location was removed ([`open_again_if_removed`]).
+    async fn call<T: Send + 'static>(
+        &self,
+        call: impl FnOnce(&Connection) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let (log, location) = (Arc::clone(&self.log), Arc::clone(&self.location));
+        self.connection
+            .call(move |connection| {
+                open_again_if_removed(connection, &mut LogReader::lock(&log), &location)?;
+                call(connection)
+            })
+            .await
+    }
+
     /// In one transaction begun with `behavior`, reads the change log since this Store last did,
     /// then does `and`, which is given the transaction and this Store's number in the log, and
     /// commits the transaction. `and` gives what it made, and the place in the log of the Commit

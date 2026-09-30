@@ -142,7 +142,7 @@ impl Session {
     }
 
     /// How many things the open Staging holds, if one is open.
-    pub fn staging(&self) -> Option<usize> {
+    pub fn staged_count(&self) -> Option<usize> {
         self.staging.as_ref().map(|open| open.count)
     }
 
@@ -220,7 +220,7 @@ impl Session {
     /// `stat-prefix` of it, in the open Staging.
     pub fn require_prefix(&mut self, prefix: String) -> Result<Report, Failure> {
         let prefix = Prefix::new(prefix)?;
-        self.open()?;
+        self.require_open()?;
         let Some(revision) = self.prefix_revisions.get(&prefix) else {
             return Err(Failure::error(format!(
                 "no Prefix Revision of {:?} to require: run `stat-prefix {}` first",
@@ -235,7 +235,7 @@ impl Session {
     /// `commit`: commits the open Staging, which is closed whether or not the Commit succeeds.
     /// If it fails, the text of each `edit` staged is kept.
     pub async fn commit(&mut self) -> Result<Report, Failure> {
-        self.open()?;
+        self.require_open()?;
         let open = self.staging.take().expect("checked above");
         match self.store.commit(open.staging).await {
             Ok(committed) => Ok(Report::Committed(committed)),
@@ -248,16 +248,22 @@ impl Session {
 
     /// `discard`: closes the open Staging without committing it.
     pub fn discard(&mut self) -> Result<Report, Failure> {
-        self.open()?;
+        self.require_open()?;
         self.staging = None;
         Ok(Report::Nothing)
     }
 
     /// The open Staging, or an error if there is none.
     fn open(&mut self) -> Result<&mut OpenStaging, Failure> {
-        self.staging
-            .as_mut()
-            .ok_or_else(|| Failure::error("no Staging is open: open one with `stage`"))
+        self.staging.as_mut().ok_or_else(no_staging_open)
+    }
+
+    /// An error if no Staging is open.
+    fn require_open(&self) -> Result<(), Failure> {
+        match self.staging {
+            Some(_) => Ok(()),
+            None => Err(no_staging_open()),
+        }
     }
 
     /// The contents `write` is to write.
@@ -309,4 +315,9 @@ fn unescape(text: &str) -> String {
         }
     }
     unescaped
+}
+
+/// The error for a command that needs an open Staging when none is open.
+fn no_staging_open() -> Failure {
+    Failure::error("no Staging is open: open one with `stage`")
 }

@@ -503,8 +503,8 @@ impl WorkingCopy {
 
     /// Keeps the folder in step with the Store until `stop` finishes, as [`WorkingCopy::sync`]
     /// says. It reconciles every Path first, then the Paths of each batch of Changes on `feed`,
-    /// and every Path again on a Resync. `feed` must have been taken when
-    /// `store` was opened, so that nothing committed since is missed.
+    /// and every Path again on a Resync. `feed` must have been taken when `store` was opened, so
+    /// that nothing committed since is missed.
     async fn follow(
         &self,
         store: &Store,
@@ -528,9 +528,9 @@ impl WorkingCopy {
     }
 
     /// Waits on `feed` for the Paths to reconcile next: those of a batch of Changes, or every Path
-    /// on a Resync, which is reported. Before waiting on an empty feed, reports
-    /// that `sync` is caught up, so anything already waiting is reconciled first. Gives `None`
-    /// once `stop` finishes.
+    /// on a Resync, which is reported. Before waiting on an empty feed, reports that `sync` is
+    /// caught up, so anything already waiting is reconciled first. Gives `None` once `stop`
+    /// finishes.
     async fn wait_for_paths(
         &self,
         feed: &mut ChangeFeed,

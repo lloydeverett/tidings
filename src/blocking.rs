@@ -5,8 +5,8 @@
 //! waits for each to finish. It runs the async Store on an internal tokio runtime of its own, as
 //! `reqwest::blocking` does. That runtime keeps running between calls, so what the Store follows
 //! in the background (other Stores' Commits on SQLite, edits in the Location on the filesystem)
-//! keeps reaching the Change feed while the app isn't calling it. The runtime stops
-//! once the Store, every Snapshot taken from it and its Change feed have all been dropped.
+//! keeps reaching the Change feed while the app isn't calling it. The runtime stops once the Store,
+//! every Snapshot taken from it and its Change feed have all been dropped.
 //!
 //! Every method that waits panics if it is called where blocking would stall a tokio runtime or
 //! deadlock it: in an async task, or in a runtime's own `block_on`. Use the async
@@ -276,8 +276,8 @@ impl Iterator for ChangeFeed {
     type Item = FeedItem;
 
     /// Waits for the next item: every Change recorded since the last one, merged per Path, in one
-    /// batch, as [`crate::ChangeFeed::next`] gives it. Gives `None` once every
-    /// handle to the Store has been dropped and everything recorded before has been read.
+    /// batch, as [`crate::ChangeFeed::next`] gives it. Gives `None` once every handle to the Store
+    /// has been dropped and everything recorded before has been read.
     ///
     /// # Panics
     ///
