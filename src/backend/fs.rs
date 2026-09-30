@@ -572,8 +572,8 @@ impl Location {
     }
 
     /// Follows `segments` down from the Location while each is a directory there under exactly its
-    /// own name, not a symlink, and not holding a `.tidings/`. The one walk from the Location that reads, writes and finishing
-    /// share.
+    /// own name, not a symlink, and not holding a `.tidings/`. The one walk from the Location that
+    /// reads, writes and finishing share.
     fn own_directories(&self, segments: &[&str]) -> Result<OwnDirectories> {
         let mut directory = self.directory.clone();
         for (count, segment) in segments.iter().enumerate() {

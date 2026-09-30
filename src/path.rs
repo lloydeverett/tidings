@@ -11,8 +11,9 @@ use crate::{Error, Result};
 ///
 /// A Path follows the strictest platform's rules, on every Backend, so a Path that works on one
 /// platform works on all of them. It is relative and `/`-separated, with no empty, `.` or `..`
-/// segments. Each segment is a name Windows accepts, the whole Path is in Unicode NFC form, and
-/// no name is `.tidings` or named like tidings' temporary files, which tidings keeps for itself. [`InvalidPathReason`] lists the rules.
+/// segments. Each segment is a name Windows accepts, the whole Path is in Unicode NFC form, and no
+/// name is `.tidings` or like tidings' temporary files' names, which tidings keeps for itself.
+/// [`InvalidPathReason`] lists the rules.
 ///
 /// It can only be made by validating a string, with [`Path::new`] or through [`IntoPath`].
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -263,8 +264,8 @@ impl fmt::Display for InvalidPathReason {
                 "it is, or is under, a symlink to a directory, which is left out of the Store"
             }
             InvalidPathReason::Nested => {
-                "it is, or is under, a directory holding `.tidings/`, another Store's Location or a \
-                 Working copy, which is left out of the Store"
+                "it is, or is under, a directory holding `.tidings/`, another Store's Location or \
+                 a Working copy, which is left out of the Store"
             }
         })
     }
