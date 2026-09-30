@@ -456,7 +456,7 @@ impl WorkingCopy {
     }
 
     /// Whether `folder` is a Working copy: whether it has a record, of this version or another.
-    fn exists(folder: &FsPath) -> bool {
+    pub fn exists(folder: &FsPath) -> bool {
         record::is_record(&record_file(folder))
     }
 

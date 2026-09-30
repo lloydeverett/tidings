@@ -25,11 +25,12 @@ Area anyway. So splitting them loses no guarantee. What changes:
   so a Location means the same on every Backend and ADR 0007's Backend marker works unchanged, one
   per Location. `detect(dir)` reads that one marker, and `MixedBackends` is gone.
 - A Store's Location can't be inside another Store's, or a Working copy: opening refuses one
-  whose ancestor holds a `.tidings/` directory, with `NestedLocation`. Nor can it be a Working
-  copy's folder: opening and `detect` refuse a Location whose `.tidings/` holds a Working copy
-  record, with `LocationIsWorkingCopy`, and `sync` refuses to make a Working copy at its Store's
-  Location. Otherwise the Store's marker and files would mix with the Working copy's. Both checks
-  run before anything is made.
+  whose ancestor holds a `.tidings/` directory, with `NestedLocation`, before anything is made.
+  The library knows only that rule, not what made the `.tidings/`, since Working copies belong to
+  the CLI. Nor can a Location be a Working copy's folder, or the Store's files would mix with the
+  Working copy's: the CLI refuses `--store` naming one, and `sync` refuses to make a Working copy
+  at its Store's Location, each before anything is made. A program using the library directly
+  could open a Store at a Working copy's folder, but has no reason to know Working copies exist.
 - A directory in a Location that holds `.tidings/` belongs to another Store, or to a Working copy,
   and is outside this one, like a symlinked directory: not listed or watched, and a write under it
   is an invalid Path. So `.tidings` is reserved at any depth of a Path, not only as its first name.

@@ -58,9 +58,8 @@
 //! }
 //! ```
 //!
-//! A Store can't be opened inside another Store's Location or a Working copy, nor at a Working
-//! copy's folder: see [`Error::NestedLocation`] and [`Error::LocationIsWorkingCopy`]. The same
-//! Location can be opened twice, on the same Backend: each Store sees the other's Commits as
+//! A Store can't be opened inside another Store's Location: see [`Error::NestedLocation`]. The
+//! same Location can be opened twice, on the same Backend: each Store sees the other's Commits as
 //! external. Any Location may vanish, as a cache's does when the OS clears it: the Store makes it
 //! again and sends a [`FeedItem::Resync`].
 

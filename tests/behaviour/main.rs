@@ -285,17 +285,17 @@ mod sqlite {
         assert_eq!(next_item(&mut feed).await, FeedItem::Resync);
         assert_nothing_more(&mut feed).await;
     }
-    /// A SQLite Location can't be inside another Store's Location, or inside a Working copy,
-    /// whose folder holds a `.tidings/` too. Opening one there is refused, naming the directory it
-    /// is inside, before anything is made. The Location itself holding `.tidings/` is usual.
+    /// A SQLite Location can't be inside another Store's Location, or inside any directory holding
+    /// a `.tidings/`. Opening one there is refused, naming the directory it is inside, before
+    /// anything is made. The Location itself holding `.tidings/` is usual.
     #[tokio::test]
-    async fn opening_inside_another_location_or_a_working_copy_is_refused() {
+    async fn opening_inside_another_location_or_a_tidings_directory_is_refused() {
         let fixture = Sqlite::new();
         let Opened { store: _store, feed: _feed } = fixture.open().await;
-        let working_copy = fixture.directory.path().join("working copy");
-        std::fs::create_dir_all(working_copy.join(".tidings")).unwrap();
+        let bare = fixture.directory.path().join("bare");
+        std::fs::create_dir_all(bare.join(".tidings")).unwrap();
 
-        for outer in [fixture.location(), working_copy] {
+        for outer in [fixture.location(), bare] {
             let inner = outer.join("deeper/inner");
             match tidings::Store::open_sqlite(&inner, SqliteOptions::default()).await {
                 Err(Error::NestedLocation { outer: named }) => {
@@ -406,17 +406,17 @@ mod fs {
         two_stores_suite!(seeing_each_other: BlockingFs(Fs::new()));
     }
 
-    /// A Location can't be inside another Store's Location, or inside a Working copy, whose folder
-    /// holds a `.tidings/` too. Opening one there is refused, naming the directory it is inside,
-    /// before anything is made. The Location itself holding `.tidings/` is usual.
+    /// A Location can't be inside another Store's Location, or inside any directory holding a
+    /// `.tidings/`. Opening one there is refused, naming the directory it is inside, before
+    /// anything is made. The Location itself holding `.tidings/` is usual.
     #[tokio::test]
-    async fn opening_inside_another_location_or_a_working_copy_is_refused() {
+    async fn opening_inside_another_location_or_a_tidings_directory_is_refused() {
         let fixture = Fs::new();
         let Opened { store: _store, feed: _feed } = fixture.open().await;
-        let working_copy = fixture.directory.path().join("working copy");
-        std::fs::create_dir_all(working_copy.join(".tidings")).unwrap();
+        let bare = fixture.directory.path().join("bare");
+        std::fs::create_dir_all(bare.join(".tidings")).unwrap();
 
-        for outer in [fixture.on_disk(""), working_copy] {
+        for outer in [fixture.on_disk(""), bare] {
             let inner = outer.join("deeper/inner");
             match tidings::Store::open_fs(&inner, fixture.usual_options()).await {
                 Err(Error::NestedLocation { outer: named }) => {
@@ -657,8 +657,8 @@ mod fs {
         assert_nothing_more(&mut feed).await;
     }
 
-    /// A `.tidings/` made in a directory of the Location while the Store is open, as by making a
-    /// Working copy there, takes that directory out of the Store: each File that was under it is
+    /// A `.tidings/` made in a directory of the Location while the Store is open, as by opening a
+    /// Store there, takes that directory out of the Store: each File that was under it is
     /// reported removed, and what happens under it from then on isn't reported. Another Store's
     /// Location moved in is never in the Store.
     #[tokio::test]
@@ -696,8 +696,8 @@ mod fs {
         assert_eq!(list(&store).await, ["kept.toml", "marker.txt"]);
     }
 
-    /// A directory whose `.tidings/` is removed while the Store is open, as when a Working copy
-    /// there is given up, comes back into the Store: each File under it is reported changed, as if
+    /// A directory whose `.tidings/` is removed while the Store is open, as when a Store there is
+    /// given up, comes back into the Store: each File under it is reported changed, as if
     /// it had just been made, and what happens under it from then on is reported.
     #[tokio::test]
     async fn a_directory_that_stops_holding_another_store_comes_back_with_changes() {
@@ -1336,8 +1336,8 @@ mod fs {
     }
 
     /// A directory that comes to hold a `.tidings/` after a Commit was interrupted, as another
-    /// Store's Location or a Working copy made there, is outside the Store by the time the Commit
-    /// is finished, so finishing neither deletes nor writes under it.
+    /// Store's Location made there does, is outside the Store by the time the Commit is finished,
+    /// so finishing neither deletes nor writes under it.
     #[tokio::test]
     async fn finishing_a_commit_again_leaves_what_is_under_another_store_made_since() {
         let fixture = Fs::new();
@@ -1458,11 +1458,11 @@ mod fs {
         assert!(link.is_symlink());
     }
 
-    /// A directory in the Location that holds a `.tidings/`, as another Store's Location or a
-    /// Working copy does, is outside the Store, as a symlink to a directory is: what is under it
-    /// isn't listed, read, in a Prefix Revision, or reported on the Change feed.
+    /// A directory in the Location that holds a `.tidings/`, whether another Store's Location or
+    /// only a bare `.tidings/`, is outside the Store, as a symlink to a directory is: what is under
+    /// it isn't listed, read, in a Prefix Revision, or reported on the Change feed.
     #[tokio::test]
-    async fn a_directory_holding_another_store_or_a_working_copy_is_left_out() {
+    async fn a_directory_holding_another_store_or_a_tidings_directory_is_left_out() {
         let fixture = Fs::new();
         let (inner, _inner_feed) =
             tidings::Store::open_fs(fixture.on_disk("inner"), fixture.usual_options())
@@ -1471,16 +1471,16 @@ mod fs {
         let mut staging = Staging::new();
         staging.write("a.txt", "a").unwrap();
         inner.commit(staging).await.unwrap();
-        std::fs::create_dir_all(fixture.on_disk("themes/copy/.tidings")).unwrap();
-        fixture.write_directly("themes/copy/b.txt", "b");
+        std::fs::create_dir_all(fixture.on_disk("themes/bare/.tidings")).unwrap();
+        fixture.write_directly("themes/bare/b.txt", "b");
         fixture.write_directly("themes/dark.toml", "dark");
         let Opened { store, mut feed } = fixture.open().await;
 
         assert_eq!(list(&store).await, ["themes/dark.toml"]);
         assert_eq!(store.list("inner/").await.unwrap(), Vec::<tidings::Path>::new());
-        assert_eq!(store.list("themes/copy/").await.unwrap(), Vec::<tidings::Path>::new());
+        assert_eq!(store.list("themes/bare/").await.unwrap(), Vec::<tidings::Path>::new());
         assert_eq!(store.read("inner/a.txt").await.unwrap(), None);
-        assert_eq!(store.stat("themes/copy/b.txt").await.unwrap(), None);
+        assert_eq!(store.stat("themes/bare/b.txt").await.unwrap(), None);
 
         let prefix_revisions = async || {
             let all = store.stat_prefix("").await.unwrap().to_string();
@@ -1490,7 +1490,7 @@ mod fs {
         let mut staging = Staging::new();
         staging.write("c.txt", "c").unwrap();
         inner.commit(staging).await.unwrap();
-        fixture.write_directly("themes/copy/b.txt", "edited");
+        fixture.write_directly("themes/bare/b.txt", "edited");
         assert_eq!(prefix_revisions().await, before);
 
         // Once the watcher has looked at a later write, it has looked at those too.
@@ -1502,8 +1502,8 @@ mod fs {
         assert_nothing_more(&mut feed).await;
     }
 
-    /// A Commit that writes or deletes under a directory holding another Store or a Working copy,
-    /// or writes or deletes that directory itself, is refused as an invalid Path before anything
+    /// A Commit that writes or deletes under a directory holding a `.tidings/`, as another Store's
+    /// Location does, or writes or deletes that directory itself, is refused as an invalid Path before anything
     /// is written. A Prefix delete above one leaves it alone.
     #[tokio::test]
     async fn a_commit_under_a_directory_holding_another_store_is_refused() {
@@ -1515,8 +1515,8 @@ mod fs {
         let mut staging = Staging::new();
         staging.write("a.txt", "a").unwrap();
         inner.commit(staging).await.unwrap();
-        std::fs::create_dir_all(fixture.on_disk("copy/.tidings")).unwrap();
-        fixture.write_directly("copy/b.txt", "b");
+        std::fs::create_dir_all(fixture.on_disk("bare/.tidings")).unwrap();
+        fixture.write_directly("bare/b.txt", "b");
         let Opened { store, feed: _feed } = fixture.open().await;
 
         type Stage = fn(&mut Staging);
@@ -1530,20 +1530,20 @@ mod fs {
             ("inner", |staging| {
                 staging.write("inner", "new").unwrap();
             }),
-            ("copy/deeper/c.txt", |staging| {
-                staging.write("copy/deeper/c.txt", "c").unwrap();
+            ("bare/deeper/c.txt", |staging| {
+                staging.write("bare/deeper/c.txt", "c").unwrap();
             }),
             ("inner/a.txt", |staging| {
                 staging.delete("inner/a.txt").unwrap();
             }),
-            ("copy/b.txt", |staging| {
-                staging.delete("copy/b.txt").unwrap();
+            ("bare/b.txt", |staging| {
+                staging.delete("bare/b.txt").unwrap();
             }),
             ("inner/", |staging| {
                 staging.delete_prefix("inner/").unwrap();
             }),
-            ("copy/", |staging| {
-                staging.delete_prefix("copy/").unwrap();
+            ("bare/", |staging| {
+                staging.delete_prefix("bare/").unwrap();
             }),
         ];
         for (refused_path, stage) in refused {
@@ -1560,15 +1560,15 @@ mod fs {
         assert_eq!(list(&store).await, Vec::<String>::new());
         assert_eq!(inner.list("").await.unwrap(), [tidings::Path::new("a.txt").unwrap()]);
         assert_eq!(inner.read("a.txt").await.unwrap().unwrap().contents(), "a");
-        assert_eq!(std::fs::read_to_string(fixture.on_disk("copy/b.txt")).unwrap(), "b");
-        assert!(!fixture.on_disk("copy/deeper").exists());
+        assert_eq!(std::fs::read_to_string(fixture.on_disk("bare/b.txt")).unwrap(), "b");
+        assert!(!fixture.on_disk("bare/deeper").exists());
         assert_eq!(temporary_files(fixture.directory.path()), Vec::<PathBuf>::new());
 
         let mut staging = Staging::new();
         staging.delete_prefix("").unwrap();
         store.commit(staging).await.unwrap();
         assert_eq!(inner.list("").await.unwrap(), [tidings::Path::new("a.txt").unwrap()]);
-        assert_eq!(std::fs::read_to_string(fixture.on_disk("copy/b.txt")).unwrap(), "b");
+        assert_eq!(std::fs::read_to_string(fixture.on_disk("bare/b.txt")).unwrap(), "b");
     }
 
     /// The Location can itself be a symlink to a directory, as when a person keeps an app's config

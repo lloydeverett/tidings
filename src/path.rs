@@ -44,8 +44,7 @@ impl Path {
 }
 
 /// The name tidings keeps its own bookkeeping under: the directory in a Location that holds
-/// everything a Backend keeps there, and in a Working copy, what the `tidings` command keeps
-/// there. No Path has it as a name, at any depth. It is its own [`letter_case_fold`].
+/// everything a Backend keeps there. No Path has it as a name, at any depth. It is its own [`letter_case_fold`].
 pub(crate) const RESERVED: &str = ".tidings";
 
 /// Why `path` is refused, if it is.
@@ -114,8 +113,7 @@ fn is_device_name_sanitize_filename_misses(name: &str) -> bool {
 }
 
 /// Whether `name`, as any segment of a Path, is tidings' own: at the top, a Store's own
-/// `.tidings/`, and deeper down, that of another Store or a Working copy, whose directory is left
-/// out of the Store. Letter case is ignored, because on a case-insensitive filesystem `.Tidings` is
+/// `.tidings/`, and deeper down, that of another Store, whose directory is left out of the Store. Letter case is ignored, because on a case-insensitive filesystem `.Tidings` is
 /// the same directory, and so are `.tidingſ` and `.tıdings` on some.
 pub(crate) fn is_reserved(name: &str) -> bool {
     letter_case_fold(name) == RESERVED
@@ -230,9 +228,9 @@ pub enum InvalidPathReason {
     /// written through one.
     DirectoryLink,
     /// A filesystem Commit would write or delete a Path that is, or is under, a directory holding
-    /// a `.tidings/` directory, as another Store's Location and a Working copy do, or would delete
-    /// such a directory as a Prefix. Such a directory is left out of the Store, with everything
-    /// under it, so that two Stores, or a Store and a Working copy, never claim the same files.
+    /// a `.tidings/` directory, as another Store's Location does, or would delete such a directory
+    /// as a Prefix. Such a directory is left out of the Store, with everything under it, so that
+    /// two Stores never claim the same files.
     Nested,
 }
 
@@ -264,8 +262,8 @@ impl fmt::Display for InvalidPathReason {
                 "it is, or is under, a symlink to a directory, which is left out of the Store"
             }
             InvalidPathReason::Nested => {
-                "it is, or is under, a directory holding `.tidings/`, another Store's Location or \
-                 a Working copy, which is left out of the Store"
+                "it is, or is under, a directory holding `.tidings/`, as another Store's Location \
+                 does, which is left out of the Store"
             }
         })
     }

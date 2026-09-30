@@ -232,28 +232,3 @@ async fn when_both_backends_open_a_fresh_location_at_once_one_gets_it() {
         assert_eq!(detect(location.path()).await.unwrap(), Some(winner));
     }
 }
-
-/// A Working copy's folder holds a `.tidings/` too, with the record the `tidings` command keeps in
-/// it, named `working-copy`. A Store on either Backend refuses to open there, and `detect` refuses
-/// to look, without changing anything, so that a Store's files never mix with a Working copy's.
-#[tokio::test]
-async fn a_working_copy_folder_is_refused_as_a_location_and_changes_nothing() {
-    let folder = tempfile::tempdir().unwrap();
-    std::fs::create_dir(folder.path().join(".tidings")).unwrap();
-    std::fs::write(folder.path().join(".tidings/working-copy"), "tidings working copy 1\n")
-        .unwrap();
-    std::fs::write(folder.path().join("notes.txt"), "mine").unwrap();
-    let before = names_under(folder.path());
-
-    let assert_refused = |result: tidings::Result<_>, what: &str| match result {
-        Err(Error::LocationIsWorkingCopy { location }) => assert_eq!(location, folder.path()),
-        other => panic!("{what} should be refused, got {:?}", other.map(|_| ())),
-    };
-    for kind in BOTH {
-        assert_refused(open(kind, folder.path()).await.map(drop), &format!("opening on {kind}"));
-    }
-    assert_refused(detect(folder.path()).await.map(drop), "detect");
-    let detected = call_blocking(|| tidings::blocking::Store::detect(folder.path()));
-    assert_refused(detected.map(drop), "detect through the blocking API");
-    assert_eq!(names_under(folder.path()), before);
-}

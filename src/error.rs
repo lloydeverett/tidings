@@ -48,25 +48,13 @@ pub enum Error {
         found: BackendKind,
     },
     /// The Location is inside `outer`, a directory holding a `.tidings/` directory, as another
-    /// Store's Location and a Working copy do. Opening a Store on the filesystem or SQLite gives
-    /// it, before anything is made, since the two would claim the same files. `outer` is as found
-    /// with every symlink on the way resolved.
-    #[error(
-        "the Location is inside {}, which holds another Store or a Working copy",
-        outer.display()
-    )]
+    /// Store's Location does. Opening a Store on the filesystem or SQLite gives it, before anything
+    /// is made, since the two would claim the same files. `outer` is as found with every symlink on
+    /// the way resolved.
+    #[error("the Location is inside {}, which holds a `.tidings/` directory", outer.display())]
     NestedLocation {
         /// The directory the Location is inside.
         outer: PathBuf,
-    },
-    /// The Location is a Working copy's folder: its `.tidings/` holds the record the `tidings`
-    /// command keeps there. Opening a Store on the filesystem or SQLite, and
-    /// [`Store::detect`](crate::Store::detect), give it, without changing anything, since the
-    /// Store's files would mix with the Working copy's.
-    #[error("the Location {} is a Working copy's folder", location.display())]
-    LocationIsWorkingCopy {
-        /// The Location, as it was given.
-        location: PathBuf,
     },
     /// A Staging required a [`PrefixRevision`](crate::PrefixRevision) for `prefix` that was taken
     /// for another Prefix, or from another Store than the one it was committed to. It could never

@@ -8,6 +8,7 @@ use clap::{Args, ValueEnum};
 use tidings::{BackendKind, ChangeFeed, FsOptions, SqliteOptions, Store};
 
 use crate::failure::Failure;
+use crate::working_copy::WorkingCopy;
 
 /// The flags that choose a Store, which every command takes.
 #[derive(Debug, Args)]
@@ -146,9 +147,16 @@ impl StoreArgs {
 
     /// The Location of the Store the flags choose, which isn't one in memory, and its Backend: the
     /// one `--backend` names, or the one found there. Fails if there is no Store there and
-    /// `--create` is left out, but never makes one.
+    /// `--create` is left out, or if the Location is a Working copy's folder, since the Store's
+    /// files would mix with the Working copy's, but never makes one.
     async fn address(&self) -> Result<StoreAddress, Failure> {
         let location = self.location()?;
+        if WorkingCopy::exists(&location) {
+            return Err(Failure::error(format!(
+                "{} is a Working copy's folder, so it can't be a Store's Location",
+                location.display(),
+            )));
+        }
         let backend = match (self.backend, detect(&location).await?) {
             (_, None) if !self.create => return Err(missing(&location)),
             (Some(backend), _) | (None, Some(backend)) => backend,

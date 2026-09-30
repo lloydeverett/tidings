@@ -13,10 +13,7 @@
 //! the one that makes the marker gets it, and the other fails.
 //!
 //! **Nesting.** Before that, opening refuses a Location inside a directory holding a `.tidings/`,
-//! another Store's Location or a Working copy ([`refuse_nested`]), so that two never claim the
-//! same files. Reading the marker refuses a Location that is a Working copy's folder itself
-//! ([`refuse_working_copy`]), for the same reason: a Store opened again at its own Location is
-//! usual, but a Working copy's folder holds only the Working copy.
+//! as another Store's Location does ([`refuse_nested`]), so that two never claim the same files.
 //!
 //! **Clearing.** A Location removed by the user or the OS loses its marker with everything else.
 //! The Store open on it makes it and marks it again.
@@ -82,28 +79,10 @@ fn read(path: &FsPath) -> Result<Option<BackendKind>> {
     }
 }
 
-/// The Backend the Location `location` is marked for, or `None` if it isn't marked, or
-/// [`Error::LocationIsWorkingCopy`] if it is a Working copy's folder ([`refuse_working_copy`]).
-/// Changes nothing.
+/// The Backend the Location `location` is marked for, or `None` if it isn't marked. Changes
+/// nothing.
 pub(crate) fn detect(location: &FsPath) -> Result<Option<BackendKind>> {
-    refuse_working_copy(location)?;
     read(&marker_path(location))
-}
-
-/// The Working copy record's name in a Working copy's `.tidings/`, as the `tidings` command writes
-/// it. The library doesn't depend on the command, so it knows the record only by its name.
-const WORKING_COPY_RECORD: &str = "working-copy";
-
-/// Gives [`Error::LocationIsWorkingCopy`] if `location`'s `.tidings/` holds a Working copy record,
-/// so that a Store's files never mix with a Working copy's, as they would if both kept them in one
-/// folder. Changes nothing.
-fn refuse_working_copy(location: &FsPath) -> Result<()> {
-    let record = location.join(RESERVED).join(WORKING_COPY_RECORD);
-    match fs::symlink_metadata(&record) {
-        Ok(_) => Err(Error::LocationIsWorkingCopy { location: location.to_path_buf() }),
-        Err(error) if is_absent(&error) => Ok(()),
-        Err(error) => Err(failed(&record, error)),
-    }
 }
 
 /// Marks the Location `location` for `kind`, as the module's doc describes, making it and its
@@ -139,9 +118,9 @@ fn check(marked: Option<BackendKind>, kind: BackendKind) -> Result<()> {
 }
 
 /// Gives [`Error::NestedLocation`] if a directory above the Location `location` holds a
-/// `.tidings/` directory, as another Store's Location and a Working copy do. Symlinks on the way
-/// are resolved first, so that the Location is checked where it really is. The Location holding
-/// one itself is usual. Changes nothing.
+/// `.tidings/` directory, as another Store's Location does. Symlinks on the way are resolved
+/// first, so that the Location is checked where it really is. The Location holding one itself is
+/// usual. Changes nothing.
 pub(crate) fn refuse_nested(location: &FsPath) -> Result<()> {
     let resolved = resolved(location)?;
     for outer in resolved.ancestors().skip(1) {
@@ -152,7 +131,7 @@ pub(crate) fn refuse_nested(location: &FsPath) -> Result<()> {
     Ok(())
 }
 
-/// Whether `directory` holds a `.tidings/` directory, as a Store's Location and a Working copy do.
+/// Whether `directory` holds a `.tidings/` directory, as a Store's Location does.
 /// Nothing there, or a file where a directory on the way would be, is `false`, and any other
 /// failure an error, so that a `.tidings/` that can't be looked at is never taken for none.
 pub(crate) fn holds_tidings(directory: &FsPath) -> Result<bool> {

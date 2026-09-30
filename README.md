@@ -83,14 +83,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   Each Store sees the other's commits as external changes. On the other Backend, opening it is
   refused with `Error::WrongBackend`. So if two of your Stores could be given the same directory,
   join a name of your own to each.
-- **Stores don't nest.** Opening a Store inside another Store's Location, or inside a Working copy,
-  is refused with `Error::NestedLocation`, naming the directory it is inside, found with symlinks
-  resolved. Opening one at a Working copy's folder is refused with `Error::LocationIsWorkingCopy`.
-  Both are checked before anything is made. *Why:* the two would claim the same files.
+- **Stores don't nest.** Opening a Store inside another Store's Location, or inside any directory
+  holding `.tidings/`, is refused with `Error::NestedLocation`, naming the directory it is inside,
+  found with symlinks resolved, before anything is made. *Why:* the two would claim the same files.
 - **A directory inside a filesystem Store's Location that holds `.tidings/` is outside the Store.**
-  It belongs to another Store or to a Working copy. Like a symlinked directory, it and everything
-  under it isn't listed, read or watched, and writing under it is refused as an invalid Path
-  (`InvalidPathReason::Nested`). One made while the Store is open drops out, with a `Removed`
+  It belongs to another Store, or to whatever else made it. Like a symlinked directory, it and
+  everything under it isn't listed, read or watched, and writing under it is refused as an invalid
+  Path (`InvalidPathReason::Nested`). One made while the Store is open drops out, with a `Removed`
   change for each of its Files, which come back if its `.tidings/` goes. SQLite has no such
   directories: its Files are all in its database.
 
@@ -229,8 +228,10 @@ These apply to every command, both for Working copies and under `tidings store`.
 
 **`sync`** resumes where it left off, catching up on whatever changed while it wasn't running. It
 refuses a folder that holds files but isn't a Working copy, the Store's own Location, and a second
-`sync` of the same folder. A Working copy inside a filesystem Store's Location is outside that
-Store, so the two never report each other's writes. It prints one line for each thing it does:
+`sync` of the same folder, and `--store` can't name a Working copy's folder either. A Working
+copy inside a filesystem Store's Location is outside that Store, since its folder holds
+`.tidings/`, so the two never report each other's writes, and a Store can't be opened inside a
+Working copy. It prints one line for each thing it does:
 
 - `created`, `updated`, `removed`: a Change in the Store applied to the folder. A directory it
   empties is removed; one still holding your files is left alone.
@@ -470,7 +471,7 @@ Each with why, where it isn't obvious.
   backend refuses to open it (`Error::WrongBackend`). `Store::detect` finds which one a Location
   has. The first store to open a Location marks it, taking over what is already there.
 - **`.tidings` can't be a name anywhere in a Path,** in any letter case. *Why:* it is tidings' own,
-  in a Location and in each nested Store or Working copy.
+  in a Location and in any directory nested in one.
 - **A Prefix Revision works only in a Staging committed to the Store it came from,** and for its
   own Prefix. Otherwise the commit is refused with `Error::WrongPrefixRevision`, since it could
   never hold. *Why:* a Staging doesn't know its Store until it is committed.

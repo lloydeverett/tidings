@@ -1725,8 +1725,8 @@ fn sync_into_the_stores_own_location_is_refused() {
     }
 }
 
-/// A Working copy's folder can't be a Store's Location either: the library refuses to open a Store
-/// there, so a `store` command pointed at one fails and changes nothing.
+/// A Working copy's folder can't be a Store's Location either: a `store` command pointed at one
+/// fails and changes nothing, even with `--create`.
 #[test]
 fn a_working_copys_folder_is_refused_as_a_stores_location() {
     for backend in BACKENDS {

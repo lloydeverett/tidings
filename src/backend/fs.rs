@@ -28,10 +28,9 @@
 //! [`DirectoryLink`](InvalidPathReason::DirectoryLink), and finishing a Commit never writes or
 //! deletes through one made since.
 //!
-//! **Other Stores and Working copies.** A directory in the Location that holds a `.tidings/`
-//! directory is another Store's Location, or a Working copy, and is left out, with everything
-//! under it, as a symlink to a directory is: so two Stores, or a Store and a Working copy, never
-//! claim the same files. A Commit that would write or delete under one is refused with
+//! **Other Stores.** A directory in the Location that holds a `.tidings/` directory, as another
+//! Store's Location does, is left out, with everything under it, as a symlink to a directory is:
+//! so two Stores never claim the same files. A Commit that would write or delete under one is refused with
 //! [`Nested`](InvalidPathReason::Nested), and finishing a Commit never writes or deletes under one
 //! made since. One made while the Store is open drops out of it: see [`watch`].
 //!
@@ -320,10 +319,10 @@ pub(crate) struct FsBackend {
 }
 
 impl FsBackend {
-    /// Refuses `location` if it is inside another Store's Location or a Working copy, marks it for
-    /// the filesystem ([`marker`]), or fails if it is SQLite's, then makes it and its `.tidings/`
-    /// directory if they don't exist, finishes or discards any Commit a crash left in its journal,
-    /// and starts watching it, giving the watcher for the Store to run.
+    /// Refuses `location` if it is inside another Store's Location, marks it for the filesystem
+    /// ([`marker`]), or fails if it is SQLite's, then makes it and its `.tidings/` directory if
+    /// they don't exist, finishes or discards any Commit a crash left in its journal, and starts
+    /// watching it, giving the watcher for the Store to run.
     pub(crate) async fn open(
         location: PathBuf,
         options: &FsOptions,
@@ -609,8 +608,8 @@ impl Location {
     }
 
     /// Whether `name`, a Path or a Prefix without its `/`, is left out of the Store because it, or
-    /// a directory on the way to it, is a directory holding a `.tidings/`: another Store's
-    /// Location, or a Working copy.
+    /// a directory on the way to it, is a directory holding a `.tidings/`, as another Store's
+    /// Location does.
     fn is_nested(&self, name: &str) -> Result<bool> {
         Ok(self.left_out(name)? == Some(LeftOut::Nested))
     }
@@ -1058,7 +1057,7 @@ enum LeftOut {
     UnderOtherName,
     /// It is a symlink to a directory.
     DirectoryLink,
-    /// It is a directory holding a `.tidings/`: another Store's Location, or a Working copy.
+    /// It is a directory holding a `.tidings/`, as another Store's Location does.
     Nested,
 }
 

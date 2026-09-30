@@ -205,10 +205,10 @@ Change feed. The app opens as many as it wants, each on the Backend that suits i
 
 - Before anything is made, opening walks up the Location's ancestors and refuses one that holds a
   `.tidings/` entry, giving a new error naming that ancestor. The Location itself holding
-  `.tidings/` is the normal case, not a refusal, unless that `.tidings/` holds a Working copy
-  record: opening, and `detect`, refuse a Working copy's folder with an error of its own (story
-  28). Symlinks are resolved before the walk, so a
-  Location reached through one is checked where it really is.
+  `.tidings/` is the normal case, not a refusal. Symlinks are resolved before the walk, so a
+  Location reached through one is checked where it really is. The library knows nothing of
+  Working copies: the `tidings` command refuses `--store` naming a Working copy's folder (story
+  28).
 - Marking follows ADR 0007 for one Location. The rule about which Store wins the config Area, when
   Stores on both Backends open at once, is replaced by the plain `create_new` race on one marker.
 
