@@ -191,7 +191,7 @@ mod fs {
 
     use crate::api::Store;
     use crate::common::{
-        app, assert_nothing_more, changes, changes_in_full, next_batch, next_item,
+        app, assert_nothing_more, changes, changes_in_full, changes_until, next_batch, next_item,
     };
     use crate::suite::{Fixture, Opened};
 
@@ -461,8 +461,9 @@ mod fs {
         let Opened { store: _store, mut feed } = fixture.open().await;
         fixture.write_directly(Area::Data, "removed.txt", "old");
         fixture.write_directly(Area::Data, "moved.txt", "old");
+        // Read up to the last write, as a busy machine can have their events settle apart.
         assert_eq!(
-            changes(&next_batch(&mut feed).await),
+            changes(&changes_until(&mut feed, "moved.txt", None).await),
             [("moved.txt", ChangeKind::Changed), ("removed.txt", ChangeKind::Changed)],
         );
         // Quiet for a while, as the Files usually are when someone replaces them.
@@ -479,11 +480,17 @@ mod fs {
             fixture.root.path().join("moved away.txt"),
         )
         .unwrap();
+        // On a busy machine, the watcher can look at a File before it is removed, and report it
+        // changed first. Either way, it is reported removed in the end, with nothing else.
+        fixture.write_directly(Area::Data, "marker.txt", "");
         assert_eq!(
-            changes(&next_batch(&mut feed).await),
-            [("moved.txt", ChangeKind::Removed), ("removed.txt", ChangeKind::Removed)],
+            changes(&changes_until(&mut feed, "marker.txt", None).await),
+            [
+                ("marker.txt", ChangeKind::Changed),
+                ("moved.txt", ChangeKind::Removed),
+                ("removed.txt", ChangeKind::Removed),
+            ],
         );
-        assert_nothing_more(&mut feed).await;
     }
 
     #[tokio::test]

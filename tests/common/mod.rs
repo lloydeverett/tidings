@@ -2,6 +2,7 @@
 //! them.
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use tidings::blocking::TimedOut;
@@ -51,6 +52,33 @@ pub async fn next_batch(feed: &mut impl Feed) -> Vec<Change> {
     }
 }
 
+/// Reads the Change feed until a batch holds a Change to `marker`, and gives every Change read,
+/// merged as the feed merges unread Changes to a Path, sorted by Area and Path. Events arrive in
+/// order, so a Change still to come for what was done in `marker`'s Area before it was written
+/// comes before it or with it: what this gives doesn't depend on how long the watcher takes. A
+/// Resync fails the test, unless it is for `resyncing`, which is then skipped.
+pub async fn changes_until(
+    feed: &mut impl Feed,
+    marker: &str,
+    resyncing: Option<Area>,
+) -> Vec<Change> {
+    let mut merged = BTreeMap::new();
+    loop {
+        let batch = match next_item(feed).await {
+            FeedItem::Changes(batch) => batch,
+            FeedItem::Resync(area) if Some(area) == resyncing => continue,
+            other => panic!("expected a batch of Changes, got {other:?}"),
+        };
+        let marked = batch.iter().any(|change| change.path.as_str() == marker);
+        for change in batch {
+            merged.insert((change.area, change.path.clone()), change);
+        }
+        if marked {
+            return merged.into_values().collect();
+        }
+    }
+}
+
 /// Each Change's Path and kind, for comparing, where the Area and Origin go without saying.
 pub fn changes(batch: &[Change]) -> Vec<(&str, ChangeKind)> {
     batch.iter().map(|change| (change.path.as_str(), change.kind)).collect()
@@ -85,10 +113,8 @@ pub async fn assert_nothing_more(feed: &mut impl Feed) {
 /// Checks that the Change feed has ended, and stays ended.
 pub async fn assert_ended(feed: &mut impl Feed) {
     for _ in 0..2 {
-        let item = feed
-            .next_within(ARRIVAL)
-            .await
-            .expect("the Change feed should have ended by now");
+        let item =
+            feed.next_within(ARRIVAL).await.expect("the Change feed should have ended by now");
         assert_eq!(item, None);
     }
 }
