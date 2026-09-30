@@ -803,6 +803,14 @@ mod fs {
     #[tokio::test]
     async fn a_failure_to_watch_gives_a_resync() {
         let fixture = Fs::new();
+        // The watcher's first events fail, so they must be the test's. A Store opened first
+        // makes the Areas' directories, and it has had every event of that once it reports a
+        // later write: on a busy machine, they could otherwise reach the failing Store late.
+        {
+            let Opened { store: _store, mut feed } = fixture.open().await;
+            fixture.write_directly(Area::Data, "opened.txt", "x");
+            changes_until(&mut feed, "opened.txt", None).await;
+        }
         let Opened { store: _store, mut feed } =
             fixture.open_with(|options| options.fail_at(FailurePoint::WatchingFails)).await;
 
@@ -810,9 +818,12 @@ mod fs {
         // watched again: directories made meanwhile too.
         fixture.write_directly(Area::Data, "missed/a.txt", "x");
         assert_eq!(next_item(&mut feed).await, FeedItem::Resync(Area::Data));
-        assert_nothing_more(&mut feed).await;
+        // The File's own events can settle after the directory's, and after the Resync, which
+        // listed it without reading it, as when a Store opens: they then give it a Change.
         fixture.write_directly(Area::Data, "seen.txt", "x");
-        assert_eq!(changes(&next_batch(&mut feed).await), [("seen.txt", ChangeKind::Changed)]);
+        let read = changes_until(&mut feed, "seen.txt", None).await;
+        let late = [("missed/a.txt", ChangeKind::Changed), ("seen.txt", ChangeKind::Changed)];
+        assert!(changes(&read) == late[1..] || changes(&read) == late, "{read:?}");
         fixture.write_directly(Area::Data, "missed/a.txt", "y");
         assert_eq!(changes(&next_batch(&mut feed).await), [("missed/a.txt", ChangeKind::Changed)]);
         assert_nothing_more(&mut feed).await;
