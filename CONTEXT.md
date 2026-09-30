@@ -1,8 +1,9 @@
 # tidings
 
 tidings gives an application as many independent places to keep text files as it wants, each in
-a directory it chooses. It hides whether each lives in real files, a SQLite database or memory. The only way
-to write is to stage changes and commit them, and every change is announced to the application.
+a directory it chooses. It hides whether each lives in real files, a SQLite database or memory.
+The only way to write is to stage changes and commit them, and every change is announced to the
+application.
 
 ## Language
 

@@ -1,9 +1,11 @@
 # tidings
 
-Text files for an application, in three areas (config, data, cache), stored on the filesystem, in
-SQLite or in memory. Writes happen only through all-or-nothing commits, and every change is
-reported on a change feed. Async on tokio; `tidings::blocking::Store` (feature `blocking`) for
-synchronous code.
+Text files for an application, in as many Stores as it wants, each in a directory it chooses and
+on the Backend that suits it: the filesystem, SQLite or memory. Writes happen only through
+all-or-nothing commits, and every change is reported on the Store's change feed. Async on tokio;
+`tidings::blocking::Store` (feature `blocking`) for synchronous code.
+
+Choose a Backend for each Store, by what that Store holds:
 
 | Use | Filesystem | SQLite | Memory | Why, where it isn't obvious |
 | --- | :---: | :---: | :---: | --- |
@@ -13,15 +15,86 @@ synchronous code.
 | Reading, searching or backing up with ordinary tools (grep, git, rsync) | ✅ | | | |
 | Keeping Files after the app exits | ✅ | ✅ | | |
 | Sharing a Store between processes | ✅ | ✅ | | Commits reach other processes late: on SQLite within a poll interval (100 ms), on the filesystem once events are quiet for 150 ms. |
-| Commits never held up by another program | | ✅ | ✅ | On Windows, a file another program has open blocks every commit to its Area until released. |
+| Commits never held up by another program | | ✅ | ✅ | On Windows, a file another program has open blocks every commit to its Store until released. |
 | A change feed with only real changes | | ✅ | ✅ | The filesystem can report a rewrite with unchanged contents, or on macOS a permissions change. |
 | Quick `stat` and Prefix Revisions of large Files | | ✅ | ✅ | The filesystem reads the whole File for its Revision. |
 | Nothing written to disk (tests, throwaway state) | | | ✅ | |
 
 The details are under [Consistency](#consistency) and [Limitations](#limitations).
 
-Status: early. The library's first version is complete, and the `tidings` command now has Working
+Status: early. The library's first version is complete, and the `tidings` command has Working
 copies for everyday editing. See [CONTEXT.md](CONTEXT.md) and [docs/adr](docs/adr).
+
+## Opening Stores
+
+A Store is one **Location**, a directory you pass in, held by one Backend, with its own change
+feed. Open as many as you need: nothing ties them together, and one Store's commits, resyncs or
+slow reader never affect another's. tidings doesn't pick directories. For the platform's standard
+ones, depend on [`etcetera`](https://docs.rs/etcetera) (or anything else) yourself and pass what it
+gives. Here config is on the filesystem, where people can edit it, and data is in SQLite, which has
+Snapshots:
+
+```rust
+use etcetera::{AppStrategy, AppStrategyArgs, choose_app_strategy};
+use tidings::{FeedItem, FsOptions, SqliteOptions, Staging, Store};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let dirs = choose_app_strategy(AppStrategyArgs {
+        top_level_domain: "com".to_owned(),
+        author: "Example".to_owned(),
+        app_name: "My App".to_owned(),
+    })?;
+    let (config, mut config_feed) =
+        Store::open_fs(dirs.config_dir(), FsOptions::default()).await?;
+    let (data, mut data_feed) =
+        Store::open_sqlite(dirs.data_dir(), SqliteOptions::default()).await?;
+
+    if let Some(settings) = config.read("settings.toml").await? {
+        println!("{}", settings.contents());
+    }
+    let mut staging = Staging::new();
+    staging.write("notes/first.md", "# First\n")?;
+    data.commit(staging).await?;
+
+    // Each Store has its own change feed. Wait on them together with ordinary tokio tools.
+    loop {
+        tokio::select! {
+            Some(item) = config_feed.next() => match item {
+                FeedItem::Changes(changes) => println!("config changed: {changes:?}"),
+                FeedItem::Resync => println!("read all the config again"),
+            },
+            Some(item) = data_feed.next() => match item {
+                FeedItem::Changes(changes) => println!("data changed: {changes:?}"),
+                FeedItem::Resync => println!("read all the data again"),
+            },
+            else => break,
+        }
+    }
+    Ok(())
+}
+```
+
+- **Opening makes the Location**, and any missing parents. A SQLite Location is a directory too,
+  holding its database in `.tidings/store.sqlite3`. `Store::open_memory()` needs no Location.
+- **Any Location may vanish,** as a cache's does when the OS clears it. That isn't an error: the
+  Store makes it again, and sends a resync on its change feed. So a cache is just another Store.
+- **The same Location can be opened twice,** on the same Backend, by two processes or within one.
+  Each Store sees the other's commits as external changes.
+- **On macOS, `etcetera`'s native strategy (`choose_native_strategy`) gives the same directory for
+  config and data.** Opening both there opens one Location twice: on the same Backend, two Stores
+  over the same Files; on different Backends, `Error::WrongBackend` for the second. Join a name of
+  your own to each, or use `choose_app_strategy`, which follows XDG on macOS.
+- **Stores don't nest.** Opening a Store inside another Store's Location, or inside a Working copy,
+  is refused with `Error::NestedLocation`, naming the directory it is inside, found with symlinks
+  resolved. Opening one at a Working copy's folder is refused with `Error::LocationIsWorkingCopy`.
+  Both are checked before anything is made. *Why:* the two would claim the same files.
+- **A directory inside a filesystem Store's Location that holds `.tidings/` is outside the Store.**
+  It belongs to another Store or to a Working copy. Like a symlinked directory, it and everything
+  under it isn't listed, read or watched, and writing under it is refused as an invalid Path
+  (`InvalidPathReason::Nested`). One made while the Store is open drops out, with a `Removed`
+  change for each of its Files, which come back if its `.tidings/` goes.
+  SQLite has no such directories: its Files are all in its database.
 
 ## The `tidings` command
 
@@ -29,7 +102,7 @@ The `cli/` crate builds a `tidings` binary (`cargo install --path cli`) for read
 app's Files with your own tools, even when they live in SQLite. It uses only the library's public
 API.
 
-Its everyday use is a **Working copy**: a folder holding one Area's Files as ordinary files. `sync`
+Its everyday use is a **Working copy**: a folder holding one Store's Files as ordinary files. `sync`
 keeps it in step with the Store, you edit it with vim, grep or anything else, and `commit` sends
 your edits back as one all-or-nothing Commit. It is a copy, not a mount ([ADR
 0008](docs/adr/0008-a-working-copy-is-a-copy-not-a-mount.md)): nothing reaches the Store until you
@@ -37,21 +110,21 @@ commit, and syncing never overwrites a local edit.
 
 ### A walkthrough
 
-To follow along, make a Store for `sync` to find. Here it is in SQLite, under `./store`; an app's
-own Store is found with `--identity tld.author.app` instead of `--root`.
+To follow along, make a Store for `sync` to find. Here it is in SQLite, at `./store`; an app's
+own Store is wherever the app opens it, and `--store` takes that directory.
 
 ```sh
-$ echo 'theme = "dark"' | tidings --root store --backend sqlite --create store write config app.toml
+$ echo 'theme = "dark"' | tidings --store store --backend sqlite --create store write app.toml
 ed9fe5424334710f362be5fcc2cce6fe  app.toml
-$ echo 'leader = ","' | tidings --root store store write config keys/vim.toml
+$ echo 'leader = ","' | tidings --store store store write keys/vim.toml
 492bd6e6af7dc44267aad24339eddd8a  keys/vim.toml
 ```
 
-Make `cfg` a Working copy of the config Area, and leave `sync` running in a terminal of its own.
-It prints one line for everything it does, until Ctrl-C:
+Make `cfg` a Working copy of the Store, and leave `sync` running in a terminal of its own. It
+prints one line for everything it does, until Ctrl-C:
 
 ```sh
-$ tidings --root store sync config cfg
+$ tidings --store store sync cfg
 created app.toml
 created keys/vim.toml
 caught up
@@ -79,7 +152,7 @@ the app (here, `tidings store write`, from another process) changes it too:
 
 ```sh
 $ vim app.toml                        # theme = "solarized"
-$ printf 'theme = "light"\nfont = 16\n' | tidings --root ../store store write config app.toml
+$ printf 'theme = "light"\nfont = 16\n' | tidings --store ../store store write app.toml
 a7e9f66bab69fdb7d209cb5092f14375  app.toml
 ```
 
@@ -120,14 +193,14 @@ discarded app.toml: took the Store's version
 
 These apply to every command, both for Working copies and under `tidings store`.
 
-- **Choosing a Store.** Give exactly one of `--root <dir>` or `--identity tld.author.app` (the
-  platform's directories for that App identity). The Backend is found from the Backend markers;
-  `--backend fs|sqlite` makes sure of it. A location with no Store is refused unless you pass
-  `--create` too, so a typo doesn't make a new, empty one. `TIDINGS_ROOT`, `TIDINGS_IDENTITY` and
-  `TIDINGS_BACKEND` stand in for the flags.
+- **Choosing a Store.** `--store <dir>` names its Location, the directory the app opens it at. The
+  Backend is found from the Location's Backend marker; `--backend fs|sqlite` makes sure of it. A
+  directory with no Store is refused unless you pass `--create` too, so a typo doesn't make a new,
+  empty one. `TIDINGS_STORE` and `TIDINGS_BACKEND` stand in for the flags.
 - **Output.** Text for a person, or JSON with `--json`: one object per line for `sync` and
-  `store watch`, one object for the others. Under `--json`, any failure is one JSON object on
-  stderr, `{"failure": …, "message": …}`, with a `paths` list for the Paths it names.
+  `store watch`, one object for the others. A resync from `store watch` is `{"resync": true}`.
+  Under `--json`, any failure is one JSON object on stderr, `{"failure": …, "message": …}`, with a
+  `paths` list for the Paths it names.
 - **Exit codes.** `0` success, `1` error, `2` no File (`store read`, `store stat`), `3` Conflict,
   or a commit refused because a Path is Diverged. The `failure` in JSON is `error`, `invalid` or
   `blocked` (exit 1), `missing` (2), or `conflict` or `diverged` (3). `invalid` is a `commit`
@@ -138,11 +211,11 @@ These apply to every command, both for Working copies and under `tidings store`.
 
 - **Choosing the Store.** The first `sync` of a folder chooses its Store with the flags
   [above](#choosing-a-store-output-and-exit-codes). After that the Working copy remembers its
-  Store, Backend and Area, so the flags are optional. Any flags given, or set in the environment,
-  must match, or the command is refused: a stale `TIDINGS_ROOT` in your shell can't commit into
-  the wrong Store. `--create` makes a new Store only for a new Working copy. It is refused on an
-  existing one, even if its Store has gone, since a new, empty Store would remove every unchanged
-  file from the folder.
+  Store's Location and Backend, so the flags are optional. Any flags given, or set in the
+  environment, must match, or the command is refused: a stale `TIDINGS_STORE` in your shell can't
+  commit into the wrong Store. `--create` makes a new Store only for a new Working copy. It is
+  refused on an existing one, even if its Store has gone, since a new, empty Store would remove
+  every unchanged file from the folder.
 - **Finding the Working copy.** Every command but `sync` finds it from the current directory or a
   folder above it, or from `-C <folder>`, which goes after the command: `tidings status -C cfg`,
   not `tidings -C cfg status`. Paths you name are relative to the current directory, and a
@@ -150,15 +223,16 @@ These apply to every command, both for Working copies and under `tidings store`.
 
 | Command | |
 | --- | --- |
-| `sync <area> [folder]` | Make an empty or missing folder (the current directory if left out) a Working copy of the Area, or resume one, and keep it in step with the Store until Ctrl-C. `--quiet` prints only its `diverged`, `resync` and `error` lines. |
+| `sync [folder]` | Make an empty or missing folder (the current directory if left out) a Working copy of the Store, or resume one, and keep it in step with the Store until Ctrl-C. `--quiet` prints only its `diverged`, `resync` and `error` lines. |
 | `commit [paths…]` | Commit every local change, or only those under the Paths you name, as one Commit. |
 | `status` | List what `commit` would do, and say whether `sync` is running. |
 | `discard [paths…]` | Take the Store's version of each changed or Diverged Path, or only those you name. |
 | `resolve <paths…>` | Take what is in the folder as the merge of each Diverged Path. |
 
 **`sync`** resumes where it left off, catching up on whatever changed while it wasn't running. It
-refuses a folder that holds files but isn't a Working copy, a Working copy of another Area, and
-a second `sync` of the same folder. It prints one line for each thing it does:
+refuses a folder that holds files but isn't a Working copy, the Store's own Location, and a second
+`sync` of the same folder. A Working copy inside a filesystem Store's Location is outside that
+Store, so the two never report each other's writes. It prints one line for each thing it does:
 
 - `created`, `updated`, `removed`: a Change in the Store applied to the folder. A directory it
   empties is removed; one still holding your files is left alone.
@@ -170,7 +244,7 @@ a second `sync` of the same folder. It prints one line for each thing it does:
   equal the Store's, or the Store went back to the Base.
 - `error`: something `sync` couldn't do for one Path, such as writing its `theirs` file. It
   carries on, and tries again later.
-- `resync`: Changes may have been missed, so it checked the whole Area again.
+- `resync`: Changes may have been missed, so it checked the whole Store again.
 - `caught up` (`caught-up` in JSON): it has done everything it knows of. A script can wait for it
   rather than sleeping. With `--json`, a `diverged` line also has `theirs`: the file relative to
   the folder, or `null`.
@@ -229,21 +303,22 @@ The commands under `tidings store` work on the Store directly, bypassing any Wor
 quick look or a one-off change, or from a script.
 
 ```sh
-export TIDINGS_ROOT=/tmp/scratch                  # or --root, or --identity com.example.myapp
-tidings --backend fs --create store list data     # a new Store needs --create and --backend
-echo 'a = 1' | tidings store write config app.toml
-tidings store read config app.toml                # the contents, exactly as stored
-tidings store stat config app.toml                # its Revision and modified time
-tidings store write data a.txt --contents x --if-revision <revision>
-tidings store edit config app.toml                # in $VISUAL or $EDITOR; :cq cancels, a Conflict keeps your edit
-tidings store watch data                          # every Change to data, until Ctrl-C
+export TIDINGS_STORE=/tmp/scratch                 # or --store
+tidings --backend fs --create store list          # a new Store needs --create and --backend
+echo 'a = 1' | tidings store write app.toml
+tidings store read app.toml                       # the contents, exactly as stored
+tidings store stat app.toml                       # its Revision and modified time
+tidings store write a.txt --contents x --if-revision <revision>
+tidings store edit app.toml                       # in $VISUAL or $EDITOR; :cq cancels, a Conflict keeps your edit
+tidings store watch                               # every Change, until Ctrl-C
 ```
 
 - **Choosing a Store, output and exit codes:** as
   [above](#choosing-a-store-output-and-exit-codes).
-- **Commands.** `read`, `stat`, `list`, `stat-prefix`, `write`, `delete`, `delete-prefix`, `edit`
-  and `watch`, each taking the Area then the Path or Prefix. `write` takes the contents from stdin,
-  `--contents` or `--from <file>`. `write` and `delete` take `--if-absent` or `--if-revision`.
+- **Commands.** `read`, `stat`, `list`, `stat-prefix`, `write`, `delete`, `delete-prefix` and
+  `edit`, each taking a Path or Prefix (`list` takes the whole Store if it is left out), and
+  `watch`. `write` takes the contents from stdin, `--contents` or `--from <file>`. `write` and
+  `delete` take `--if-absent` or `--if-revision`.
 
 `tidings store shell` keeps one Store open, so a Commit can be built up over several commands,
 and the memory Backend (`--backend memory`) can be used. It takes the same commands (not
@@ -251,7 +326,7 @@ and the memory Backend (`--backend memory`) can be used. It takes the same comma
 
 | Command | |
 | --- | --- |
-| `stage <area>` | Open a Staging: `write`, `delete`, `delete-prefix` and `edit` add to it instead of committing. One at a time, shown in the prompt. |
+| `stage` | Open a Staging: `write`, `delete`, `delete-prefix` and `edit` add to it instead of committing. One at a time, shown in the prompt. |
 | `require <path> absent\|<revision>` | Add a Precondition to it. |
 | `require-prefix <prefix>` | Require the Prefix unchanged since its last `stat-prefix` in this shell. A Prefix Revision can't be typed in, so this works only in the shell. |
 | `commit`, `discard` | Commit the Staging, or drop it. Either way it is closed. |
@@ -281,7 +356,7 @@ Ways a Working copy can surprise you, and why.
   Store, not the folder.
 - **An ignored file is still yours.** If the Store makes a File at the Path of an ignored local
   file, the Path is Diverged, not overwritten. *Why:* syncing never overwrites a local file.
-- **One Area per Working copy.** *Why:* a commit across Areas would be up to three Commits, and one
+- **One Store per Working copy.** *Why:* a commit across Stores would be several Commits, and one
   could succeed while another is refused.
 - **No memory Stores.** *Why:* no other process can reach one.
 - **`sync` runs in the foreground,** until Ctrl-C, which lets the change it is applying finish
@@ -309,7 +384,7 @@ Ways you could lose data or see confusing behaviour, and why.
     other programs can edit files mid-read; a lock would only hold off tidings, not them.
 - **`Error::Pending` means the commit succeeded.** On the filesystem, if a file can't be replaced
   (on Windows, another program has it open), the commit has still happened and is reported.
-  - Until the file is released, *every* commit to that area fails, even ones not touching it.
+  - Until the file is released, *every* commit to that Store fails, even ones not touching it.
     *Why:* this commit must be finished first to keep commits all-or-nothing.
 - **An outside program's edit can be lost if it lands mid-commit.** A precondition is checked,
   then the commit's files are prepared and forced to disk, then renamed into place. An edit
@@ -320,7 +395,7 @@ Ways you could lose data or see confusing behaviour, and why.
   - Outside programs can also see a commit half-applied.
   - The reverse can happen too: if the edit swaps a directory for a symlink to one, the commit's
     files under it are dropped, though reported as written, and read until the commit finishes.
-    *Why:* they're outside the area now, and finishing never writes through such a link, so a
+    *Why:* they're outside the Store now, and finishing never writes through such a link, so a
     commit left unfinished doesn't block every later one.
 - **The change feed doesn't give you every step.** It says which path changed, not the new
   contents, and merges unread changes to the same path. Re-read to see what's there.
@@ -337,8 +412,8 @@ Ways you could lose data or see confusing behaviour, and why.
   so can the first change to its permissions, or nothing at all, if the file was made shortly
   before the store opened: FSEvents can report a recent creation again, or late. *Why:* avoiding
   it means reading every file when the store opens, and they can be large.
-  - On macOS, an area's directory removed while the store runs can give a second resync a moment
-    after the first. *Why:* FSEvents can report the removal, and the directory made again, late;
+  - On macOS, a Location removed while the store runs can give a second resync a moment after the
+    first. *Why:* FSEvents can report the removal, and the directory made again, late;
     taking the directory still there for proof that nothing was missed would be wrong if it had
     been moved away and back.
 
@@ -363,10 +438,10 @@ Each with why, where it isn't obvious.
 - **Non-UTF-8 files are listed but give `Error::NotText` when read.**
 - **Writes go through symlinks to files**, keeping the link. The target's directory must exist.
   A commit writing both a link and its target is refused (`SameFile`).
-- **Symlinks to directories inside an area are ignored**, with everything under them: not
+- **Symlinks to directories inside a Location are ignored**, with everything under them: not
   listed, read or watched. Writing under one is refused (`DirectoryLink`). *Why:* so each file
   has one path, and every directory holding files is watched.
-- **An area's directory can be a symlink, but it's resolved once, when the store opens.**
+- **A Location can be a symlink, but it's resolved once, when the store opens.**
   Re-pointing it later takes effect at the next open.
 
 ### Performance
@@ -374,7 +449,7 @@ Each with why, where it isn't obvious.
 - **Stat reads the whole file, and a prefix revision reads every file under the prefix**, on the
   filesystem. *Why:* revisions come from contents, since modified times can be coarse or set by
   hand.
-- **Watching uses memory per file** in each area, to tell what an event changed.
+- **Watching uses memory per file** in each Store, to tell what an event changed.
 - **A long-held SQLite snapshot makes the database's log grow** until it is dropped. *Why:* that
   is how SQLite keeps the old state readable.
 
@@ -393,8 +468,13 @@ Each with why, where it isn't obvious.
 - A SQLite store more than 10 minutes behind other processes' commits (a stopped process, say)
   gets a resync. *Why:* the log of commits is pruned, so it stays small without tracking which
   stores are open.
-- **Each area records which backend holds it,** in `.tidings/backend`, and a store on the other
-  backend refuses to open it (`Error::WrongBackend`). `Store::detect` finds which one a location
-  has. The first store to open an area marks it, taking over what is already there.
-- Not supported: binary files; moving data between backends; size limits or eviction for the
-  cache; your own backends; other programs writing to tidings' SQLite databases.
+- **Each Location records which backend holds it,** in `.tidings/backend`, and a store on the other
+  backend refuses to open it (`Error::WrongBackend`). `Store::detect` finds which one a Location
+  has. The first store to open a Location marks it, taking over what is already there.
+- **`.tidings` can't be a name anywhere in a Path,** in any letter case. *Why:* it is tidings' own,
+  in a Location and in each nested Store or Working copy.
+- **A Prefix Revision works only in a Staging committed to the Store it came from,** and for its
+  own Prefix. Otherwise the commit is refused with `Error::WrongPrefixRevision`, since it could
+  never hold. *Why:* a Staging doesn't know its Store until it is committed.
+- Not supported: binary files; moving data between backends; size limits or eviction; commits or
+  snapshots across Stores; your own backends; other programs writing to tidings' SQLite databases.

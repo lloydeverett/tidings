@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
-description = "Text files for an application in config, data and cache areas, written through all-or-nothing commits, with a change feed."
+description = "Text files for an application, in as many Stores as it wants at directories it chooses, written through all-or-nothing commits, with a change feed."
 readme = "README.md"
 
 [features]
@@ -44,6 +44,8 @@ xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 # need it, and with `blocking`, so that it runs the behaviour suite through the blocking Store too.
 # Dev-dependencies don't reach normal builds, or crates that depend on tidings.
 tidings = { path = ".", default-features = false, features = ["testing", "blocking"] }
+# For the crate docs' example of opening Stores at the platform's standard directories.
+etcetera = "0.11.0"
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
 

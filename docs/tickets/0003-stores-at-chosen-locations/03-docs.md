@@ -9,15 +9,15 @@ App identity or a Root override any more.
 
 **Blocked by:** 01, 02
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] The README's opening, and its walkthrough and command reference, use `--store` and no Areas.
-- [ ] An example opens a config Store on the filesystem and a data Store in SQLite, at directories
+- [x] The README's opening, and its walkthrough and command reference, use `--store` and no Areas.
+- [x] An example opens a config Store on the filesystem and a data Store in SQLite, at directories
       from `etcetera`, and waits on both Change feeds with `select!`.
-- [ ] The table of which Backend suits which use is framed as a choice per Store.
-- [ ] The README says what nesting does: opening inside another Store or a Working copy is
+- [x] The table of which Backend suits which use is framed as a choice per Store.
+- [x] The README says what nesting does: opening inside another Store or a Working copy is
       refused, and a nested one is outside a filesystem Store. It notes that on macOS
       `etcetera`'s native strategy gives the same directory for config and data, which opens one
       Location twice.
-- [ ] The crate-level docs and the `Cargo.toml` description match.
-- [ ] ADR 0009 is marked accepted, and the spec's status says it is built.
+- [x] The crate-level docs and the `Cargo.toml` description match.
+- [x] ADR 0009 is marked accepted, and the spec's status says it is built.

@@ -1,6 +1,6 @@
 # Spec 0003: Stores at Locations the app chooses
 
-Status: ready to build. Terms are used as defined in [CONTEXT.md](../../CONTEXT.md), and the
+Status: built. Terms are used as defined in [CONTEXT.md](../../CONTEXT.md), and the
 decisions in [docs/adr](../adr) apply throughout, especially
 [ADR 0009](../adr/0009-a-store-is-one-location-the-app-chooses.md).
 

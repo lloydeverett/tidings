@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # A Store is one Location the app chooses
@@ -25,14 +25,23 @@ Area anyway. So splitting them loses no guarantee. What changes:
   so a Location means the same on every Backend and ADR 0007's Backend marker works unchanged, one
   per Location. `detect(dir)` reads that one marker, and `MixedBackends` is gone.
 - A Store's Location can't be inside another Store's, or a Working copy: opening refuses one
-  whose ancestor holds a `.tidings/` directory. A directory in a Location that holds `.tidings/`
-  belongs to another Store, or to a Working copy, and is outside this one, like a symlinked
-  directory: not listed or watched, and a write under it is an invalid Path. So `.tidings` is reserved at any depth of a Path, not only as
-  its first name. The same Location opened twice, on the same Backend, is allowed: the two Stores
-  see each other's Commits as external, as two processes do.
+  whose ancestor holds a `.tidings/` directory, with `NestedLocation`. Nor can it be a Working
+  copy's folder: opening and `detect` refuse a Location whose `.tidings/` holds a Working copy
+  record, with `LocationIsWorkingCopy`, and `sync` refuses to make a Working copy at its Store's
+  Location. Otherwise the Store's marker and files would mix with the Working copy's. Both checks
+  run before anything is made.
+- A directory in a Location that holds `.tidings/` belongs to another Store, or to a Working copy,
+  and is outside this one, like a symlinked directory: not listed or watched, and a write under it
+  is an invalid Path. So `.tidings` is reserved at any depth of a Path, not only as its first name.
+  The same Location opened twice, on the same Backend, is allowed: the two Stores see each other's
+  Commits as external, as two processes do.
+- A Staging no longer knows its Store until it is committed, so a Prefix Revision carries the
+  Store that took it, and a Commit to another Store refuses it with `WrongPrefixRevision`, rather
+  than panicking when it is staged, as before.
 - Cache is no longer a kind of place. Any Location may vanish; the Store makes it again and sends a
   Resync, as it already did for every Area.
-- The CLI takes `--store <dir>` for the Location, commands take no Area, and `--identity` is gone.
+- The CLI takes `--store <dir>` for the Location in place of `--root` and `--identity`, and
+  commands take no Area. In JSON, a Resync is `{"resync": true}`.
 
 There was no migration: the formats on disk, including the Working copy record, change in place and
 are still called version 1.
