@@ -209,7 +209,8 @@ fn a_conflict_commits_nothing_and_marks_each_conflicting_path_diverged_as_sync_w
         assert_eq!(location.read("config", "app.toml"), "theirs", "{backend}");
         assert_eq!(location.read("config", "created.toml"), "theirs", "{backend}");
         location.run(&["store", "read", "config", "unrelated.toml"]).expect_code(2);
-        assert_eq!(fs::read_to_string(folder.path().join("app.toml")).unwrap(), "mine\n");
+        let local = fs::read_to_string(folder.path().join("app.toml")).unwrap();
+        assert_eq!(local, "mine\n", "{backend}");
         assert!(!folder.path().join("themes/dark.toml").exists(), "{backend}");
         for path in ["app.toml", "created.toml", "themes/dark.toml"] {
             let written = fs::read_to_string(theirs(folder.path(), path)).unwrap();
@@ -1278,6 +1279,31 @@ fn a_theirs_that_cant_be_written_is_an_error_and_sync_carries_on() {
         assert_eq!(written, "theirs\n", "{backend}");
         let run = run_in("commit", folder.path(), &[]).expect_code(3);
         assert!(run.stderr.contains("app.toml"), "{backend}: {run:?}");
+    }
+}
+
+#[test]
+fn the_sweep_leaves_a_directory_where_a_diverged_paths_theirs_goes() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        synced(&location, "config", folder.path());
+        let in_the_way = theirs(folder.path(), "app.toml");
+        fs::create_dir_all(&in_the_way).unwrap();
+        fs::write(in_the_way.join("precious"), "precious\n").unwrap();
+        fs::write(folder.path().join("app.toml"), "mine\n").unwrap();
+        location.write("config", "app.toml", "theirs\n");
+
+        // Starting, `sync` reconciles every Path, then sweeps stale `theirs` files.
+        let mut sync = Sync::start(&location, "config", folder.path());
+        let events = sync.wait_for("caught-up");
+        sync.stop();
+        let message = message_for(&events, "app.toml");
+        assert!(message.contains("can't write .tidings/theirs/app.toml"), "{backend}: {events:?}");
+        let precious = fs::read_to_string(in_the_way.join("precious")).unwrap();
+        assert_eq!(precious, "precious\n", "{backend}");
+        let local = fs::read_to_string(folder.path().join("app.toml")).unwrap();
+        assert_eq!(local, "mine\n", "{backend}");
     }
 }
 
@@ -2561,7 +2587,7 @@ fn resolve_after_the_store_changed_again_still_conflicts() {
 }
 
 #[test]
-fn resolve_after_the_store_changed_again_takes_the_contents_of_theirs_as_the_bases() {
+fn resolve_after_the_store_changed_again_takes_the_contents_merged_against_as_the_bases() {
     for backend in BACKENDS {
         let location = store_with_config(backend);
         let folder = TempDir::new().unwrap();
@@ -2590,6 +2616,40 @@ fn resolve_after_the_store_changed_again_takes_the_contents_of_theirs_as_the_bas
         sync.stop();
         let local = fs::read_to_string(folder.path().join("app.toml")).unwrap();
         assert_eq!(local, "theirs 2\n", "{backend}");
+    }
+}
+
+#[test]
+fn a_merge_made_in_theirs_after_the_store_changed_again_isnt_overwritten() {
+    for backend in BACKENDS {
+        let location = store_with_config(backend);
+        let folder = TempDir::new().unwrap();
+        let mut sync = Sync::start(&location, "config", folder.path());
+        sync.wait_for("caught-up");
+        fs::write(folder.path().join("app.toml"), "mine\n").unwrap();
+        location.write("config", "app.toml", "theirs 1\n");
+        sync.wait_for("diverged");
+        sync.stop();
+        // Changed again while `sync` isn't running, so the Store no longer holds what `theirs`
+        // does.
+        location.write("config", "app.toml", "theirs 2\n");
+
+        // The person merges in `theirs` itself, and copies the merge into place.
+        let theirs_file = theirs(folder.path(), "app.toml");
+        fs::write(&theirs_file, "merged\n").unwrap();
+        fs::copy(&theirs_file, folder.path().join("app.toml")).unwrap();
+        run_in("resolve", folder.path(), &["app.toml"]).expect_success();
+        let run = run_in("status", folder.path(), &[]).expect_success();
+        assert!(run.stdout.starts_with("modified app.toml\n"), "{backend}: {run:?}");
+
+        // So `sync` doesn't take the merge for an unchanged file and put the Store's File over it.
+        let mut sync = Sync::start(&location, "config", folder.path());
+        let events = sync.wait_for("caught-up");
+        sync.stop();
+        assert!(paths(&events, "updated").is_empty(), "{backend}: {events:?}");
+        assert_eq!(paths(&events, "diverged"), ["app.toml"], "{backend}: {events:?}");
+        let local = fs::read_to_string(folder.path().join("app.toml")).unwrap();
+        assert_eq!(local, "merged\n", "{backend}");
     }
 }
 

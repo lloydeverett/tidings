@@ -368,7 +368,7 @@ fn settled_json(key: &str, settled: impl Iterator<Item = Value>, events: &[SyncE
 /// What `discard` says about one Path, as in "discarded a: took the Store's version".
 fn discarded_parts(discarded: &Discarded) -> EventParts<'_> {
     let message = match discarded.outcome {
-        DiscardOutcome::TookStoresVersion(_) => "took the Store's version",
+        DiscardOutcome::TookStoresFile(_) => "took the Store's version",
         DiscardOutcome::Removed => "removed, since the Store has no File there",
         DiscardOutcome::Absent => "the Store has no File there either",
     };
@@ -456,10 +456,7 @@ fn as_json(report: &Report) -> Option<Value> {
         }),
         Report::WorkingCopyDiscard(report) => {
             let discarded = report.discarded.iter().map(|discarded| {
-                let revision = match discarded.outcome {
-                    DiscardOutcome::TookStoresVersion(revision) => Some(revision.to_string()),
-                    DiscardOutcome::Removed | DiscardOutcome::Absent => None,
-                };
+                let revision = discarded.outcome.revision().map(|revision| revision.to_string());
                 json!({
                     "path": discarded.path.as_str(),
                     "change": discarded_change_name(discarded.change),

@@ -255,7 +255,7 @@ impl Selection {
         &self,
         scan: &Scan,
         record: &Record,
-        command: Naming,
+        command: NamingCommand,
     ) -> Result<(), Failure> {
         let Selection::Named(named) = self else { return Ok(()) };
         let paths = scan.files.keys().chain(record.bases.keys()).chain(record.divergences.keys());
@@ -285,19 +285,21 @@ impl Selection {
     }
 }
 
-/// Which command named the paths a [`Selection`] checks.
+/// The command that named the paths a [`Selection`] checks.
 #[derive(Debug, Clone, Copy)]
-enum Naming {
+enum NamingCommand {
+    /// `commit`.
     Commit,
+    /// `discard`.
     Discard,
 }
 
-impl Naming {
+impl NamingCommand {
     /// The command's name, as a verb.
     fn verb(self) -> &'static str {
         match self {
-            Naming::Commit => "commit",
-            Naming::Discard => "discard",
+            NamingCommand::Commit => "commit",
+            NamingCommand::Discard => "discard",
         }
     }
 }
@@ -626,7 +628,7 @@ impl WorkingCopy {
     ) -> Result<Vec<SyncEvent>, Failure> {
         let mut lock = self.lock()?;
         let record = &mut lock.record;
-        let everything = matches!(paths, Paths::All);
+        let all_paths = matches!(paths, Paths::All);
         let mut paths = match paths {
             Paths::All => {
                 let mut paths: BTreeSet<Path> =
@@ -642,7 +644,7 @@ impl WorkingCopy {
         paths.extend(record.divergences.keys().cloned());
         paths.extend(theirs_failures.iter().cloned());
         let mut events = self.reconcile_paths(store, record, paths, theirs_failures).await?;
-        if everything {
+        if all_paths {
             // Reported once while `sync` runs, as a `theirs` file reconciling couldn't remove is.
             for event in self.remove_stale_theirs(record) {
                 if event.path().is_some_and(|path| theirs_failures.insert(path.clone())) {
@@ -681,9 +683,12 @@ impl WorkingCopy {
         }
         let mut events = Vec::new();
         for (path, store_file) in removed.into_iter().chain(written) {
-            let divergence = record.divergences.get(&path).copied();
+            let theirs_revision =
+                |record: &Record| record.divergences.get(&path).map(Divergence::theirs_revision);
+            let before = theirs_revision(record);
             let event = self.reconcile_path(record, &path, store_file.as_ref())?;
-            let changed = record.divergences.get(&path) != divergence.as_ref();
+            // Not when only a hash was recorded, which leaves `theirs` as it is.
+            let changed = theirs_revision(record) != before;
             let retrying = theirs_failures.remove(&path);
             // The Store's version for `theirs` to hold, if the Path is Diverged.
             let theirs = store_file.as_ref().filter(|_| record.divergences.contains_key(&path));
@@ -878,9 +883,10 @@ impl WorkingCopy {
 
     /// Removes each file in `.tidings/theirs/` whose name is a Path that isn't Diverged in
     /// `record`, and each directory there left empty, so that a `theirs` file that once couldn't
-    /// be removed doesn't stay for good. No symlink is followed, but removed like a file, and
-    /// nothing outside `.tidings/theirs/` is touched. A file whose name isn't a Path was never a
-    /// `theirs` file, so it is left alone. Gives the error event for each file or directory it
+    /// be removed doesn't stay for good. Nothing where a Diverged Path's `theirs` file goes is
+    /// removed or looked into, even a directory. No symlink is followed, but removed like a file,
+    /// and nothing outside `.tidings/theirs/` is touched. A file whose name isn't a Path was never
+    /// a `theirs` file, so it is left alone. Gives the error event for each file or directory it
     /// couldn't remove, or read, whose name is a Path.
     fn remove_stale_theirs(&self, record: &Record) -> Vec<SyncEvent> {
         let top = self.folder.join(RECORD_DIRECTORY).join(THEIRS_DIRECTORY);
@@ -943,7 +949,7 @@ impl WorkingCopy {
         let selection = self.select(named, current)?;
         refuse_diverged(&lock.record, &selection)?;
         let scan = scan::scan(&self.folder, &lock.record.bases)?;
-        selection.check_each_names_something(&scan, &lock.record, Naming::Commit)?;
+        selection.check_each_names_something(&scan, &lock.record, NamingCommand::Commit)?;
         refuse_invalid(&scan.invalid, &selection)?;
         let (staging, changes) = self.stage(&scan, &selection)?;
         let files = scan.files;
@@ -1051,10 +1057,10 @@ impl WorkingCopy {
         match result {
             Ok(committed) => {
                 for (path, _) in changes {
-                    let committed = committed.revisions().get(path).zip(files.get(path));
+                    let revision = committed.revisions().get(path).zip(files.get(path));
                     record.set_base(
                         path,
-                        committed.map(|(&revision, contents)| Base::of(revision, contents)),
+                        revision.map(|(&revision, contents)| Base::of(revision, contents)),
                     );
                 }
                 Ok(CommitOutcome::Committed)
@@ -1242,6 +1248,12 @@ fn remove_stale_theirs_in(top: &FsPath, name: &str, record: &Record, events: &mu
         // Nothing under a name that isn't UTF-8 can be a Path.
         let Some(part) = entry.file_name().to_str().map(str::to_owned) else { continue };
         let child = if name.is_empty() { part } else { format!("{name}/{part}") };
+        let diverged = Path::new(&child).is_ok_and(|path| record.divergences.contains_key(&path));
+        if diverged {
+            // Where the Diverged Path's `theirs` file goes: whatever is there is left alone, even
+            // a directory, which the person may have put there.
+            continue;
+        }
         let is_dir = match entry.file_type() {
             Ok(file_type) => file_type.is_dir(),
             Err(error) => {
@@ -1256,7 +1268,7 @@ fn remove_stale_theirs_in(top: &FsPath, name: &str, record: &Record, events: &mu
                 Err(error) if error.kind() == ErrorKind::DirectoryNotEmpty => {}
                 Err(error) => events.extend(failed(&child, "remove", error)),
             }
-        } else if Path::new(&child).is_ok_and(|path| !record.divergences.contains_key(&path))
+        } else if Path::new(&child).is_ok()
             && let Err(error) = fs::remove_file(entry.path())
         {
             events.extend(failed(&child, "remove", error));
@@ -1289,17 +1301,20 @@ fn resolve(record: &mut Record, path: &Path) -> Option<SyncEvent> {
     record.divergences.remove(path).map(|_| SyncEvent::Resolved(path.clone()))
 }
 
-/// Marks `path` Diverged in `record`, with `store_file` as the Store's version, giving the event
-/// reporting it, unless it was Diverged with that Revision already. `blocked` says what in the
-/// folder kept `store_file` from being applied, if anything. The Base stays as it is.
+/// Marks `path` Diverged in `record`, with `store_file` as the Store's File in `theirs`, and the
+/// hash of its contents, giving the event reporting it, unless it was Diverged with that Revision
+/// already. `blocked` says what in the folder kept `store_file` from being applied, if anything.
+/// The Base stays as it is.
 fn diverge(
     record: &mut Record,
     path: &Path,
     store_file: Option<&File>,
     blocked: Option<Blocked>,
 ) -> Option<SyncEvent> {
-    let divergence = Divergence { theirs_revision: store_file.map(File::revision) };
-    if record.divergences.insert(path.clone(), divergence) == Some(divergence) {
+    let divergence = Divergence { theirs: store_file.map(Base::of_file) };
+    // Always recorded, so that one read from a version-1 record gains its hash.
+    let was = record.divergences.insert(path.clone(), divergence);
+    if was.map(|was| was.theirs_revision()) == Some(divergence.theirs_revision()) {
         return None;
     }
     let theirs_file = store_file.map(|_| theirs_file(path));
@@ -1322,7 +1337,7 @@ fn diverged_paths(record: &Record, selection: &Selection) -> Vec<DivergedPath> {
         .filter(|(path, _)| selection.covers(path.as_str()))
         .map(|(path, divergence)| DivergedPath {
             path: path.clone(),
-            theirs_file: divergence.theirs_revision.map(|_| theirs_file(path)),
+            theirs_file: divergence.theirs.map(|_| theirs_file(path)),
             blocked: None,
         })
         .collect()

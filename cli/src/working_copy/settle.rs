@@ -3,7 +3,6 @@
 //! against the Store's version in `theirs`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::{Path as FsPath, PathBuf};
 
 use tidings::{File, Path, Revision, Store};
@@ -11,8 +10,8 @@ use tidings::{File, Path, Revision, Store};
 use super::record::{Base, Record};
 use super::scan::{self, Scan};
 use super::{
-    Blocked, Local, LocalChange, NamedPath, Naming, RECORD_DIRECTORY, Selection, SyncEvent, Target,
-    WorkingCopy, blocking_directory, theirs_file,
+    Blocked, Local, LocalChange, NamedPath, NamingCommand, Selection, SyncEvent, Target,
+    WorkingCopy,
 };
 use crate::failure::Failure;
 
@@ -40,12 +39,22 @@ pub struct Discarded {
 /// What the folder holds at a Path `discard` threw a local change away at.
 #[derive(Debug, Clone, Copy)]
 pub enum DiscardOutcome {
-    /// The Store's version, of this Revision, which is the new Base.
-    TookStoresVersion(Revision),
+    /// The Store's File, of this Revision, which is the new Base.
+    TookStoresFile(Revision),
     /// Nothing, since the Store has no File there: the local file was removed.
     Removed,
     /// Nothing, as the Store has no File there either.
     Absent,
+}
+
+impl DiscardOutcome {
+    /// The Revision of the Store's File the folder now holds, the new Base, if it holds one.
+    pub fn revision(self) -> Option<Revision> {
+        match self {
+            DiscardOutcome::TookStoresFile(revision) => Some(revision),
+            DiscardOutcome::Removed | DiscardOutcome::Absent => None,
+        }
+    }
 }
 
 /// What `discard` threw away at a Path.
@@ -115,7 +124,7 @@ impl WorkingCopy {
         let selection = self.select(named, current)?;
         let chosen = {
             let scan = scan::scan(&self.folder, &lock.record.bases)?;
-            selection.check_each_names_something(&scan, &lock.record, Naming::Discard)?;
+            selection.check_each_names_something(&scan, &lock.record, NamingCommand::Discard)?;
             refuse_unfit_names(&scan, &selection)?;
             discardable(&scan, &lock.record, &selection)
         };
@@ -141,7 +150,7 @@ impl WorkingCopy {
         let mut report = DiscardReport { discarded: Vec::new(), events: Vec::new() };
         for Discarding { path, change, store_file, local } in discarding {
             let outcome = match &store_file {
-                Some(file) => DiscardOutcome::TookStoresVersion(file.revision()),
+                Some(file) => DiscardOutcome::TookStoresFile(file.revision()),
                 None if matches!(local, Local::File(_) | Local::Other) => DiscardOutcome::Removed,
                 None => DiscardOutcome::Absent,
             };
@@ -209,13 +218,14 @@ impl WorkingCopy {
         let mut report = ResolveReport { resolved: Vec::new(), events: Vec::new() };
         for path in paths {
             let Some(divergence) = record.divergences.remove(&path) else { continue };
-            let revision = divergence.theirs_revision;
-            let base = match revision {
-                Some(revision) => Some(self.base_of(store, &path, revision).await?),
-                None => None,
+            let base = match divergence.theirs {
+                Some(Base { revision, hash: None }) => {
+                    Some(self.base_of(store, &path, revision).await?)
+                }
+                theirs => theirs,
             };
             record.set_base(&path, base);
-            report.resolved.push(Resolved { path, revision });
+            report.resolved.push(Resolved { path, revision: divergence.theirs_revision() });
         }
         report.events = self.remove_stale_theirs(record);
         self.save(record)?;
@@ -223,14 +233,11 @@ impl WorkingCopy {
     }
 
     /// The Base of the Diverged `path` at `revision`, the Revision recorded for its `theirs` file,
-    /// with the hash of its contents: those the Store holds, if it is still at `revision`, or else
-    /// those of the `theirs` file, which `sync` writes whenever it records a new Revision for it.
-    /// (Only a crash between the two, or the person editing it, leaves it holding other contents,
-    /// and then a local file holding them counts as unchanged since a Base that is older than they
-    /// are, so the Store's version is put over it, which loses nothing it doesn't have.) If there
-    /// is no `theirs` file either, the contents aren't known, so any local file counts as changed
-    /// since the Base: were it taken as unchanged, `sync` would put the Store's newer version over
-    /// it.
+    /// when the hash of its contents wasn't recorded with it, as for a Divergence read from a
+    /// version-1 record: the hash of those the Store holds, if it is still at `revision`. The
+    /// `theirs` file's contents are never taken, since the person may have merged in it. Otherwise
+    /// the contents aren't known, so any local file counts as changed since the Base: were it
+    /// taken as unchanged, `sync` would put the Store's newer File over it.
     async fn base_of(
         &self,
         store: &Store,
@@ -238,26 +245,10 @@ impl WorkingCopy {
         revision: Revision,
     ) -> Result<Base, Failure> {
         let store_file = store.read(self.area, path).await?;
-        let contents = match store_file.filter(|file| file.revision() == revision) {
-            Some(file) => Some(file.contents().to_owned()),
-            None => self.read_theirs(path),
-        };
-        Ok(match contents {
-            Some(contents) => Base::of(revision, &contents),
+        Ok(match store_file.filter(|file| file.revision() == revision) {
+            Some(file) => Base::of_file(&file),
             None => Base { revision, hash: None },
         })
-    }
-
-    /// What `path`'s `theirs` file holds, if it is a regular file holding text, reached through no
-    /// symlink.
-    fn read_theirs(&self, path: &Path) -> Option<String> {
-        let at = self.folder.join(theirs_file(path));
-        let blocked = blocking_directory(&self.folder.join(RECORD_DIRECTORY), &at).ok()?;
-        let is_file = fs::symlink_metadata(&at).is_ok_and(|metadata| metadata.is_file());
-        if blocked.is_some() || !is_file {
-            return None;
-        }
-        fs::read_to_string(&at).ok()
     }
 }
 
