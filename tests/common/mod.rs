@@ -25,9 +25,16 @@ impl Feed for ChangeFeed {
     }
 }
 
-/// Waits for the next item on the Change feed, failing the test if none arrives in time.
+/// How long to wait for something the Change feed should send before failing the test. Long, so
+/// that a test fails only when it never comes: on a busy machine the platform's watcher can take
+/// seconds to deliver events, or to watch a directory again. A test that passes doesn't wait it
+/// out.
+const ARRIVAL: Duration = Duration::from_secs(60);
+
+/// Waits for the next item on the Change feed, failing the test if none arrives within
+/// [`ARRIVAL`].
 pub async fn next_item(feed: &mut impl Feed) -> FeedItem {
-    feed.next_within(Duration::from_secs(5))
+    feed.next_within(ARRIVAL)
         .await
         .expect("the Change feed should have sent something by now")
         .expect("the Change feed should not have ended")
@@ -79,7 +86,7 @@ pub async fn assert_nothing_more(feed: &mut impl Feed) {
 pub async fn assert_ended(feed: &mut impl Feed) {
     for _ in 0..2 {
         let item = feed
-            .next_within(Duration::from_secs(5))
+            .next_within(ARRIVAL)
             .await
             .expect("the Change feed should have ended by now");
         assert_eq!(item, None);
