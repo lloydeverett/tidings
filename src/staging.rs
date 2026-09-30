@@ -240,6 +240,15 @@ impl Staged {
         }
     }
 
+    /// Each Path the Staging writes or deletes, and each Prefix other than the empty one it
+    /// deletes, as given: where a Commit changes something on disk.
+    #[cfg(feature = "fs")]
+    pub(crate) fn changed_names(&self) -> impl Iterator<Item = &str> {
+        let paths = self.actions.keys().map(Path::as_str);
+        let prefixes = self.prefix_deletes.iter().map(Prefix::as_str);
+        paths.chain(prefixes.filter(|prefix| !prefix.is_empty()))
+    }
+
     /// Turns the Prefix deletes into deletes of the Paths under them in `current`, the Store as it
     /// is when the Commit runs: the second step of
     /// [`CommitRequest::plan`](crate::backend::CommitRequest::plan). A Path staged after the Prefix

@@ -228,6 +228,11 @@ pub enum InvalidPathReason {
     /// symlink to a directory is left out of the Store, with everything under it, so nothing is
     /// written through one.
     DirectoryLink,
+    /// A filesystem Commit would write or delete a Path that is, or is under, a directory holding
+    /// a `.tidings/` directory, as another Store's Location and a Working copy do, or would delete
+    /// such a directory as a Prefix. Such a directory is left out of the Store, with everything
+    /// under it, so that two Stores, or a Store and a Working copy, never claim the same files.
+    Nested,
 }
 
 impl fmt::Display for InvalidPathReason {
@@ -256,6 +261,10 @@ impl fmt::Display for InvalidPathReason {
             }
             InvalidPathReason::DirectoryLink => {
                 "it is, or is under, a symlink to a directory, which is left out of the Store"
+            }
+            InvalidPathReason::Nested => {
+                "it is, or is under, a directory holding `.tidings/`, another Store's Location or a \
+                 Working copy, which is left out of the Store"
             }
         })
     }

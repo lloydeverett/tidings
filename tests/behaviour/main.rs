@@ -1394,6 +1394,75 @@ mod fs {
         assert_eq!(prefix_revisions().await, before);
     }
 
+    /// A Commit that writes or deletes under a directory holding another Store or a Working copy,
+    /// or writes or deletes that directory itself, is refused as an invalid Path before anything
+    /// is written. A Prefix delete above one leaves it alone.
+    #[tokio::test]
+    async fn a_commit_under_a_directory_holding_another_store_is_refused() {
+        let fixture = Fs::new();
+        let (inner, _inner_feed) =
+            tidings::Store::open_fs(fixture.on_disk("inner"), fixture.usual_options())
+                .await
+                .unwrap();
+        let mut staging = Staging::new();
+        staging.write("a.txt", "a").unwrap();
+        inner.commit(staging).await.unwrap();
+        std::fs::create_dir_all(fixture.on_disk("copy/.tidings")).unwrap();
+        fixture.write_directly("copy/b.txt", "b");
+        let Opened { store, feed: _feed } = fixture.open().await;
+
+        type Stage = fn(&mut Staging);
+        let refused: [(&str, Stage); 8] = [
+            ("inner/new.txt", |staging| {
+                staging.write("inner/new.txt", "new").unwrap();
+            }),
+            ("inner/a.txt", |staging| {
+                staging.write("inner/a.txt", "new").unwrap();
+            }),
+            ("inner", |staging| {
+                staging.write("inner", "new").unwrap();
+            }),
+            ("copy/deeper/c.txt", |staging| {
+                staging.write("copy/deeper/c.txt", "c").unwrap();
+            }),
+            ("inner/a.txt", |staging| {
+                staging.delete("inner/a.txt").unwrap();
+            }),
+            ("copy/b.txt", |staging| {
+                staging.delete("copy/b.txt").unwrap();
+            }),
+            ("inner/", |staging| {
+                staging.delete_prefix("inner/").unwrap();
+            }),
+            ("copy/", |staging| {
+                staging.delete_prefix("copy/").unwrap();
+            }),
+        ];
+        for (refused_path, stage) in refused {
+            let mut staging = Staging::new();
+            staging.write("kept.txt", "kept").unwrap();
+            stage(&mut staging);
+            match store.commit(staging).await {
+                Err(Error::InvalidPath { path, reason: InvalidPathReason::Nested }) => {
+                    assert_eq!(path, refused_path);
+                }
+                other => panic!("a Commit to {refused_path} should be refused, got {other:?}"),
+            }
+        }
+        assert_eq!(list(&store).await, Vec::<String>::new());
+        assert_eq!(inner.list("").await.unwrap(), [tidings::Path::new("a.txt").unwrap()]);
+        assert_eq!(inner.read("a.txt").await.unwrap().unwrap().contents(), "a");
+        assert_eq!(std::fs::read_to_string(fixture.on_disk("copy/b.txt")).unwrap(), "b");
+        assert!(!fixture.on_disk("copy/deeper").exists());
+        assert_eq!(temporary_files(fixture.directory.path()), Vec::<PathBuf>::new());
+
+        let mut staging = Staging::new();
+        staging.delete_prefix("").unwrap();
+        store.commit(staging).await.unwrap();
+        assert_eq!(inner.list("").await.unwrap(), [tidings::Path::new("a.txt").unwrap()]);
+        assert_eq!(std::fs::read_to_string(fixture.on_disk("copy/b.txt")).unwrap(), "b");
+    }
+
     /// The Location can itself be a symlink to a directory, as when a person keeps an app's config
     /// in a dotfiles repo. It is followed once, when the Store opens.
     #[cfg(unix)]

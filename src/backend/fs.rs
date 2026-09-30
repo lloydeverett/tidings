@@ -629,6 +629,7 @@ impl Location {
                 error,
             }));
         }
+        self.refuse_nested(&request)?;
         let timestamp = request.timestamp;
         let plan = request.plan(self)?;
         // Nothing is changed here yet: the journal is made from what the Plan changes, and then
@@ -714,6 +715,20 @@ impl Location {
                 Ok(CommitOutcome { pending: true, ..outcome })
             }
         }
+    }
+
+    /// Gives [`Nested`](InvalidPathReason::Nested) for the first Path `request` writes or deletes,
+    /// or Prefix it deletes, that is or is under a directory holding a `.tidings/`. It comes
+    /// before the checks every Backend shares, as a Path that is invalid anywhere would.
+    fn refuse_nested(&self, request: &CommitRequest) -> Result<()> {
+        for given in request.staged.changed_names() {
+            let name = given.strip_suffix('/').unwrap_or(given);
+            if self.left_out(name)? == Some(LeftOut::Nested) {
+                let reason = InvalidPathReason::Nested;
+                return Err(Error::InvalidPath { path: given.to_owned(), reason });
+            }
+        }
+        Ok(())
     }
 
     /// Writes `journal` as `committed`. If that fails, the journal on disk is either as it was or
