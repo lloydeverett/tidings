@@ -22,9 +22,9 @@
 //! reports without the Files in it. Names that aren't Paths are dropped, which drops `.tidings/`
 //! and tidings' temporary files too. But a name in the `.tidings/` of a directory in the Location
 //! has that directory looked at as a whole, as one removed is: it may have just become another
-//! Store's Location, and left the Store, so that each File reported under it is
-//! reported removed. Events under such a directory give nothing, since reads through tidings don't
-//! find what is there. The Files of a Commit left in the journal, which gave `Pending` or was
+//! Store's Location, and left the Store, so that each File reported under it is reported removed.
+//! Events under such a directory give nothing, since reads through tidings don't find what is
+//! there. The Files of a Commit left in the journal, which gave `Pending` or was
 //! interrupted, are looked at once the journal's own events have settled, since reads show them
 //! finished before any event for them may come. (An ordinary Commit's journal is made and removed
 //! within the window, so the debouncer drops its events. Looking at a Commit's Files any sooner
@@ -958,8 +958,8 @@ impl Watched {
 
 /// The directory holding the `.tidings` that `name`, a name in the Location, is or is under, if
 /// that isn't the Location's own: an event there can mean that it has just become another Store's
-/// Location, and so left the Store, or has stopped being one. So the directory is
-/// looked at as a whole, as one removed or moved in is.
+/// Location, and so left the Store, or has stopped being one. So the directory is looked at as a
+/// whole, as one removed or moved in is.
 fn directory_holding_tidings_in(name: &str) -> Option<Path> {
     let segments: Vec<&str> = name.split('/').collect();
     let at = segments.iter().position(|segment| is_reserved(segment))?;

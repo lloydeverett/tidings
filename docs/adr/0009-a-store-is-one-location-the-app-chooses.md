@@ -31,9 +31,10 @@ Area anyway. So splitting them loses no guarantee. What changes:
   Working copy's: the CLI refuses `--store` naming one, and `sync` refuses to make a Working copy
   at its Store's Location, each before anything is made. A program using the library directly
   could open a Store at a Working copy's folder, but has no reason to know Working copies exist.
-- A directory in a Location that holds `.tidings/` belongs to another Store, or to a Working copy,
-  and is outside this one, like a symlinked directory: not listed or watched, and a write under it
-  is an invalid Path. So `.tidings` is reserved at any depth of a Path, not only as its first name.
+- A directory in a Location that holds `.tidings/` belongs to another Store, or to something else
+  such as a Working copy, and is outside this one, like a symlinked directory: not listed or
+  watched, and a write under it is an invalid Path. So `.tidings` is reserved at any depth of a
+  Path, not only as its first name.
   The same Location opened twice, on the same Backend, is allowed: the two Stores see each other's
   Commits as external, as two processes do.
 - A Staging no longer knows its Store until it is committed, so a Prefix Revision carries the

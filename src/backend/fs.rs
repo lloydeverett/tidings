@@ -30,9 +30,9 @@
 //!
 //! **Other Stores.** A directory in the Location that holds a `.tidings/` directory, as another
 //! Store's Location does, is left out, with everything under it, as a symlink to a directory is:
-//! so two Stores never claim the same files. A Commit that would write or delete under one is refused with
-//! [`Nested`](InvalidPathReason::Nested), and finishing a Commit never writes or deletes under one
-//! made since. One made while the Store is open drops out of it: see [`watch`].
+//! so two Stores never claim the same files. A Commit that would write or delete under one is
+//! refused with [`Nested`](InvalidPathReason::Nested), and finishing a Commit never writes or
+//! deletes under one made since. One made while the Store is open drops out of it: see [`watch`].
 //!
 //! **Exact names.** A Path names only the file on disk with exactly its name. Some filesystems
 //! (macOS's and Windows' by default) also find `Foo` when asked for `foo`. Opening a Store finds

@@ -1725,8 +1725,8 @@ fn sync_into_the_stores_own_location_is_refused() {
     }
 }
 
-/// A Working copy's folder can't be a Store's Location either: a `store` command pointed at one
-/// fails and changes nothing, even with `--create`.
+/// A Working copy's folder can't be a Store's Location either: a `store` command, or a `sync` of
+/// a new Working copy, pointed at one fails and changes nothing, even with `--create`.
 #[test]
 fn a_working_copys_folder_is_refused_as_a_stores_location() {
     for backend in BACKENDS {
@@ -1740,6 +1740,16 @@ fn a_working_copys_folder_is_refused_as_a_stores_location() {
         let run = common::run(command, "").expect_code(1);
         assert!(run.stderr.contains("is a Working copy's folder"), "{backend}: {run:?}");
         assert_eq!(names_under(folder.path()), before, "{backend}");
+
+        let other = TempDir::new().unwrap();
+        let new_folder = other.path().join("new");
+        let mut command = tidings();
+        command.arg("--store").arg(folder.path()).args(["--backend", backend, "--create"]);
+        command.arg("sync").arg(&new_folder);
+        let run = common::run(command, "").expect_code(1);
+        assert!(run.stderr.contains("is a Working copy's folder"), "{backend}: {run:?}");
+        assert_eq!(names_under(folder.path()), before, "{backend}");
+        assert!(!new_folder.exists(), "{backend}: made the new folder");
     }
 }
 

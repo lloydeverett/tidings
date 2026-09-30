@@ -286,3 +286,75 @@ itself).
    decision as built, and the dev-dependency doesn't reach crates that depend on tidings.
 
 `cargo fmt`, clippy, `cargo doc` with warnings denied and the doctests (now two) pass.
+
+---
+
+## Follow-up: the Working copy folder refusal moves to the CLI
+
+Ticket 02 had the library refuse a Location that is a Working copy's folder, with
+`Error::LocationIsWorkingCopy`. To do that it knew the CLI's record, `.tidings/working-copy`, by
+name, which leaks a CLI concept into the library. The CLI now refuses `--store` naming a Working
+copy's folder, the error is gone, and the library's docs, messages and tests no longer mention
+Working copies.
+
+Reviewed: `git diff 62fc326...1ad4277` (commit 1ad4277). The spec was the request "move the check
+into the CLI, and make sure the library has no knowledge about things that are CLI-layer only",
+with ADR 0009 and spec 0003.
+
+### Standards
+
+- **Hard violations (wrapping):**
+  - Four comment lines ran past 100 columns: src/backend/fs.rs:33, src/path.rs:47,
+    src/path.rs:116 and tests/behaviour/main.rs:1506.
+  - Two paragraphs in src/backend/fs/watch.rs were left with short lines.
+- **Glossary drift (judgement call):** CONTEXT.md's Location entry still says a Location can't be
+  a Working copy's folder, without saying which layer enforces it.
+- **Smells (judgement calls):**
+  - `StoreArgs::address`'s doc comment: "but never makes one" now hangs off the "since" clause.
+  - Possible Shotgun Surgery: the two refusals that keep a Store and a Working copy apart are in
+    separate places, `sync` in working_copy.rs and `StoreArgs::address` in location.rs.
+  - Possible Mysterious Name: the fixtures' "bare" directory, and test names like
+    `..._or_a_tidings_directory_is_refused`, which say "a directory holding `.tidings/`" twice.
+- **Leftovers:** none. src/ and tests/ don't mention Working copies or the `tidings` command.
+
+### Spec
+
+- **(a) Missing or partial:**
+  - CONTEXT.md isn't in the diff.
+  - Spec story 28 still names Working copies from an app developer's view.
+  - Only `store list --create` tests the new CLI check. `sync --create` and `store shell` aren't
+    tested, though all three go through the same function.
+- **(b) Scope creep:** none.
+- **(c) Wrong:**
+  - ADR 0009's third bullet still said a directory holding `.tidings/` "belongs to another Store,
+    or to a Working copy", which sits badly with the new wording that the library doesn't know
+    what made it.
+  - Coverage is otherwise right: every CLI path from `--store` goes through the check, before
+    anything is made.
+
+### Summary
+
+Standards: 6 wrapping violations, 1 glossary drift and 3 judgement-call smells (worst: the
+wrapping). Spec: 3 partial and 1 inconsistent (worst: `sync --create` isn't tested against a
+Working copy's folder).
+
+### Resolution
+
+1. **Wrapping:** fixed.
+2. **`address`'s doc comment:** fixed, by splitting the sentence.
+3. **CLI tests:** `sync --create` of a new Working copy with `--store` naming a Working copy's
+   folder is now tested, and the new folder is checked not to have been made. `store shell` isn't
+   tested separately: it opens the Store through the same `StoreArgs::open` as `store list`.
+4. **ADR 0009's third bullet:** fixed. It now says "another Store, or … something else such as a
+   Working copy".
+5. **CONTEXT.md:** not changed. It is the whole project's glossary, CLI included, and has no
+   implementation details. So the rule stays true there, and which layer enforces it belongs in
+   the ADR, which now says so.
+6. **Spec story 28:** not changed. It asks for opening a Store *inside* a Working copy to be
+   refused, which the library still does through its generic rule for `.tidings/` directories. The
+   spec's decisions now say that the CLI refuses a Working copy's folder itself.
+7. **The two CLI refusals in separate places:** not changed. Each sits where its command's other
+   checks are, and each is one line calling a shared helper (`same_directory` and
+   `WorkingCopy::exists`).
+8. **"bare" and the test names:** not changed. The doc comments explain them, and the names
+   contrast the two cases each test loops over.

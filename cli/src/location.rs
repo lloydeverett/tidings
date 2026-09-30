@@ -146,9 +146,9 @@ impl StoreArgs {
     }
 
     /// The Location of the Store the flags choose, which isn't one in memory, and its Backend: the
-    /// one `--backend` names, or the one found there. Fails if there is no Store there and
-    /// `--create` is left out, or if the Location is a Working copy's folder, since the Store's
-    /// files would mix with the Working copy's, but never makes one.
+    /// one `--backend` names, or the one found there. Never makes one. Fails if there is no Store
+    /// there and `--create` is left out, or if the Location is a Working copy's folder, since the
+    /// Store's files would mix with the Working copy's.
     async fn address(&self) -> Result<StoreAddress, Failure> {
         let location = self.location()?;
         if WorkingCopy::exists(&location) {

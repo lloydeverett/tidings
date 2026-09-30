@@ -1503,8 +1503,8 @@ mod fs {
     }
 
     /// A Commit that writes or deletes under a directory holding a `.tidings/`, as another Store's
-    /// Location does, or writes or deletes that directory itself, is refused as an invalid Path before anything
-    /// is written. A Prefix delete above one leaves it alone.
+    /// Location does, or writes or deletes that directory itself, is refused as an invalid Path
+    /// before anything is written. A Prefix delete above one leaves it alone.
     #[tokio::test]
     async fn a_commit_under_a_directory_holding_another_store_is_refused() {
         let fixture = Fs::new();
