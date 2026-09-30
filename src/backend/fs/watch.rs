@@ -20,7 +20,11 @@
 //! compared with the Files reported under it, since the directory's own events are all there may
 //! be: one made or moved in with Files in it before its watch was added, or one removed, which the
 //! debouncer reports without the Files in it. Names that aren't Paths are dropped, which drops
-//! `.tidings/` and tidings' temporary files too. The Files of a Commit left in the journal, which
+//! `.tidings/` and tidings' temporary files too. But a name in the `.tidings/` of a directory in
+//! the Location has that directory looked at as a whole, as one removed is: it may have just become
+//! another Store's Location or a Working copy, and left the Store, so that each File reported under
+//! it is reported removed. Events under such a directory give nothing, since reads through tidings
+//! don't find what is there. The Files of a Commit left in the journal, which
 //! gave `Pending` or was interrupted, are looked at once the journal's own events have settled,
 //! since reads show them finished before any event for them may come. (An ordinary Commit's
 //! journal is made and removed within the window, so the debouncer drops its events. Looking at a
@@ -97,7 +101,7 @@ use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use super::Location;
 use super::journal::AsFinished;
 use crate::backend::{CommitOutcome, Observed, RawChange, off_runtime};
-use crate::path::{is_temporary_file_name, range_under};
+use crate::path::{RESERVED, is_temporary_file_name, letter_case_fold, range_under};
 use crate::{ChangeKind, Error, Origin, Path, Prefix, Result, Revision};
 
 /// The journal, in the Location.
@@ -867,7 +871,14 @@ impl Watched {
                 seen.names.insert(path);
             }
             _ if name.as_deref() == Some(JOURNAL) => seen.journal = true,
-            _ => tracing::debug!("dropped an event for {}, which is no Path", path.display()),
+            _ => match name.as_deref().and_then(holding_tidings) {
+                Some(holding) => {
+                    seen.names.insert(holding);
+                }
+                None => {
+                    tracing::debug!("dropped an event for {}, which is no Path", path.display())
+                }
+            },
         }
     }
 
@@ -944,6 +955,16 @@ impl Watched {
         }
         first_error
     }
+}
+
+/// The directory holding the `.tidings` that `name`, a name in the Location, is or is under, if
+/// that isn't the Location's own: an event there can mean that it has just become another Store's
+/// Location or a Working copy, and so left the Store, or has stopped being one. So the directory is
+/// looked at as a whole, as one removed or moved in is.
+fn holding_tidings(name: &str) -> Option<Path> {
+    let segments: Vec<&str> = name.split('/').collect();
+    let at = segments.iter().position(|segment| letter_case_fold(segment) == RESERVED)?;
+    Path::new(segments[..at].join("/")).ok()
 }
 
 /// Reads the File at `name`, and the Files under it if it is a directory, into `read_files`. A File

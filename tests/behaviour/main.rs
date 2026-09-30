@@ -657,6 +657,45 @@ mod fs {
         assert_nothing_more(&mut feed).await;
     }
 
+    /// A `.tidings/` made in a directory of the Location while the Store is open, as by making a
+    /// Working copy there, takes that directory out of the Store: each File that was under it is
+    /// reported removed, and what happens under it from then on isn't reported. Another Store's
+    /// Location moved in is never in the Store.
+    #[tokio::test]
+    async fn a_directory_that_comes_to_hold_another_store_drops_out_with_removed_changes() {
+        let fixture = Fs::new();
+        for path in ["themes/dark.toml", "themes/deeper/light.toml", "kept.toml"] {
+            fixture.write_directly(path, "x");
+        }
+        let Opened { store, mut feed } = fixture.open().await;
+
+        std::fs::create_dir(fixture.on_disk("themes/.tidings")).unwrap();
+        let expected = [
+            ("themes/dark.toml", ChangeKind::Removed, Origin::External),
+            ("themes/deeper/light.toml", ChangeKind::Removed, Origin::External),
+        ];
+        assert_eq!(changes_in_full(&next_batch(&mut feed).await), expected);
+        assert_eq!(list(&store).await, ["kept.toml"]);
+
+        let elsewhere = fixture.directory.path().join("elsewhere");
+        let (other, _other_feed) =
+            tidings::Store::open_fs(&elsewhere, fixture.usual_options()).await.unwrap();
+        let mut staging = Staging::new();
+        staging.write("a.txt", "a").unwrap();
+        other.commit(staging).await.unwrap();
+        std::fs::rename(&elsewhere, fixture.on_disk("moved")).unwrap();
+        fixture.write_directly("themes/dark.toml", "edited");
+        fixture.write_directly("themes/new.toml", "new");
+        fixture.write_directly("moved/b.txt", "b");
+        fixture.write_directly("marker.txt", "x");
+        assert_eq!(
+            changes(&changes_until(&mut feed, "marker.txt", false).await),
+            [("marker.txt", ChangeKind::Changed)],
+        );
+        assert_nothing_more(&mut feed).await;
+        assert_eq!(list(&store).await, ["kept.toml", "marker.txt"]);
+    }
+
     /// A File replaced by renaming another over it looks newly made to the watcher. Removed or
     /// renamed away straight after, before its events have settled, it is still reported
     /// removed.

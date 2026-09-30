@@ -458,6 +458,7 @@ pub async fn an_invalid_path_is_refused_wherever_it_is_used(fixture: &impl Fixtu
         ("tab\there", InvalidPathReason::UnportableName),
         ("cafe\u{301}.txt", InvalidPathReason::NotNfc),
         (".tidings/lock", InvalidPathReason::Reserved),
+        ("notes/.tidings/lock", InvalidPathReason::Reserved),
     ];
     for (path, expected) in refused {
         let mut staging = Staging::new();
@@ -489,6 +490,7 @@ pub async fn an_invalid_path_is_refused_wherever_it_is_used(fixture: &impl Fixtu
         ("CON/", InvalidPathReason::UnportableName),
         ("cafe\u{301}/", InvalidPathReason::NotNfc),
         (".tidings/", InvalidPathReason::Reserved),
+        ("notes/.Tidings/", InvalidPathReason::Reserved),
     ];
     for (prefix, expected) in refused {
         let mut staging = Staging::new();
@@ -517,7 +519,7 @@ pub async fn every_allowed_path_can_be_written_and_read_back(fixture: &impl Fixt
         "console.log",
         "caf\u{e9}/r\u{e9}sum\u{e9}.md",
         "\u{65e5}\u{672c}\u{8a9e}/\u{30e1}\u{30e2}.txt",
-        "notes/.tidings",
+        "notes/.tidings2",
     ];
     let mut staging = Staging::new();
     for path in allowed {
