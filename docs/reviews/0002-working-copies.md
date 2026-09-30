@@ -1252,3 +1252,102 @@ location with a file without following it. Findings (minor, not acted on):
 **For the spec's owner:** update the record section (docs/specs/0002-working-copies.md:264-271):
 format `tidings working-copy 2`; a Base's hash may be unknown; a Diverged entry also records the
 hash of the Store's File. And `discard` of a named directory leaves files with no Base alone.
+
+---
+
+## Ticket 10: Surviving crashes
+
+Reviewed: `git diff 9dab660...b0086e1` (commit b0086e1).
+
+The implementer audited every multi-step operation (`sync` apply, `commit`, `discard`, `resolve`,
+create, `theirs` writes, the sweep) and changed three things: a `commit` whose earlier record save
+was lost no longer fails with a Conflict (if every conflicting Path already holds the local
+contents in the Store, those take their Base silently and the rest is committed, retrying once);
+every full reconcile clears leftovers in `.tidings/tmp/` and temporary files from writing the
+record or the ignore file; folder writes and removals force their directory to disk before the
+record is saved.
+
+### Standards
+
+**(a) Documented-standard violations:** none. Every item documented, no line over 100 columns,
+tests through the binary (reaching crash states by SIGKILL or by restoring an earlier record's
+bytes, never parsing the format) on fs and SQLite. Judgement call: a test plants a
+`.working-copy.x1Y2z3` file, copying `atomic-write-file`'s undocumented naming.
+
+**(b) Judgement calls:**
+
+1. **Possible Data Clump:** `commit`'s retry loop packs `Attempt { changes, files, outcome }` and
+   then breaks with a new 4-tuple of the same fields.
+2. **Possible Mysterious Name:** `all_same` (every conflicting Path took the Store's File) and
+   `healed` (set before any healing; means "already retried").
+3. Two `if all_paths` branches in `reconcile`; a repeated `sync_directory(…).map_err(…)`.
+4. **Tests:** the sync-until-caught-up steps, "commit and expect nothing to commit", and the
+   `store shell` script writing numbered files each repeat; `heals(…, next: &str)` branches on its
+   label strings; `label, location, folder` travel together.
+
+### Spec
+
+Probed on fs: SIGKILL with 952 of 1,500 Files created, and with 19 of 1,500 updated: each resume
+reported only the rest, nothing Diverged, the folder matching the Store. A lost record after
+`commit` (an earlier record restored) heals: `commit` says nothing to commit, then `status` shows
+nothing; a new file added first is the only thing committed; a mixed case Diverges the edited
+Path, reports the matching one as `same`, exits 3 and commits nothing. A lost deletion or
+`discard` heals the same way. The retry rescans against the updated Bases, so its preconditions
+are "unchanged since" the new Base, and a second Conflict is reported: **no way was found to
+commit over an unseen change.** Leftovers are removed, other files in `.tidings/` kept, and a
+symlink in `tmp/` removed without touching its target. A record in an unknown format is refused
+by all five commands and left byte for byte.
+
+**(a) Missing or partial:** after a lost commit record, `status` lists the Paths as *modified*
+until a `commit` or `sync` runs; the spec's `status` doesn't read the Store, so this is expected,
+but the ticket's "healed by the next command" overstates it.
+
+**(b) Scope creep:** none.
+
+**(c) Looks wrong:**
+
+1. **`sync` writes outside the folder when `.tidings/tmp` is a symlink** (confirmed: with `tmp`
+   linked to a read-only outside directory, `sync` failed creating its temporary file there).
+   `write` makes and uses `tmp` without checking it. Known to the implementer but unrecorded.
+2. **When another process committed the same contents, `commit` exits 0, not 3.** The spec's
+   Conflict bullet says "if the contents turn out equal, takes the new Base. The command exits 3,
+   naming them." Code can't tell this from a lost record save; the behaviour is safe.
+3. A crash between removing a file and removing the directories it emptied leaves an empty
+   directory, never cleaned up.
+
+Outside this ticket: `resolve` removes `theirs` before saving the record, so after a lost save
+`status` and `commit` point to a `theirs` file that isn't there until `sync` rewrites it.
+
+### Summary
+
+Standards: 0 hard violations, 4 groups of judgement calls (worst: the tuple packing in `commit`).
+Spec: 1 partial and 3 wrong (worst: writing outside the folder through a symlinked `tmp`).
+
+### Resolution
+
+Fixed in a69a291:
+
+1. **Spec (c)1, a symlinked `tmp`:** fixed. Before writing, `make_tmp_directory` replaces a
+   symlink at `.tidings/tmp` with a real directory, removing the link and never its target;
+   anything else that isn't a directory there fails with a clear error (tidings never puts one
+   there). Test: `sync_never_writes_through_a_symlinked_tmp_directory` (unix, fs and SQLite), which
+   fails on b0086e1 with the probe's Permission denied.
+2. **`theirs` removed before the record was saved:** fixed in both `resolve` and `discard`: the
+   record is saved first and stale `theirs` removed after, so a crash leaves only a stale file for
+   the sweep. No binary test: the order can only be seen with a crash in between.
+3. **Standards:** `commit`'s loop breaks with its `Attempt`; `healed` became `retried` and
+   `all_same` became `all_took_stores_file`; one `sync_parent` helper; tests share `synced()` (now
+   returning its events), `commits_nothing()`, `numbered_files`/`commit_all`, and a
+   `Next { Commit, Sync }` enum.
+
+Accepted, not changed, **for the spec's owner:**
+
+- `commit` exits 0 and takes the Store's File as the Base when another process committed the same
+  contents (it can't be told from a lost record save, and it is safe); the spec's Conflict bullet
+  says it exits 3 naming them.
+- After a lost commit record, `status` shows *modified* until the next `commit` or `sync`.
+- A crash between removing a file and removing the directories it emptied leaves an empty
+  directory; removing empty directories on sight would break story 16.
+
+No re-review: the fixes are narrow and the safety fix is tested. (One library fs test,
+`an_area_directory_removed_while_running_is_made_again_with_a_resync`, flaked once again.)
