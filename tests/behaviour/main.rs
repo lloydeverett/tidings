@@ -753,7 +753,9 @@ mod fs {
     }
 
     /// Clearing the Cache by removing its directory, while the app runs, is safe: the directory
-    /// is made again and watched again, and the Area gets a Resync, since its Files are gone.
+    /// is made again and watched again, and the Area gets a Resync, since its Files are gone. On
+    /// macOS, FSEvents can report the removal, and the directory made again, late, and the Area
+    /// then gets another Resync: see the README's Consistency section.
     #[tokio::test]
     async fn an_area_directory_removed_while_running_is_made_again_with_a_resync() {
         let fixture = Fs::new();
@@ -769,7 +771,7 @@ mod fs {
         std::fs::remove_dir_all(fixture.on_disk(Area::Cache, "")).unwrap();
         assert_eq!(next_item(&mut feed).await, FeedItem::Resync(Area::Cache));
         assert!(fixture.on_disk(Area::Cache, "").is_dir());
-        assert_nothing_more(&mut feed).await;
+        assert_eq!(settle_skipping_cache_resyncs(&fixture, &mut feed).await, []);
 
         // Watched again.
         fixture.write_directly(Area::Cache, "new.txt", "x");
@@ -784,7 +786,9 @@ mod fs {
             changes_in_full(&next_batch(&mut feed).await),
             [(Area::Cache, "thumbnails/a.png", ChangeKind::Changed, Origin::Local)],
         );
-        assert_nothing_more(&mut feed).await;
+        // Settled, so that the Commit's events aren't looked at after the rename, which would
+        // rightly report its File removed.
+        assert_eq!(settle_skipping_cache_resyncs(&fixture, &mut feed).await, []);
 
         // Renamed away, the same, and what happens to it where it went is no Change.
         let moved = fixture.root.path().join("old cache");
@@ -792,10 +796,26 @@ mod fs {
         assert_eq!(next_item(&mut feed).await, FeedItem::Resync(Area::Cache));
         assert!(fixture.on_disk(Area::Cache, "").is_dir());
         std::fs::write(moved.join("new.txt"), "y").unwrap();
-        assert_nothing_more(&mut feed).await;
+        assert_eq!(settle_skipping_cache_resyncs(&fixture, &mut feed).await, []);
         fixture.write_directly(Area::Cache, "new.txt", "z");
         assert_eq!(changes(&next_batch(&mut feed).await), [("new.txt", ChangeKind::Changed)]);
         assert_nothing_more(&mut feed).await;
+    }
+
+    /// Waits until the watcher has looked at every event so far, skipping the Cache's Resyncs,
+    /// and gives the other Changes it read, for
+    /// [`an_area_directory_removed_while_running_is_made_again_with_a_resync`]. It writes a
+    /// marker File to Data twice, reading up to each Change to it. What the watcher gives for
+    /// earlier events comes before the first Change, or with it, or, for another Area, straight
+    /// after it; the second write comes after all that, so its Change comes after it all too.
+    async fn settle_skipping_cache_resyncs(fixture: &Fs, feed: &mut ChangeFeed) -> Vec<Change> {
+        let mut read = Vec::new();
+        for contents in ["1", "2"] {
+            fixture.write_directly(Area::Data, "marker.txt", contents);
+            read.extend(changes_until(feed, "marker.txt", Some(Area::Cache)).await);
+        }
+        read.retain(|change| change.path.as_str() != "marker.txt");
+        read
     }
 
     /// If watching fails, the Areas it concerns get a Resync, since Changes to them may have been

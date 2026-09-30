@@ -322,6 +322,10 @@ Ways you could lose data or see confusing behaviour, and why.
   so can the first change to its permissions, or nothing at all, if the file was made shortly
   before the store opened: FSEvents can report a recent creation again, or late. *Why:* avoiding
   it means reading every file when the store opens, and they can be large.
+  - On macOS, an area's directory removed while the store runs can give a second resync a moment
+    after the first. *Why:* FSEvents can report the removal, and the directory made again, late;
+    taking the directory still there for proof that nothing was missed would be wrong if it had
+    been moved away and back.
 
 ## Limitations
 
