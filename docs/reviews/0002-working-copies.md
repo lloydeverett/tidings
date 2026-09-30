@@ -1080,3 +1080,175 @@ Fixed in 17d5266 (no behaviour change; `--json` keys unchanged):
 Not acted on: rows keyed `event` (kept, matching the spec's JSON style for `sync`). The owner
 accepted the open decisions listed across these reviews, including Area-relative Paths from a
 subdirectory. No re-review: a refactor with no behaviour change, and the tests pass.
+
+---
+
+## Ticket 09: `discard` and `resolve`
+
+Reviewed: `git diff bb505ea...f5628d2` (commit f5628d2). (The implementer stalled once and was
+resumed. It reported library fs tests hanging for over 10 minutes; the orchestrator found no stray
+processes, ran one of them alone in 8.6 s, and a full workspace run then passed all 505 tests:
+outside load on the machine, not a regression.)
+
+### Standards
+
+**(a) Documented-standard violations:** none hard. Thin commands, reports through `output.rs`,
+refusals through `failure.rs` (`Failure::blocked`), every item documented, tests through the
+binary on fs and SQLite. Leaning soft:
+
+- **The record format:** a `base` line may now lack its hash (`record.rs:181-189`) under the same
+  `tidings working-copy 1`. An older binary won't misread it (its parser fails with "has a line it
+  can't read"), but that is not the "unknown format or version is refused" story 78 asks for, and
+  the spec's record section still says each entry holds a hash.
+
+**(b) Judgement calls:**
+
+1. **Possible Duplicated Code:** "set or drop the Base from the Store's File" is written three
+   times (`settle.rs:666-673`, `working_copy.rs:751-756`, `:1004-1010`).
+2. **Possible Duplicated Code:** the text and JSON arms for the discard and resolve reports repeat
+   one "parts, then events" pipeline.
+3. **Possible Primitive Obsession:** `Discarded { revision: Option<Revision>, removed: bool }`
+   encodes three outcomes, decoded by a tuple match.
+4. **Possible Primitive Obsession:** `check_each_names_something(…, command: &str)` passes the
+   command's name only to build a message.
+5. **Possible Feature Envy:** `settle.rs` uses a dozen of its parent's helpers: a file split rather
+   than a module hiding anything. Acceptable as a child module.
+
+### Spec
+
+Probed on fs and SQLite: `discard` of modified, deleted, symlink (not followed; the file outside
+untouched) and non-UTF-8 files; a Diverged Path removed in the Store has its local file and emptied
+directories removed; a bare `discard` leaves added files alone and a named one is removed, also
+from a subdirectory; `resolve` then `commit` goes through, and `resolve`, a Store change, then
+`commit` is still a Conflict (story 64); `resolve` of a removed-in-the-Store Divergence leaves no
+Base; `discard` waits on a held lock; all work while `sync` runs; `store shell`'s `commit` and
+`discard` keep their Staging meaning (story 73). Nothing outside the folder was ever touched.
+
+**(a) Missing or partial:**
+
+1. **No test runs `discard` or `resolve` alongside a live `sync`**, which the ticket asks for
+   (behaviour is fine by probe).
+2. **A `theirs` that couldn't be removed stays for good** (story 66): after `resolve` reports the
+   error, a later `sync` never removes it, since the retry lives only in `sync`'s memory.
+
+**(b) Scope creep:** none of substance (`{"failure":"blocked"}`; refusing a named ignored file,
+as `commit` does).
+
+**(c) Looks wrong or questionable:**
+
+1. **The record change** (as Standards (a)): sound in design, since a resumed `sync` marks such a
+   merge Diverged rather than overwriting it, but should be a new format version.
+2. **A side effect of the unknown hash:** with the folder holding exactly the `theirs` contents
+   after a `resolve`, `status` still lists it as *modified* (story 57 "compare contents").
+3. **A named file whose name can't be a Path** gives "nothing to discard", exit 0, with no hint
+   why.
+4. **`discard <directory>` removes every added and invalid no-Base file under it**, e.g.
+   `discard .`: consistent with "as for `commit`", but it stretches story 61, "remove an added
+   file only when I name it". For the owner.
+5. Judged fine: `resolve` of anything not Diverged (a directory, a typo, a mix) exits 1 and
+   resolves nothing; a blocked write refuses the whole `discard` up front, stricter than `sync`'s
+   Divergence but safe.
+
+### Summary
+
+Standards: 0 hard violations, 1 near-violation (the record format) and 5 judgement calls. Spec: 2
+partial (no tests with `sync` running; a stale `theirs` never cleaned up) and 4 questionable (worst:
+`discard <directory>` deleting added files the person didn't name).
+
+### Resolution
+
+Fixed in 8a1672e:
+
+1. **Spec (a)1, tests with `sync` running:** added
+   `discard_and_resolve_while_sync_runs_leave_it_nothing_to_report` (fs and SQLite).
+2. **Spec (a)2, a stale `theirs`:** a sweep, `remove_stale_theirs`, removes any file under
+   `.tidings/theirs/` whose Path isn't Diverged (never following symlinks), after `discard` and
+   `resolve` and whenever `sync` reconciles everything. Tests:
+   `a_theirs_that_couldnt_be_removed_is_removed_once_sync_restarts` and
+   `discard_resolve_and_a_resync_remove_every_stale_theirs_without_following_symlinks`.
+3. **Standards (a) and Spec (c)1, the record format:** the record is now written as
+   `tidings working-copy 2`; version 1 is still read; any other version is refused as a format
+   this version doesn't know. Test:
+   `a_record_in_version_1_is_read_and_one_in_an_unknown_version_refused`.
+4. **Spec (c)2, `status` after `resolve`:** the Base's hash is taken from the Store's contents if
+   it still holds the Revision, else from the `theirs` file, else left unknown. (See the
+   re-review: the `theirs` fallback was wrong.)
+5. **Spec (c)3:** `discard` refuses a named file whose name can't be a Path, as `commit` and
+   `resolve` do.
+6. **Spec (c)4, decided:** `discard` removes a file with no Base only when that file itself is
+   named; a named directory, or `.`, leaves such files alone (story 61). **For the spec's owner:**
+   the spec doesn't say this about directories yet.
+7. **Standards (b):** `Record::set_base` and `Base::of_file` replace the three copies;
+   `settled_lines`/`settled_json` share the report pipeline; a `DiscardOutcome` enum and a
+   `Naming` enum replace the bool pair and the command string.
+
+### Re-review of 8a1672e
+
+**Standards.** Hard: `DiscardOutcome::TookStoresVersion` brings back "version" for a Revision,
+which ticket 06 had renamed away; `Naming`'s variants lack doc comments. Soft: **the spec's record
+section (lines 264-271) still says `tidings working-copy 1` and that every entry holds a hash; the
+owner should update it.** Judgement calls: two matches on `DiscardOutcome`; a shadowed `committed`;
+`everything` for "all Paths"; `Naming` names a command; `read_theirs` repeats checks; the
+version-1 test writes the record format directly (stretching the one exception, reasonably).
+
+**Spec.** Probed on fs and SQLite, with the old binary built from f5628d2 for the format checks:
+the sweep keeps Diverged Paths' `theirs`, removes stale files, directories and dotfiles, removes
+symlinks inside `theirs/` as links without touching their targets, leaves non-Path names alone,
+and touches nothing outside when `.tidings/theirs` is itself a symlink; a version-1 record is read
+and rewritten as version 2, and the old binary refuses version 2 as an unknown format;
+`discard .` leaves added files while naming them removes them; everything from the first review
+still holds. Findings:
+
+1. **A person's merge can be silently overwritten (data loss).** If the person merges inside
+   `.tidings/theirs/a.txt` and copies it into the folder while the Store has moved on, `resolve`
+   takes the merge's hash as the Base's (from the `theirs` file), `status` says nothing to commit,
+   and the next `sync` sees the file as unchanged and overwrites it with the Store's newer File;
+   the sweep has already removed `theirs`, so the merge is gone. Stories 63, 64.
+2. The sweep empties a directory a person put at a Diverged Path's `theirs` location, in the same
+   reconcile that reports it can't write there. It stays inside `.tidings/theirs/` and heals, but
+   the report no longer matches the disk.
+
+### Resolution of the re-review
+
+Fixed in 1a6b441:
+
+1. **The merge overwrite (data loss):** fixed. The record's Divergence now stores the hash of the
+   Store's File, computed from the File itself when the Divergence is recorded (so it is there
+   even if writing `theirs` fails). `resolve` uses it, else the Store's contents if the Store still
+   holds that Revision, else leaves the hash unknown; it never reads `theirs`. Version-2
+   `diverged` lines carry the hash; version-1 records still load and gain it on the next
+   reconcile. Test: `a_merge_made_in_theirs_after_the_store_changed_again_isnt_overwritten`.
+2. **The sweep and a Diverged Path's `theirs` location:** it now skips that location without
+   looking inside. Test: `the_sweep_leaves_a_directory_where_a_diverged_paths_theirs_goes`.
+3. **Standards:** `TookStoresFile` again; `NamingCommand` with documented variants;
+   `DiscardOutcome::revision()`; `revision` and `all_paths` renames; the test message.
+
+Both new tests fail on 8a1672e.
+
+### Third review, of 1a6b441
+
+**Standards.** No hard violations; every claimed fix is clean. Judgement calls: `Divergence.theirs`
+is typed `Option<Base>` though it isn't a Base until `resolve` takes it (its doc explains);
+two small duplications in `record.rs` and the sweep; `was` for a previous value; a closure named
+like the method it calls; a hard-to-read sentence in `base_of`'s doc. The spec's record section
+drifts a little further: it doesn't mention the Divergence's hash either.
+
+**Spec.** Probed on fs and SQLite; both new tests fail on 8a1672e. The original repro now shows
+*modified* after `resolve`, `sync` Diverges instead of overwriting, and the merge survives; a commit
+without `sync` is a real Conflict (story 64). Variants hold: editing only `theirs`; the Store
+changing after `resolve`; `theirs` refreshed by a running `sync` (the recorded hash follows the
+refresh); a failed `theirs` write; version-1 records made by the f5628d2 binary, with and without
+the Store having moved on, before and after a reconcile. The sweep keeps Diverged `theirs` files
+(nested too), removes stale ones and symlinks as links, and replaces a symlink at a Diverged
+location with a file without following it. Findings (minor, not acted on):
+
+1. A version-1 record whose Store has moved on, with the folder exactly equal to the old
+   contents: `resolve` leaves the hash unknown, so `status` shows *modified* and `sync` makes a
+   needless Divergence rather than applying the newer File. Nothing is lost; it is the accepted
+   cost of never trusting `theirs`, and affects only records written before version 2.
+2. A directory the person put at `theirs/a.txt` is kept only while the Path is Diverged; once it
+   is resolved, the sweep removes it, as story 66 asks.
+
+**For the spec's owner:** update the record section (docs/specs/0002-working-copies.md:264-271):
+format `tidings working-copy 2`; a Base's hash may be unknown; a Diverged entry also records the
+hash of the Store's File. And `discard` of a named directory leaves files with no Base alone.
