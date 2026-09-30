@@ -344,6 +344,13 @@ pub(crate) fn failed(path: &std::path::Path, error: std::io::Error) -> Error {
     Error::backend(std::io::Error::new(error.kind(), message))
 }
 
+/// Whether `error` means that there is nothing there: no such file, or a file where a directory on
+/// the way would have to be.
+#[cfg(any(feature = "fs", feature = "sqlite"))]
+pub(crate) fn is_absent(error: &std::io::Error) -> bool {
+    matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory)
+}
+
 /// Forces the entries of `directory` to disk, where the platform can, so that a rename, delete or
 /// new entry in it survives a power cut. A directory that is gone has nothing to force.
 #[cfg(any(feature = "fs", feature = "sqlite"))]
@@ -351,11 +358,7 @@ pub(crate) fn sync_directory(directory: &std::path::Path) -> Result<()> {
     #[cfg(unix)]
     match std::fs::File::open(directory).and_then(|opened| opened.sync_all()) {
         Ok(()) => {}
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) => {}
+        Err(error) if is_absent(&error) => {}
         Err(error) => return Err(failed(directory, error)),
     }
     #[cfg(not(unix))]

@@ -117,7 +117,7 @@ fn is_device_name_sanitize_filename_misses(name: &str) -> bool {
 /// `.tidings/`, and deeper down, that of another Store or a Working copy, whose directory is left
 /// out of the Store. Letter case is ignored, because on a case-insensitive filesystem `.Tidings` is
 /// the same directory, and so are `.tidingſ` and `.tıdings` on some.
-fn is_reserved(name: &str) -> bool {
+pub(crate) fn is_reserved(name: &str) -> bool {
     letter_case_fold(name) == RESERVED
 }
 

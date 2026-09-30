@@ -113,9 +113,11 @@ use xxhash_rust::xxh3::xxh3_128;
 use self::journal::{AsFinished, Journal, Recovery, Remove, Replace, Target};
 pub(crate) use self::watch::FsWatcher;
 use self::watch::Reported;
-use super::{CommitOutcome, CommitRequest, Planned, StoreState, failed, marker, off_runtime};
+use super::{
+    CommitOutcome, CommitRequest, Planned, StoreState, failed, is_absent, marker, off_runtime,
+};
 use crate::path::{RESERVED, letter_case_fold, temporary_file_name};
-use crate::staging::has_name;
+use crate::staging::{has_name, without_trailing_slash};
 use crate::{BackendKind, Error, File, InvalidPathReason, Path, Prefix, Result, Revision, Stat};
 
 /// How to open a Store on the filesystem, with [`Store::open_fs`](crate::Store::open_fs).
@@ -580,7 +582,7 @@ impl Location {
             let next = directory.join(segment);
             let there = present_at(fs::symlink_metadata(&next), &next)?;
             if there.as_ref().is_some_and(fs::Metadata::is_dir) && self.named_exactly(&next)? {
-                if holds_tidings(&next)? {
+                if marker::holds_tidings(&next)? {
                     let next_left_out = Some(LeftOut::Nested);
                     return Ok(OwnDirectories { directory, count, next_left_out });
                 }
@@ -604,6 +606,13 @@ impl Location {
     fn left_out(&self, name: &str) -> Result<Option<LeftOut>> {
         let segments: Vec<&str> = name.split('/').collect();
         Ok(self.own_directories(&segments)?.next_left_out)
+    }
+
+    /// Whether `name`, a Path or a Prefix without its `/`, is left out of the Store because it, or
+    /// a directory on the way to it, is a directory holding a `.tidings/`: another Store's
+    /// Location, or a Working copy.
+    fn is_nested(&self, name: &str) -> Result<bool> {
+        Ok(self.left_out(name)? == Some(LeftOut::Nested))
     }
 
     /// The contents of the File at `path` and when it was last modified, or `None` if there is no
@@ -722,8 +731,7 @@ impl Location {
     /// before the checks every Backend shares, as a Path that is invalid anywhere would.
     fn refuse_nested(&self, request: &CommitRequest) -> Result<()> {
         for given in request.staged.changed_names() {
-            let name = given.strip_suffix('/').unwrap_or(given);
-            if self.left_out(name)? == Some(LeftOut::Nested) {
+            if self.is_nested(without_trailing_slash(given))? {
                 let reason = InvalidPathReason::Nested;
                 return Err(Error::InvalidPath { path: given.to_owned(), reason });
             }
@@ -948,7 +956,7 @@ impl OnDisk {
     fn of(entry: &fs::DirEntry) -> Result<Option<OnDisk>> {
         let file_type = entry.file_type().map_err(|error| failed(&entry.path(), error))?;
         if file_type.is_dir() {
-            return Ok((!holds_tidings(&entry.path())?).then_some(OnDisk::Directory));
+            return Ok((!marker::holds_tidings(&entry.path())?).then_some(OnDisk::Directory));
         }
         let file_type = if file_type.is_symlink() {
             match present_at(fs::metadata(entry.path()), &entry.path())? {
@@ -1119,13 +1127,6 @@ fn revisions(
     Ok(files)
 }
 
-/// Whether `directory`, in the Location, holds a `.tidings/` directory, as another Store's
-/// Location and a Working copy do, and so is left out of the Store, with everything under it.
-fn holds_tidings(directory: &FsPath) -> Result<bool> {
-    let tidings = directory.join(RESERVED);
-    Ok(present_at(fs::metadata(&tidings), &tidings)?.is_some_and(|there| there.is_dir()))
-}
-
 /// Whether `directory` has an entry named exactly `name`.
 fn has_entry(directory: &FsPath, name: &std::ffi::OsStr) -> Result<bool> {
     let entries = fs::read_dir(directory).map_err(|error| failed(directory, error))?;
@@ -1240,10 +1241,4 @@ fn present<T>(result: io::Result<T>) -> io::Result<Option<T>> {
 /// failure as tidings' error.
 fn present_at<T>(result: io::Result<T>, path: &FsPath) -> Result<Option<T>> {
     present(result).map_err(|error| failed(path, error))
-}
-
-/// Whether `error` means that there is nothing there: no such file, or a file where a directory
-/// on the way would have to be.
-fn is_absent(error: &io::Error) -> bool {
-    matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
 }

@@ -140,7 +140,7 @@ impl AsFinished<'_> {
     pub(super) fn read(&self, path: &Path) -> Result<Option<(Vec<u8>, Timestamp)>> {
         // A temporary file that is gone was renamed over the File already.
         if let Some(temporary) = self.written.get(path)
-            && !self.written_outside(path)?
+            && !self.written_under_nested(path)?
             && let Some(read) = read_file(temporary)?
         {
             return Ok(Some(read));
@@ -161,7 +161,7 @@ impl AsFinished<'_> {
             }
         }
         for path in self.written.keys().filter(|path| prefix.covers(path)) {
-            if !self.written_outside(path)? {
+            if !self.written_under_nested(path)? {
                 paths.push(path.clone());
             }
         }
@@ -171,10 +171,9 @@ impl AsFinished<'_> {
     }
 
     /// Whether `path`, which the Commit writes, is now under a directory holding a `.tidings/`,
-    /// made since the Commit checked its Paths, so that finishing won't write it
-    /// ([`Journal::finish`]).
-    fn written_outside(&self, path: &Path) -> Result<bool> {
-        Ok(self.location.left_out(path.as_str())? == Some(LeftOut::Nested))
+    /// made since the Commit checked its Paths, which [`Journal::finish`] won't write under.
+    fn written_under_nested(&self, path: &Path) -> Result<bool> {
+        self.location.is_nested(path.as_str())
     }
 
     /// The Path and Revision of every File under `prefix`, in order of Path, once the Commit is

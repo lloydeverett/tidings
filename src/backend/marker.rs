@@ -25,7 +25,7 @@ use std::path::Component;
 use std::path::{Path as FsPath, PathBuf};
 use std::time::Duration;
 
-use super::{failed, sync_directory};
+use super::{failed, is_absent, sync_directory};
 use crate::path::RESERVED;
 use crate::{BackendKind, Error, Result};
 
@@ -125,11 +125,23 @@ fn check(marked: Option<BackendKind>, kind: BackendKind) -> Result<()> {
 pub(crate) fn refuse_nested(location: &FsPath) -> Result<()> {
     let resolved = resolved(location)?;
     for outer in resolved.ancestors().skip(1) {
-        if fs::metadata(outer.join(RESERVED)).is_ok_and(|metadata| metadata.is_dir()) {
+        if holds_tidings(outer)? {
             return Err(Error::NestedLocation { outer: outer.to_path_buf() });
         }
     }
     Ok(())
+}
+
+/// Whether `directory` holds a `.tidings/` directory, as a Store's Location and a Working copy do.
+/// Nothing there, or a file where a directory on the way would be, is `false`, and any other
+/// failure an error, so that a `.tidings/` that can't be looked at is never taken for none.
+pub(crate) fn holds_tidings(directory: &FsPath) -> Result<bool> {
+    let tidings = directory.join(RESERVED);
+    match fs::metadata(&tidings) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if is_absent(&error) => Ok(false),
+        Err(error) => Err(failed(&tidings, error)),
+    }
 }
 
 /// `location`, made absolute, with every symlink on the way resolved, though it may not exist

@@ -359,7 +359,7 @@ fn first_segments(path: &str, count: usize) -> &str {
 
 /// `name` without the `/` that ends it if it is a Prefix, so that a Prefix and a Path of the
 /// same name compare equal.
-fn without_trailing_slash(name: &str) -> &str {
+pub(crate) fn without_trailing_slash(name: &str) -> &str {
     name.strip_suffix('/').unwrap_or(name)
 }
 
