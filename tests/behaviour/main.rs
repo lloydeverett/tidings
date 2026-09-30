@@ -696,6 +696,35 @@ mod fs {
         assert_eq!(list(&store).await, ["kept.toml", "marker.txt"]);
     }
 
+    /// A directory whose `.tidings/` is removed while the Store is open, as when a Working copy
+    /// there is given up, comes back into the Store: each File under it is reported changed, as if
+    /// it had just been made, and what happens under it from then on is reported.
+    #[tokio::test]
+    async fn a_directory_that_stops_holding_another_store_comes_back_with_changes() {
+        let fixture = Fs::new();
+        fixture.write_directly("themes/dark.toml", "dark");
+        fixture.write_directly("themes/deeper/light.toml", "light");
+        std::fs::create_dir(fixture.on_disk("themes/.tidings")).unwrap();
+        std::fs::write(fixture.on_disk("themes/.tidings/lock"), "").unwrap();
+        let Opened { store, mut feed } = fixture.open().await;
+        assert_eq!(list(&store).await, Vec::<String>::new());
+
+        std::fs::remove_dir_all(fixture.on_disk("themes/.tidings")).unwrap();
+        let expected = [
+            ("themes/dark.toml", ChangeKind::Changed, Origin::External),
+            ("themes/deeper/light.toml", ChangeKind::Changed, Origin::External),
+        ];
+        assert_eq!(changes_in_full(&next_batch(&mut feed).await), expected);
+        assert_eq!(list(&store).await, ["themes/dark.toml", "themes/deeper/light.toml"]);
+
+        fixture.write_directly("themes/dark.toml", "edited");
+        assert_eq!(
+            changes(&next_batch(&mut feed).await),
+            [("themes/dark.toml", ChangeKind::Changed)],
+        );
+        assert_nothing_more(&mut feed).await;
+    }
+
     /// A File replaced by renaming another over it looks newly made to the watcher. Removed or
     /// renamed away straight after, before its events have settled, it is still reported
     /// removed.
@@ -1431,7 +1460,7 @@ mod fs {
 
     /// A directory in the Location that holds a `.tidings/`, as another Store's Location or a
     /// Working copy does, is outside the Store, as a symlink to a directory is: what is under it
-    /// isn't listed, read, or in a Prefix Revision.
+    /// isn't listed, read, in a Prefix Revision, or reported on the Change feed.
     #[tokio::test]
     async fn a_directory_holding_another_store_or_a_working_copy_is_left_out() {
         let fixture = Fs::new();
@@ -1445,7 +1474,7 @@ mod fs {
         std::fs::create_dir_all(fixture.on_disk("themes/copy/.tidings")).unwrap();
         fixture.write_directly("themes/copy/b.txt", "b");
         fixture.write_directly("themes/dark.toml", "dark");
-        let Opened { store, feed: _feed } = fixture.open().await;
+        let Opened { store, mut feed } = fixture.open().await;
 
         assert_eq!(list(&store).await, ["themes/dark.toml"]);
         assert_eq!(store.list("inner/").await.unwrap(), Vec::<tidings::Path>::new());
@@ -1463,6 +1492,14 @@ mod fs {
         inner.commit(staging).await.unwrap();
         fixture.write_directly("themes/copy/b.txt", "edited");
         assert_eq!(prefix_revisions().await, before);
+
+        // Once the watcher has looked at a later write, it has looked at those too.
+        fixture.write_directly("marker.txt", "x");
+        assert_eq!(
+            changes(&changes_until(&mut feed, "marker.txt", false).await),
+            [("marker.txt", ChangeKind::Changed)],
+        );
+        assert_nothing_more(&mut feed).await;
     }
 
     /// A Commit that writes or deletes under a directory holding another Store or a Working copy,
