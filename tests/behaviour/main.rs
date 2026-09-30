@@ -856,9 +856,9 @@ mod fs {
     #[tokio::test]
     async fn an_area_that_cant_be_watched_is_resynced_and_tried_again() {
         let fixture = Fs::new();
-        // Each Area fails when the Store opens, and Config once more after that. A longer window,
-        // so that the Resyncs at open are read before the retries' come.
-        let failing = FailurePoint::WatchingAnAreaFails { times: 4 };
+        // Each Area fails when the Store opens. A longer window, so that the Resyncs at open are
+        // read before the retries' come.
+        let failing = FailurePoint::WatchingAnAreaFails { times: 3 };
         let window = Duration::from_millis(100);
         let Opened { store: _store, mut feed } =
             fixture.open_with(|options| options.fail_at(failing).debounce_window(window)).await;
@@ -871,7 +871,9 @@ mod fs {
             }
         }
         use Area::*;
-        assert_eq!(resynced, [Config, Data, Cache, Data, Cache, Config]);
+        // Each Area is tried again on its own, so the order of the second Resyncs isn't known.
+        resynced[3..].sort();
+        assert_eq!(resynced, [Config, Data, Cache, Config, Data, Cache]);
         assert_nothing_more(&mut feed).await;
         for area in [Config, Data, Cache] {
             fixture.write_directly(area, "seen.txt", "x");

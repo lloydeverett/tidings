@@ -16,7 +16,7 @@ use jiff::Timestamp;
 #[cfg(any(feature = "fs", feature = "sqlite"))]
 use crate::Error;
 use crate::staging::{Action, PlannedRevisions, Staged};
-use crate::{Area, ChangeKind, File, Origin, Path, Prefix, PrefixRevision, Result, Revision, Stat};
+use crate::{ChangeKind, File, Origin, Path, Prefix, Result, Revision, Stat};
 
 /// A Backend that keeps its Areas on disk, as an Area's Backend marker names it. Opening a Store
 /// on one Backend refuses Areas marked for the other, and
@@ -230,45 +230,46 @@ impl Plan {
 }
 
 impl Backend {
-    pub(crate) async fn read(&self, area: Area, path: &Path) -> Result<Option<File>> {
+    pub(crate) async fn read(&self, path: &Path) -> Result<Option<File>> {
         match self {
             #[cfg(feature = "fs")]
-            Backend::Fs(backend) => backend.read(area, path).await,
-            Backend::Memory(backend) => Ok(backend.read(area, path)),
+            Backend::Fs(backend) => backend.read(path).await,
+            Backend::Memory(backend) => Ok(backend.read(path)),
             #[cfg(feature = "sqlite")]
-            Backend::Sqlite(backend) => backend.read(area, path).await,
+            Backend::Sqlite(backend) => backend.read(path).await,
         }
     }
 
-    pub(crate) async fn stat(&self, area: Area, path: &Path) -> Result<Option<Stat>> {
+    pub(crate) async fn stat(&self, path: &Path) -> Result<Option<Stat>> {
         match self {
             #[cfg(feature = "fs")]
-            Backend::Fs(backend) => backend.stat(area, path).await,
-            Backend::Memory(backend) => Ok(backend.stat(area, path)),
+            Backend::Fs(backend) => backend.stat(path).await,
+            Backend::Memory(backend) => Ok(backend.stat(path)),
             #[cfg(feature = "sqlite")]
-            Backend::Sqlite(backend) => backend.stat(area, path).await,
+            Backend::Sqlite(backend) => backend.stat(path).await,
         }
     }
 
     /// The Paths under `prefix`, in order.
-    pub(crate) async fn list(&self, area: Area, prefix: &Prefix) -> Result<Vec<Path>> {
+    pub(crate) async fn list(&self, prefix: &Prefix) -> Result<Vec<Path>> {
         match self {
             #[cfg(feature = "fs")]
-            Backend::Fs(backend) => backend.list(area, prefix).await,
-            Backend::Memory(backend) => Ok(backend.list(area, prefix)),
+            Backend::Fs(backend) => backend.list(prefix).await,
+            Backend::Memory(backend) => Ok(backend.list(prefix)),
             #[cfg(feature = "sqlite")]
-            Backend::Sqlite(backend) => backend.list(area, prefix).await,
+            Backend::Sqlite(backend) => backend.list(prefix).await,
         }
     }
 
-    /// The Prefix Revision of everything under `prefix`.
-    pub(crate) async fn stat_prefix(&self, area: Area, prefix: &Prefix) -> Result<PrefixRevision> {
+    /// The Path and Revision of every File under `prefix`, in order of Path, for the Store layer
+    /// to make a Prefix Revision of.
+    pub(crate) async fn revisions_under(&self, prefix: &Prefix) -> Result<Vec<(Path, Revision)>> {
         match self {
             #[cfg(feature = "fs")]
-            Backend::Fs(backend) => backend.stat_prefix(area, prefix).await,
-            Backend::Memory(backend) => backend.stat_prefix(area, prefix),
+            Backend::Fs(backend) => backend.revisions_under(prefix).await,
+            Backend::Memory(backend) => backend.revisions_under(prefix),
             #[cfg(feature = "sqlite")]
-            Backend::Sqlite(backend) => backend.stat_prefix(area, prefix).await,
+            Backend::Sqlite(backend) => backend.revisions_under(prefix).await,
         }
     }
 
@@ -284,15 +285,15 @@ impl Backend {
         }
     }
 
-    /// A view of `area` as it stands now, which Commits made afterwards don't change, and which
-    /// doesn't hold them up.
-    pub(crate) async fn snapshot(&self, area: Area) -> Result<BackendSnapshot> {
+    /// A view of the Files as they stand now, which Commits made afterwards don't change, and
+    /// which doesn't hold them up.
+    pub(crate) async fn snapshot(&self) -> Result<BackendSnapshot> {
         match self {
             #[cfg(feature = "fs")]
             Backend::Fs(_) => Err(Error::Unsupported),
-            Backend::Memory(backend) => Ok(BackendSnapshot::Memory(backend.snapshot(area))),
+            Backend::Memory(backend) => Ok(BackendSnapshot::Memory(backend.snapshot())),
             #[cfg(feature = "sqlite")]
-            Backend::Sqlite(backend) => Ok(BackendSnapshot::Sqlite(backend.snapshot(area).await?)),
+            Backend::Sqlite(backend) => Ok(BackendSnapshot::Sqlite(backend.snapshot().await?)),
         }
     }
 

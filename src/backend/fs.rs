@@ -106,15 +106,10 @@ use xxhash_rust::xxh3::xxh3_128;
 use self::journal::{AsFinished, Journal, Recovery, Remove, Replace, Target};
 pub(crate) use self::watch::FsWatcher;
 use self::watch::Reported;
-use super::{AreaState, CommitOutcome, CommitRequest, Planned, failed, marker, off_runtime};
-use crate::app::AppIdentity;
-use crate::area::PerArea;
+use super::{AreaState, CommitOutcome, CommitRequest, Planned, failed, off_runtime};
 use crate::path::{RESERVED, letter_case_fold, temporary_file_name};
 use crate::staging::has_name;
-use crate::{
-    Area, BackendKind, Error, File, InvalidPathReason, Path, Prefix, PrefixRevision, Result,
-    Revision, Stat,
-};
+use crate::{Error, File, InvalidPathReason, Path, Prefix, Result, Revision, Stat};
 
 /// How to open a Store on the filesystem, with [`Store::open_fs`](crate::Store::open_fs).
 ///
@@ -122,12 +117,10 @@ use crate::{
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct FsOptions {
-    root_override: Option<PathBuf>,
+    pub(crate) root_override: Option<PathBuf>,
     debounce_window: Option<Duration>,
     #[cfg(feature = "testing")]
-    fail_at: Option<FailurePoint>,
-    #[cfg(feature = "testing")]
-    pause_at: Option<(FailurePoint, Pause)>,
+    failures: FailureSetup,
 }
 
 impl FsOptions {
@@ -158,7 +151,17 @@ impl FsOptions {
     /// [`FailurePoint::WatchingAnAreaFails`] make watching fail.
     #[cfg(feature = "testing")]
     pub fn fail_at(mut self, point: FailurePoint) -> FsOptions {
-        self.fail_at = Some(point);
+        self.failures.fail_at = Some(point);
+        let renames = match point {
+            FailurePoint::RenameFails { times, .. } => times,
+            _ => 0,
+        };
+        self.failures.renames_to_fail = Arc::new(AtomicUsize::new(renames));
+        let watches = match point {
+            FailurePoint::WatchingAnAreaFails { times } => times,
+            _ => 0,
+        };
+        self.failures.watches_to_fail = Arc::new(AtomicUsize::new(watches));
         self
     }
 
@@ -167,7 +170,7 @@ impl FsOptions {
     /// way through. `point` must be a place [`fail_at`](Self::fail_at) stops a Commit at.
     #[cfg(feature = "testing")]
     pub fn pause_at(mut self, point: FailurePoint, pause: &Pause) -> FsOptions {
-        self.pause_at = Some((point, pause.clone()));
+        self.failures.pause_at = Some((point, pause.clone()));
         self
     }
 }
@@ -268,15 +271,17 @@ pub enum FailurePoint {
     },
 }
 
-/// What [`FsOptions::fail_at`] and [`FsOptions::pause_at`] set up, for each Area of a Store.
+/// What [`FsOptions::fail_at`] and [`FsOptions::pause_at`] set up. Its clones share what is left
+/// of each failure, so every Backend opened with the same options counts them together.
 #[cfg(feature = "testing")]
 #[derive(Debug, Clone, Default)]
 struct FailureSetup {
     fail_at: Option<FailurePoint>,
     pause_at: Option<(FailurePoint, Pause)>,
-    /// How many more times the rename [`FailurePoint::RenameFails`] names fails, shared by every
-    /// Area of the Store.
+    /// How many more times the rename [`FailurePoint::RenameFails`] names fails.
     renames_to_fail: Arc<AtomicUsize>,
+    /// How many more times watching fails, with [`FailurePoint::WatchingAnAreaFails`].
+    watches_to_fail: Arc<AtomicUsize>,
 }
 
 /// The error [`AreaRoot::stop_at`] stops a Commit with, which is never tried again.
@@ -308,65 +313,45 @@ const RETRY_DELAYS: [Duration; 3] =
 
 #[derive(Debug)]
 pub(crate) struct FsBackend {
-    areas: PerArea<Arc<AreaRoot>>,
-    /// What the Change feed has been told of each Area's Files, which the watcher compares events
-    /// with, and each Commit updates.
-    reported: PerArea<Arc<Mutex<Reported>>>,
+    root: Arc<AreaRoot>,
+    /// What the Change feed has been told of the Files, which the watcher compares events with,
+    /// and each Commit updates.
+    reported: Arc<Mutex<Reported>>,
 }
 
 impl FsBackend {
-    /// Marks each Area for the filesystem ([`marker`]), adopting what an unmarked one holds, or
-    /// fails if one is another Backend's. Makes each Area's root and its `.tidings/` directory if
-    /// they don't exist, finishes or discards any Commit a crash left in its journal, and starts
-    /// watching the Areas, giving the watcher for the Store to run.
-    pub(crate) async fn open(
-        app: &AppIdentity,
-        options: FsOptions,
-    ) -> Result<(FsBackend, FsWatcher)> {
-        let roots = app.area_directories(options.root_override.as_deref())?;
+    /// Makes `root` and its `.tidings/` directory if they don't exist, finishes or discards any
+    /// Commit a crash left in its journal, and starts watching it, giving the watcher for the
+    /// Store to run.
+    pub(crate) async fn open(root: PathBuf, options: &FsOptions) -> Result<(FsBackend, FsWatcher)> {
         let window = options.debounce_window.unwrap_or(watch::DEFAULT_WINDOW);
         #[cfg(feature = "testing")]
-        let watch_failures = watch::WatchFailures {
-            first_events: options.fail_at == Some(FailurePoint::WatchingFails),
-            watching_an_area: match options.fail_at {
-                Some(FailurePoint::WatchingAnAreaFails { times }) => times,
-                _ => 0,
-            },
-        };
+        let failures = options.failures.clone();
         #[cfg(feature = "testing")]
-        let failures = FailureSetup {
-            fail_at: options.fail_at,
-            pause_at: options.pause_at,
-            renames_to_fail: Arc::new(AtomicUsize::new(match options.fail_at {
-                Some(FailurePoint::RenameFails { times, .. }) => times,
-                _ => 0,
-            })),
+        let watch_failures = watch::WatchFailures {
+            first_events: failures.fail_at == Some(FailurePoint::WatchingFails),
+            watching: Arc::clone(&failures.watches_to_fail),
         };
-        let areas = off_runtime(move || {
-            marker::claim(&roots, BackendKind::Fs)?;
-            PerArea::try_from_fn(|area| {
-                #[cfg_attr(not(feature = "testing"), expect(unused_mut))]
-                let mut root = AreaRoot::open(roots.get(area).clone())?;
-                #[cfg(feature = "testing")]
-                {
-                    root.failures = failures.clone();
-                }
-                let _locked = root.lock()?;
-                // Reads show a Commit that can't be finished yet, so the Store can open.
-                if let Recovery::Left(error) = journal::recover(&root)? {
-                    tracing::debug!(
-                        "a Commit to {} is left unfinished for now: {error}",
-                        root.root.display(),
-                    );
-                }
-                Ok(Arc::new(root))
-            })
+        let root = off_runtime(move || {
+            #[cfg_attr(not(feature = "testing"), expect(unused_mut))]
+            let mut root = AreaRoot::open(root)?;
+            #[cfg(feature = "testing")]
+            {
+                root.failures = failures;
+            }
+            let _locked = root.lock()?;
+            // Reads show a Commit that can't be finished yet, so the Store can open.
+            if let Recovery::Left(error) = journal::recover(&root)? {
+                tracing::debug!(
+                    "a Commit to {} is left unfinished for now: {error}",
+                    root.root.display(),
+                );
+            }
+            Ok(Arc::new(root))
         })
         .await?;
-        let reported = PerArea::try_from_fn(|_| Ok(Arc::default()))?;
-        let watching = PerArea::try_from_fn(|area| {
-            Ok((Arc::clone(areas.get(area)), Arc::clone(reported.get(area))))
-        })?;
+        let reported = Arc::<Mutex<Reported>>::default();
+        let watching = (Arc::clone(&root), Arc::clone(&reported));
         let watcher = off_runtime(move || {
             FsWatcher::start(
                 watching,
@@ -376,12 +361,12 @@ impl FsBackend {
             )
         })
         .await?;
-        Ok((FsBackend { areas, reported }, watcher))
+        Ok((FsBackend { root, reported }, watcher))
     }
 
-    pub(crate) async fn read(&self, area: Area, path: &Path) -> Result<Option<File>> {
+    pub(crate) async fn read(&self, path: &Path) -> Result<Option<File>> {
         let path = path.clone();
-        self.off_runtime(area, move |root| {
+        self.off_runtime(move |root| {
             let Some((contents, modified)) = root.as_finished()?.read(&path)? else {
                 return Ok(None);
             };
@@ -393,45 +378,39 @@ impl FsBackend {
         .await
     }
 
-    pub(crate) async fn stat(&self, area: Area, path: &Path) -> Result<Option<Stat>> {
+    pub(crate) async fn stat(&self, path: &Path) -> Result<Option<Stat>> {
         let path = path.clone();
-        self.off_runtime(area, move |root| {
+        self.off_runtime(move |root| {
             let read = root.as_finished()?.read(&path)?;
             Ok(read.map(|(contents, modified)| Stat::new(modified, Revision::of_bytes(&contents))))
         })
         .await
     }
 
-    pub(crate) async fn list(&self, area: Area, prefix: &Prefix) -> Result<Vec<Path>> {
+    pub(crate) async fn list(&self, prefix: &Prefix) -> Result<Vec<Path>> {
         let prefix = prefix.clone();
-        self.off_runtime(area, move |root| root.as_finished()?.paths_under(&prefix)).await
+        self.off_runtime(move |root| root.as_finished()?.paths_under(&prefix)).await
     }
 
-    pub(crate) async fn stat_prefix(&self, area: Area, prefix: &Prefix) -> Result<PrefixRevision> {
+    pub(crate) async fn revisions_under(&self, prefix: &Prefix) -> Result<Vec<(Path, Revision)>> {
         let prefix = prefix.clone();
-        self.off_runtime(area, move |root| {
-            let files = root.as_finished()?.revisions_under(&prefix)?;
-            Ok(PrefixRevision::of(area, prefix, files))
-        })
-        .await
+        self.off_runtime(move |root| root.as_finished()?.revisions_under(&prefix)).await
     }
 
-    /// Commits `request` to its Area's directory, as the module's doc describes, and takes what
-    /// it changed as reported, since the Store reports it.
+    /// Commits `request` to the directory, as the module's doc describes, and takes what it
+    /// changed as reported, since the Store reports it.
     pub(crate) async fn commit(&self, request: CommitRequest) -> Result<CommitOutcome> {
-        let area = request.staged.area;
-        let outcome = self.off_runtime(area, move |root| root.commit(request)).await?;
-        watch::lock_ignoring_poison(self.reported.get(area)).committed(&outcome);
+        let outcome = self.off_runtime(move |root| root.commit(request)).await?;
+        watch::lock_ignoring_poison(&self.reported).committed(&outcome);
         Ok(outcome)
     }
 
-    /// Runs `call` with `area`'s root, on a blocking thread.
+    /// Runs `call` with the root, on a blocking thread.
     async fn off_runtime<T: Send + 'static>(
         &self,
-        area: Area,
         call: impl FnOnce(&AreaRoot) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        let root = Arc::clone(self.areas.get(area));
+        let root = Arc::clone(&self.root);
         off_runtime(move || call(&root)).await
     }
 }

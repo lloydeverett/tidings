@@ -29,7 +29,7 @@ impl Area {
 }
 
 /// One `T` for each Area. The only place that knows how Areas map to positions.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct PerArea<T>([T; 3]);
 
 impl<T> PerArea<T> {
@@ -42,8 +42,17 @@ impl<T> PerArea<T> {
         Ok(PerArea([make(config)?, make(data)?, make(cache)?]))
     }
 
+    /// One `T` for each Area, in order of Area.
+    ///
+    /// # Panics
+    ///
+    /// If `all` doesn't hold one `T` for each Area.
+    #[cfg(any(feature = "fs", feature = "sqlite"))]
+    pub(crate) fn from_vec(all: Vec<T>) -> PerArea<T> {
+        PerArea(all.try_into().unwrap_or_else(|_| panic!("one for each Area")))
+    }
+
     /// One `T` for each Area, made by `make`.
-    #[cfg(feature = "fs")]
     pub(crate) fn from_fn(make: impl FnMut(Area) -> T) -> PerArea<T> {
         PerArea(Area::ALL.map(make))
     }

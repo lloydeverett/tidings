@@ -18,16 +18,19 @@ use crate::ChangeKind;
 use crate::FsOptions;
 #[cfg(feature = "sqlite")]
 use crate::SqliteOptions;
+use crate::area::PerArea;
 #[cfg(feature = "testing")]
 use crate::backend::RawChange;
 #[cfg(feature = "fs")]
 use crate::backend::fs::{FsBackend, FsWatcher};
 #[cfg(feature = "sqlite")]
-use crate::backend::sqlite::{SqliteBackend, SqlitePoller};
+use crate::backend::sqlite::{self, SqliteBackend, SqlitePoller};
 #[cfg(any(feature = "fs", feature = "sqlite"))]
 use crate::backend::{self, marker};
 use crate::backend::{Backend, CommitRequest, Observed, memory::MemoryBackend};
 use crate::change::{self, FeedSender};
+#[cfg(feature = "sqlite")]
+use crate::path::RESERVED;
 use crate::{
     Area, ChangeFeed, Committed, Error, File, IntoPath, IntoPrefix, Origin, Path, PrefixRevision,
     Result, Snapshot, Staging, Stat,
@@ -53,7 +56,8 @@ pub struct Store {
 /// such a task, holding its `commit_order` guard, so that it finishes and records its Changes.
 #[derive(Debug)]
 struct Inner {
-    backend: Backend,
+    /// The Backend of each Area.
+    backends: PerArea<Backend>,
     feed: FeedSender,
     /// Held from before a Commit is applied until its Changes are recorded, so that Commits reach
     /// the Change feed in the order they were applied. Otherwise two Commits to the same Path
@@ -61,9 +65,9 @@ struct Inner {
     /// The task that follows other Stores' Commits holds it too, from reading them until they are
     /// recorded.
     commit_order: Arc<Mutex<()>>,
-    /// The task that follows other Stores' Commits, if the Backend has one. It is stopped when
-    /// the Store is dropped.
-    following: Option<AbortHandle>,
+    /// The tasks that follow other Stores' Commits, one for each Area, if the Backend has them.
+    /// They are stopped when the Store is dropped.
+    following: Vec<AbortHandle>,
 }
 
 /// A Commit that has started. It runs in place while the app waits for it. If the app stops
@@ -110,7 +114,7 @@ impl Drop for Started {
 impl Drop for Inner {
     /// The last Store handle is gone, so nothing more can be committed: the Change feed ends.
     fn drop(&mut self) {
-        if let Some(following) = &self.following {
+        for following in &self.following {
             following.abort();
         }
         self.feed.end();
@@ -121,7 +125,8 @@ impl Store {
     /// Opens a Store that keeps its Files in memory, for tests and short-lived data. Returns the
     /// Store together with its one Change feed.
     pub fn open_memory() -> (Store, ChangeFeed) {
-        Store::open(Backend::Memory(MemoryBackend::default()), |_, _| None)
+        let backends = PerArea::from_fn(|_| Backend::Memory(MemoryBackend::default()));
+        Store::open(backends, |_, _| Vec::new())
     }
 
     /// Opens a Store that keeps each Area in a directory, and each File in a file in it, so that
@@ -160,13 +165,25 @@ impl Store {
     /// If it isn't called from within a tokio runtime.
     #[cfg(feature = "fs")]
     pub async fn open_fs(app: &AppIdentity, options: FsOptions) -> Result<(Store, ChangeFeed)> {
-        let (backend, watcher) = FsBackend::open(app, options).await?;
-        Ok(Store::open(Backend::Fs(backend), |feed, commit_order| {
-            for area in watcher.unwatched() {
-                feed.resync(*area);
+        let directories = app.area_directories(options.root_override.as_deref())?;
+        let marking = directories.clone();
+        backend::off_runtime(move || marker::claim(&marking, BackendKind::Fs)).await?;
+        let (mut backends, mut watchers) = (Vec::new(), Vec::new());
+        for (area, directory) in directories.iter() {
+            let (backend, watcher) = FsBackend::open(directory.clone(), &options).await?;
+            backends.push(Backend::Fs(backend));
+            watchers.push((area, watcher));
+        }
+        Ok(Store::open(PerArea::from_vec(backends), |feed, commit_order| {
+            let mut following = Vec::new();
+            for (area, watcher) in watchers {
+                if watcher.unwatched() {
+                    feed.resync(area);
+                }
+                let watching = watch(area, watcher, feed.clone(), Arc::clone(commit_order));
+                following.push(supervise("watching a directory", watching, feed, area));
             }
-            let watching = watch_areas(watcher, feed.clone(), Arc::clone(commit_order));
-            Some(supervise("watching the Areas' directories", watching, feed))
+            following
         }))
     }
 
@@ -195,10 +212,30 @@ impl Store {
         app: &AppIdentity,
         options: SqliteOptions,
     ) -> Result<(Store, ChangeFeed)> {
-        let (backend, poller) = SqliteBackend::open(app, options).await?;
-        Ok(Store::open(Backend::Sqlite(backend), |feed, commit_order| {
-            let following = follow_other_stores(poller, feed.clone(), Arc::clone(commit_order));
-            Some(supervise("following other Stores' Commits", following, feed))
+        let directories = app.area_directories(options.root_override.as_deref())?;
+        let marking = directories.clone();
+        backend::off_runtime(move || {
+            for area in marker::claim(&marking, BackendKind::Sqlite)? {
+                sqlite::warn_if_holding_other_files(area, marking.get(area));
+            }
+            Ok(())
+        })
+        .await?;
+        let (mut backends, mut pollers) = (Vec::new(), Vec::new());
+        for (area, directory) in directories.iter() {
+            let database = directory.join(RESERVED).join(format!("{}.sqlite3", area.name()));
+            let (backend, poller) = SqliteBackend::open(database, &options).await?;
+            backends.push(Backend::Sqlite(backend));
+            pollers.push((area, poller));
+        }
+        Ok(Store::open(PerArea::from_vec(backends), |feed, commit_order| {
+            let mut following = Vec::new();
+            for (area, poller) in pollers {
+                let polling =
+                    follow_other_stores(area, poller, feed.clone(), Arc::clone(commit_order));
+                following.push(supervise("following other Stores' Commits", polling, feed, area));
+            }
+            following
         }))
     }
 
@@ -223,38 +260,38 @@ impl Store {
         backend::off_runtime(move || marker::detect(&directories)).await
     }
 
-    /// Opens a Store on `backend`, with its Change feed. `follow` starts the task that follows
-    /// other Stores' Commits, if the Backend has one, given the Store's end of the feed and its
-    /// turn with Commits. The Store stops the task when it is dropped.
+    /// Opens a Store on `backends`, with its Change feed. `follow` starts the tasks that follow
+    /// other Stores' Commits, if the Backend has them, given the Store's end of the feed and its
+    /// turn with Commits. The Store stops the tasks when it is dropped.
     fn open(
-        backend: Backend,
-        follow: impl FnOnce(&FeedSender, &Arc<Mutex<()>>) -> Option<AbortHandle>,
+        backends: PerArea<Backend>,
+        follow: impl FnOnce(&FeedSender, &Arc<Mutex<()>>) -> Vec<AbortHandle>,
     ) -> (Store, ChangeFeed) {
         let (feed, change_feed) = change::feed();
         let commit_order = Arc::default();
         let following = follow(&feed, &commit_order);
-        let inner = Inner { backend, feed, commit_order, following };
+        let inner = Inner { backends, feed, commit_order, following };
         (Store { inner: Arc::new(inner) }, change_feed)
     }
 
     /// Reads the File at `path` in `area`, or gives `Ok(None)` if there is none.
     pub async fn read(&self, area: Area, path: impl IntoPath) -> Result<Option<File>> {
         let path = path.into_path()?;
-        self.inner.backend.read(area, &path).await
+        self.inner.backends.get(area).read(&path).await
     }
 
     /// Gives when the File at `path` in `area` was last modified and its Revision, without loading
     /// its contents, or `Ok(None)` if there is no File there.
     pub async fn stat(&self, area: Area, path: impl IntoPath) -> Result<Option<Stat>> {
         let path = path.into_path()?;
-        self.inner.backend.stat(area, &path).await
+        self.inner.backends.get(area).stat(&path).await
     }
 
     /// Lists the Paths of the Files under `prefix` in `area`, in order. The empty Prefix lists the
     /// whole Area. Only the Paths are loaded, not the Files.
     pub async fn list(&self, area: Area, prefix: impl IntoPrefix) -> Result<Vec<Path>> {
         let prefix = prefix.into_prefix()?;
-        self.inner.backend.list(area, &prefix).await
+        self.inner.backends.get(area).list(&prefix).await
     }
 
     /// Gives the Prefix Revision of everything under `prefix` in `area`: which Files are there,
@@ -268,13 +305,14 @@ impl Store {
     /// proportion to the number of Files under `prefix`, which can be large for a Cache.
     pub async fn stat_prefix(&self, area: Area, prefix: impl IntoPrefix) -> Result<PrefixRevision> {
         let prefix = prefix.into_prefix()?;
-        self.inner.backend.stat_prefix(area, &prefix).await
+        let files = self.inner.backends.get(area).revisions_under(&prefix).await?;
+        Ok(PrefixRevision::of(area, prefix, files))
     }
 
     /// Whether this Store's Backend provides Snapshots. Memory and SQLite do. The filesystem
     /// doesn't, because other programs can change its Files while they are being read.
     pub fn supports_snapshots(&self) -> bool {
-        self.inner.backend.supports_snapshots()
+        self.inner.backends.get(Area::Config).supports_snapshots()
     }
 
     /// Takes a [`Snapshot`] of `area`: a view of it as it stands now, for reading several Files
@@ -284,7 +322,7 @@ impl Store {
     /// Gives [`Error::Unsupported`](crate::Error::Unsupported) if the Backend has no Snapshots.
     /// Check [`supports_snapshots`](Self::supports_snapshots) when the app starts.
     pub async fn snapshot(&self, area: Area) -> Result<Snapshot> {
-        Ok(Snapshot::new(self.inner.backend.snapshot(area).await?))
+        Ok(Snapshot::new(self.inner.backends.get(area).snapshot().await?))
     }
 
     /// Commits `staging`: applies all of its writes and deletes, or none of them. Prefix deletes
@@ -336,7 +374,7 @@ impl Store {
             // doesn't.
             let timestamp = Timestamp::now();
             let request = CommitRequest { timestamp, staged: staging.into_staged() };
-            let outcome = inner.backend.commit(request).await?;
+            let outcome = inner.backends.get(area).commit(request).await?;
             record_all_observed(&inner.feed, area, outcome.observed_before);
             inner.feed.record(area, outcome.changes, Origin::Local);
             if outcome.pending {
@@ -382,12 +420,13 @@ fn record_all_observed(feed: &FeedSender, area: Area, observed: Vec<Observed>) {
 /// handle that stops it.
 ///
 /// If the task panics or ends, the Changes it records stop arriving, so a second task, which waits
-/// for it, sends a Resync for every Area. When the Store stops the task, it sends nothing.
+/// for it, sends a Resync for `area`. When the Store stops the task, it sends nothing.
 #[cfg(any(feature = "fs", feature = "sqlite"))]
 fn supervise(
     doing: &'static str,
     task: impl Future<Output = ()> + Send + 'static,
     feed: &FeedSender,
+    area: Area,
 ) -> AbortHandle {
     let running = tokio::spawn(task);
     let stopping = running.abort_handle();
@@ -397,58 +436,62 @@ fn supervise(
             Err(ended) if ended.is_cancelled() => {}
             Err(ended) => {
                 tracing::debug!("{doing} panicked: {ended}");
-                feed.resync_every_area();
+                feed.resync(area);
             }
             Ok(()) => {
                 tracing::debug!("{doing} stopped");
-                feed.resync_every_area();
+                feed.resync(area);
             }
         }
     });
     stopping
 }
 
-/// Records what changed in the Areas' directories outside this Store as the watcher sees it,
-/// until the Store is dropped and stops it, or watching stops. It holds only the Store's end of
-/// the Change feed and its turn with Commits, not the Store, so that the feed still ends.
+/// Records what changed in `area`'s directory outside this Store as the watcher sees it, until
+/// the Store is dropped and stops it, or watching stops. It holds only the Store's end of the
+/// Change feed and its turn with Commits, not the Store, so that the feed still ends.
 ///
 /// It reads what each burst of events names without the turn, then takes the turn to compare it
 /// with what was reported, and record the difference, so that the Store's own Commits are neither
 /// held up for long nor reported again: see the watcher's doc.
 #[cfg(feature = "fs")]
-async fn watch_areas(mut watcher: FsWatcher, feed: FeedSender, commit_order: Arc<Mutex<()>>) {
+async fn watch(area: Area, mut watcher: FsWatcher, feed: FeedSender, commit_order: Arc<Mutex<()>>) {
     while let Some(burst) = watcher.next_burst().await {
         let readings = watcher.read(burst).await;
         let _turn = commit_order.lock().await;
-        for (area, observed) in watcher.conclude(readings).await {
+        if let Some(observed) = watcher.conclude(readings).await {
             record_observed(&feed, area, observed);
         }
     }
 }
 
-/// Records other Stores' Commits to the SQLite databases as the poller notices them, until the
+/// Records other Stores' Commits to `area`'s SQLite database as the poller notices them, until the
 /// Store is dropped and stops it. It holds only the Store's end of the Change feed and its turn
 /// with Commits, not the Store, so that the feed still ends.
 ///
-/// If an Area's change log can't be read, a Resync for the Area is sent, once until it can be
-/// read again.
+/// If the change log can't be read, a Resync is sent, once until it can be read again.
 #[cfg(feature = "sqlite")]
-async fn follow_other_stores(poller: SqlitePoller, feed: FeedSender, commit_order: Arc<Mutex<()>>) {
-    let mut failing = Vec::new();
+async fn follow_other_stores(
+    area: Area,
+    poller: SqlitePoller,
+    feed: FeedSender,
+    commit_order: Arc<Mutex<()>>,
+) {
+    let mut failing = false;
     loop {
-        for area in poller.wait().await {
-            let _turn = commit_order.lock().await;
-            match poller.read(area).await {
-                Ok(observed) => {
-                    failing.retain(|failed| *failed != area);
-                    record_all_observed(&feed, area, observed);
-                }
-                Err(error) => {
-                    tracing::debug!("reading the change log of {area:?} failed: {error}");
-                    if !failing.contains(&area) {
-                        failing.push(area);
-                        feed.resync(area);
-                    }
+        if !poller.wait().await {
+            continue;
+        }
+        let _turn = commit_order.lock().await;
+        match poller.read().await {
+            Ok(observed) => {
+                failing = false;
+                record_all_observed(&feed, area, observed);
+            }
+            Err(error) => {
+                tracing::debug!("reading the change log of {area:?} failed: {error}");
+                if !std::mem::replace(&mut failing, true) {
+                    feed.resync(area);
                 }
             }
         }

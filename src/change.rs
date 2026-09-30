@@ -180,16 +180,6 @@ impl Unread {
         *self.areas.get_mut(area) = UnreadInArea::Resync;
     }
 
-    #[cfg(any(feature = "fs", feature = "sqlite"))]
-    fn resync_every_area(&mut self) {
-        if self.store_dropped || self.feed_dropped {
-            return;
-        }
-        for (_, unread) in self.areas.iter_mut() {
-            *unread = UnreadInArea::Resync;
-        }
-    }
-
     /// Resyncs first, one Area at a time, then a batch of every other Area's Changes.
     fn next(&mut self) -> Next {
         for (area, unread) in self.areas.iter_mut() {
@@ -248,13 +238,6 @@ impl FeedSender {
     /// Area's unread Changes, and those recorded for it until the Resync is read.
     pub(crate) fn resync(&self, area: Area) {
         self.shared.unread.lock().unwrap().resync(area);
-        self.shared.recorded.notify_one();
-    }
-
-    /// Records a Resync for every Area, as [`resync`](Self::resync) does for one.
-    #[cfg(any(feature = "fs", feature = "sqlite"))]
-    pub(crate) fn resync_every_area(&self) {
-        self.shared.unread.lock().unwrap().resync_every_area();
         self.shared.recorded.notify_one();
     }
 

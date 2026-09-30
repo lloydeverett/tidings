@@ -42,16 +42,9 @@ use std::time::Duration;
 use jiff::Timestamp;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
 
-use super::{
-    AreaState, CommitOutcome, CommitRequest, Observed, Planned, RawChange, marker, off_runtime,
-};
-use crate::app::AppIdentity;
-use crate::area::PerArea;
+use super::{AreaState, CommitOutcome, CommitRequest, Observed, Planned, RawChange, off_runtime};
 use crate::path::{RESERVED, letter_case_fold, letter_case_fold_unicode_versions, range_under};
-use crate::{
-    Area, BackendKind, ChangeKind, Error, File, Origin, Path, Prefix, PrefixRevision, Result,
-    Revision, Stat,
-};
+use crate::{Area, ChangeKind, Error, File, Origin, Path, Prefix, Result, Revision, Stat};
 
 /// How to open a Store on SQLite, with [`Store::open_sqlite`](crate::Store::open_sqlite).
 ///
@@ -60,7 +53,7 @@ use crate::{
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct SqliteOptions {
-    root_override: Option<PathBuf>,
+    pub(crate) root_override: Option<PathBuf>,
     poll_interval: Duration,
     change_log_retention: Duration,
 }
@@ -161,16 +154,11 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub(crate) struct SqliteBackend {
-    areas: PerArea<Database>,
-    /// How long Commits are kept in the change log.
-    change_log_retention: Duration,
-}
-
-/// One Area's database, and the Store's connection to it.
-#[derive(Debug)]
-struct Database {
+    /// Where the database is.
     path: PathBuf,
     store: StoreConnection,
+    /// How long Commits are kept in the change log.
+    change_log_retention: Duration,
 }
 
 /// The connection the Store reads and commits through for one Area, and how far the Store has
@@ -202,7 +190,7 @@ struct LogReader {
 /// Notices the Commits other Stores make to a Store's databases, by polling them.
 #[derive(Debug)]
 pub(crate) struct SqlitePoller {
-    areas: PerArea<StoreConnection>,
+    store: StoreConnection,
     interval: Duration,
 }
 
@@ -216,60 +204,50 @@ pub(crate) struct AreaConnection(Arc<Mutex<Connection>>);
 pub(crate) type SqliteSnapshot = AreaConnection;
 
 impl SqliteBackend {
-    /// Marks each Area for SQLite ([`marker`]), or fails if one is another Backend's, then opens
-    /// each Area's database, creating it and its directories if they don't exist. Gives the
-    /// Backend, and the poller that notices other Stores' Commits from the end of each change log
-    /// as it is now.
+    /// Opens the database at `path`, creating it if it doesn't exist, and the directory it is in.
+    /// Gives the Backend, and the poller that notices other Stores' Commits from the end of the
+    /// change log as it is now.
     pub(crate) async fn open(
-        app: &AppIdentity,
-        options: SqliteOptions,
+        path: PathBuf,
+        options: &SqliteOptions,
     ) -> Result<(SqliteBackend, SqlitePoller)> {
-        let directories = app.area_directories(options.root_override.as_deref())?;
-        let areas = off_runtime(move || {
-            for area in marker::claim(&directories, BackendKind::Sqlite)? {
-                warn_if_holding_other_files(area, directories.get(area));
+        let opened = path.clone();
+        let (connection, log) = off_runtime(move || {
+            if let Some(directory) = opened.parent() {
+                std::fs::create_dir_all(directory)
+                    .map_err(|error| super::failed(directory, error))?;
             }
-            PerArea::try_from_fn(|area| {
-                let path =
-                    directories.get(area).join(RESERVED).join(format!("{}.sqlite3", area.name()));
-                let (connection, log) = open_database(&path)?;
-                let connection = AreaConnection::new(connection);
-                let log = Arc::new(Mutex::new(log));
-                Ok(Database { path, store: StoreConnection { connection, log } })
-            })
+            open_database(&opened)
         })
         .await?;
-        let polled = PerArea::try_from_fn(|area| Ok(areas.get(area).store.clone()))?;
-        let poller = SqlitePoller { areas: polled, interval: options.poll_interval };
-        Ok((SqliteBackend { areas, change_log_retention: options.change_log_retention }, poller))
+        let connection = AreaConnection::new(connection);
+        let store = StoreConnection { connection, log: Arc::new(Mutex::new(log)) };
+        let poller = SqlitePoller { store: store.clone(), interval: options.poll_interval };
+        let retention = options.change_log_retention;
+        Ok((SqliteBackend { path, store, change_log_retention: retention }, poller))
     }
 
-    pub(crate) async fn read(&self, area: Area, path: &Path) -> Result<Option<File>> {
-        self.areas.get(area).store.connection.read(path).await
+    pub(crate) async fn read(&self, path: &Path) -> Result<Option<File>> {
+        self.store.connection.read(path).await
     }
 
-    pub(crate) async fn stat(&self, area: Area, path: &Path) -> Result<Option<Stat>> {
-        self.areas.get(area).store.connection.stat(path).await
+    pub(crate) async fn stat(&self, path: &Path) -> Result<Option<Stat>> {
+        self.store.connection.stat(path).await
     }
 
-    pub(crate) async fn list(&self, area: Area, prefix: &Prefix) -> Result<Vec<Path>> {
-        self.areas.get(area).store.connection.list(prefix).await
+    pub(crate) async fn list(&self, prefix: &Prefix) -> Result<Vec<Path>> {
+        self.store.connection.list(prefix).await
     }
 
-    pub(crate) async fn stat_prefix(&self, area: Area, prefix: &Prefix) -> Result<PrefixRevision> {
+    pub(crate) async fn revisions_under(&self, prefix: &Prefix) -> Result<Vec<(Path, Revision)>> {
         let prefix = prefix.clone();
-        let connection = &self.areas.get(area).store.connection;
-        connection
-            .call(move |connection| {
-                let files = AreaInDatabase(connection).revisions_under(&prefix)?;
-                Ok(PrefixRevision::of(area, prefix, files))
-            })
-            .await
+        let connection = &self.store.connection;
+        connection.call(move |connection| AreaInDatabase(connection).revisions_under(&prefix)).await
     }
 
-    /// Begins a read transaction on a new connection to the Area's database.
-    pub(crate) async fn snapshot(&self, area: Area) -> Result<SqliteSnapshot> {
-        let path = self.areas.get(area).path.clone();
+    /// Begins a read transaction on a new connection to the database.
+    pub(crate) async fn snapshot(&self) -> Result<SqliteSnapshot> {
+        let path = self.path.clone();
         off_runtime(move || {
             let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
             let connection = Connection::open_with_flags(&path, flags).map_err(Error::backend)?;
@@ -289,7 +267,7 @@ impl SqliteBackend {
     /// change log and prunes the log.
     pub(crate) async fn commit(&self, request: CommitRequest) -> Result<CommitOutcome> {
         let retention = self.change_log_retention;
-        let store = &self.areas.get(request.staged.area).store;
+        let store = &self.store;
         let committing = move |transaction: &Connection, this_store| {
             let timestamp = request.timestamp;
             let plan = request.plan(&AreaInDatabase(transaction))?;
@@ -313,7 +291,7 @@ impl SqliteBackend {
 /// Warns that `area`, just adopted by SQLite, holds other files in `directory`, besides the
 /// `.tidings/` directory SQLite keeps everything in. SQLite never shows them as Files, so an app
 /// that expected them there, as if the Area were the filesystem's, finds it empty.
-fn warn_if_holding_other_files(area: Area, directory: &std::path::Path) {
+pub(crate) fn warn_if_holding_other_files(area: Area, directory: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(directory) else { return };
     let others = entries.flatten().any(|entry| entry.file_name() != RESERVED);
     if others {
@@ -364,35 +342,29 @@ impl LogReader {
 }
 
 impl SqlitePoller {
-    /// Waits for the poll interval, then gives each Area whose database another connection may
-    /// have committed to since the last time. An Area whose database can't be checked is given
-    /// too, so that reading its log shows what is wrong.
-    pub(crate) async fn wait(&self) -> Vec<Area> {
+    /// Waits for the poll interval, then gives whether another connection may have committed to
+    /// the database since the last time. A database that can't be checked gives `true`, so that
+    /// reading its log shows what is wrong.
+    pub(crate) async fn wait(&self) -> bool {
         tokio::time::sleep(self.interval).await;
-        let mut changed = Vec::new();
-        for (area, StoreConnection { connection, log }) in self.areas.iter() {
-            let log = Arc::clone(log);
-            let checked = connection
-                .call(move |connection| {
-                    let now = data_version(connection).map_err(Error::backend)?;
-                    let mut log = LogReader::lock(&log);
-                    Ok(std::mem::replace(&mut log.data_version, now) != now)
-                })
-                .await;
-            if checked.unwrap_or(true) {
-                changed.push(area);
-            }
-        }
-        changed
+        let StoreConnection { connection, log } = &self.store;
+        let log = Arc::clone(log);
+        let checked = connection
+            .call(move |connection| {
+                let now = data_version(connection).map_err(Error::backend)?;
+                let mut log = LogReader::lock(&log);
+                Ok(std::mem::replace(&mut log.data_version, now) != now)
+            })
+            .await;
+        checked.unwrap_or(true)
     }
 
-    /// Reads what was committed to `area` since this Store last read its change log, and moves
-    /// the Store past it. The Store layer calls it in turn with Commits, under `commit_order`, and
-    /// records what it gives before its turn ends.
-    pub(crate) async fn read(&self, area: Area) -> Result<Vec<Observed>> {
-        let store = self.areas.get(area);
+    /// Reads what was committed since this Store last read the change log, and moves the Store
+    /// past it. The Store layer calls it in turn with Commits, under `commit_order`, and records
+    /// what it gives before its turn ends.
+    pub(crate) async fn read(&self) -> Result<Vec<Observed>> {
         let (observed, ()) =
-            store.read_log_and(TransactionBehavior::Deferred, |_, _| Ok(((), None))).await?;
+            self.store.read_log_and(TransactionBehavior::Deferred, |_, _| Ok(((), None))).await?;
         Ok(observed)
     }
 }
