@@ -285,6 +285,30 @@ mod sqlite {
         assert_eq!(next_item(&mut feed).await, FeedItem::Resync);
         assert_nothing_more(&mut feed).await;
     }
+    /// A SQLite Location can't be inside another Store's Location, or inside a Working copy,
+    /// whose folder holds a `.tidings/` too. Opening one there is refused, naming the directory it
+    /// is inside, before anything is made. The Location itself holding `.tidings/` is usual.
+    #[tokio::test]
+    async fn opening_inside_another_location_or_a_working_copy_is_refused() {
+        let fixture = Sqlite::new();
+        let Opened { store: _store, feed: _feed } = fixture.open().await;
+        let working_copy = fixture.directory.path().join("working copy");
+        std::fs::create_dir_all(working_copy.join(".tidings")).unwrap();
+
+        for outer in [fixture.location(), working_copy] {
+            let inner = outer.join("deeper/inner");
+            match tidings::Store::open_sqlite(&inner, SqliteOptions::default()).await {
+                Err(Error::NestedLocation { outer: named }) => {
+                    assert_eq!(named, outer.canonicalize().unwrap());
+                }
+                other => {
+                    panic!("opening inside {} should be refused, got {other:?}", outer.display())
+                }
+            }
+            assert!(!outer.join("deeper").exists());
+        }
+        let Opened { store: _again, feed: _again_feed } = fixture.open().await;
+    }
 }
 
 #[cfg(feature = "fs")]
@@ -380,6 +404,53 @@ mod fs {
         behaviour_suite!(BlockingFs(Fs::new()));
         two_stores_suite!(committing: BlockingFs(Fs::new()));
         two_stores_suite!(seeing_each_other: BlockingFs(Fs::new()));
+    }
+
+    /// A Location can't be inside another Store's Location, or inside a Working copy, whose folder
+    /// holds a `.tidings/` too. Opening one there is refused, naming the directory it is inside,
+    /// before anything is made. The Location itself holding `.tidings/` is usual.
+    #[tokio::test]
+    async fn opening_inside_another_location_or_a_working_copy_is_refused() {
+        let fixture = Fs::new();
+        let Opened { store: _store, feed: _feed } = fixture.open().await;
+        let working_copy = fixture.directory.path().join("working copy");
+        std::fs::create_dir_all(working_copy.join(".tidings")).unwrap();
+
+        for outer in [fixture.on_disk(""), working_copy] {
+            let inner = outer.join("deeper/inner");
+            match tidings::Store::open_fs(&inner, fixture.usual_options()).await {
+                Err(Error::NestedLocation { outer: named }) => {
+                    assert_eq!(named, outer.canonicalize().unwrap());
+                }
+                other => {
+                    panic!("opening inside {} should be refused, got {other:?}", outer.display())
+                }
+            }
+            assert!(!outer.join("deeper").exists());
+        }
+        let Opened { store: _again, feed: _again_feed } = fixture.open().await;
+    }
+
+    /// A Location reached through a symlink is checked where it really is, so a link from outside
+    /// into another Store's Location doesn't get around the refusal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opening_inside_another_location_through_a_symlink_is_refused() {
+        let fixture = Fs::new();
+        let Opened { store: _store, feed: _feed } = fixture.open().await;
+        std::fs::create_dir(fixture.on_disk("sub")).unwrap();
+        let link = fixture.directory.path().join("link");
+        std::os::unix::fs::symlink(fixture.on_disk("sub"), &link).unwrap();
+
+        for inner in [link.clone(), link.join("inner")] {
+            match tidings::Store::open_fs(&inner, fixture.usual_options()).await {
+                Err(Error::NestedLocation { outer }) => {
+                    assert_eq!(outer, fixture.on_disk("").canonicalize().unwrap());
+                }
+                other => panic!("opening {} should be refused, got {other:?}", inner.display()),
+            }
+        }
+        assert!(std::fs::read_dir(fixture.on_disk("sub")).unwrap().next().is_none());
     }
 
     /// The suite's Snapshot tests are skipped where Snapshots aren't supported, so this makes sure

@@ -12,11 +12,16 @@
 //! if it names another Backend. So when Stores on two Backends open an unmarked Location at once,
 //! the one that makes the marker gets it, and the other fails.
 //!
+//! **Nesting.** Before that, opening refuses a Location inside a directory holding a `.tidings/`,
+//! another Store's Location or a Working copy ([`refuse_nested`]), so that two never claim the
+//! same files.
+//!
 //! **Clearing.** A Location removed by the user or the OS loses its marker with everything else.
 //! The Store open on it makes it and marks it again.
 
 use std::fs;
 use std::io::{self, Write};
+use std::path::Component;
 use std::path::{Path as FsPath, PathBuf};
 use std::time::Duration;
 
@@ -111,4 +116,50 @@ fn check(marked: Option<BackendKind>, kind: BackendKind) -> Result<()> {
         Some(found) if found != kind => Err(Error::WrongBackend { found }),
         _ => Ok(()),
     }
+}
+
+/// Gives [`Error::NestedLocation`] if a directory above the Location `location` holds a
+/// `.tidings/` directory, as another Store's Location and a Working copy do. Symlinks on the way
+/// are resolved first, so that the Location is checked where it really is. The Location holding
+/// one itself is usual. Changes nothing.
+pub(crate) fn refuse_nested(location: &FsPath) -> Result<()> {
+    let resolved = resolved(location)?;
+    for outer in resolved.ancestors().skip(1) {
+        if fs::metadata(outer.join(RESERVED)).is_ok_and(|metadata| metadata.is_dir()) {
+            return Err(Error::NestedLocation { outer: outer.to_path_buf() });
+        }
+    }
+    Ok(())
+}
+
+/// `location`, made absolute, with every symlink on the way resolved, though it may not exist
+/// yet: the nearest of it and its ancestors that exists, as [`fs::canonicalize`] gives it, then
+/// the names after that, which can't be symlinks, since they don't exist.
+fn resolved(location: &FsPath) -> Result<PathBuf> {
+    let mut existing = std::path::absolute(location).map_err(|error| failed(location, error))?;
+    let mut missing = Vec::new();
+    let mut resolved = loop {
+        match fs::canonicalize(&existing) {
+            Ok(canonical) => break canonical,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let last = existing.components().next_back().map(Component::as_os_str);
+                let Some(last) = last.map(ToOwned::to_owned) else {
+                    return Err(failed(&existing, error));
+                };
+                if !existing.pop() {
+                    return Err(failed(&existing, error));
+                }
+                missing.push(last);
+            }
+            Err(error) => return Err(failed(&existing, error)),
+        }
+    };
+    for name in missing.into_iter().rev() {
+        if name == ".." {
+            resolved.pop();
+        } else {
+            resolved.push(name);
+        }
+    }
+    Ok(resolved)
 }

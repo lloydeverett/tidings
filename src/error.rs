@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crate::{BackendKind, InvalidPathReason, Path, Prefix};
 
 /// Everything that can go wrong in tidings.
@@ -44,6 +46,18 @@ pub enum Error {
     WrongBackend {
         /// The Backend its marker names.
         found: BackendKind,
+    },
+    /// The Location is inside `outer`, a directory holding a `.tidings/` directory, as another
+    /// Store's Location and a Working copy do. Opening a Store on the filesystem or SQLite gives
+    /// it, before anything is made, since the two would claim the same files. `outer` is as found
+    /// with every symlink on the way resolved.
+    #[error(
+        "the Location is inside {}, which holds another Store or a Working copy",
+        outer.display()
+    )]
+    NestedLocation {
+        /// The directory the Location is inside.
+        outer: PathBuf,
     },
     /// A Staging required a [`PrefixRevision`](crate::PrefixRevision) for `prefix` that was taken
     /// for another Prefix, or from another Store than the one it was committed to. It could never

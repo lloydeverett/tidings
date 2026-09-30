@@ -311,10 +311,10 @@ pub(crate) struct FsBackend {
 }
 
 impl FsBackend {
-    /// Marks the Location `location` for the filesystem ([`marker`]), or fails if it is SQLite's,
-    /// then makes it and its `.tidings/` directory if they don't exist, finishes or discards any
-    /// Commit a crash left in its journal, and starts watching it, giving the watcher for the
-    /// Store to run.
+    /// Refuses `location` if it is inside another Store's Location or a Working copy, marks it for
+    /// the filesystem ([`marker`]), or fails if it is SQLite's, then makes it and its `.tidings/`
+    /// directory if they don't exist, finishes or discards any Commit a crash left in its journal,
+    /// and starts watching it, giving the watcher for the Store to run.
     pub(crate) async fn open(
         location: PathBuf,
         options: &FsOptions,
@@ -328,6 +328,7 @@ impl FsBackend {
             watching: Arc::clone(&failures.watches_to_fail),
         };
         let location = off_runtime(move || {
+            marker::refuse_nested(&location)?;
             marker::claim(&location, BackendKind::Fs)?;
             #[cfg_attr(not(feature = "testing"), expect(unused_mut))]
             let mut location = Location::open(location)?;

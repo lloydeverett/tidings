@@ -240,15 +240,20 @@ pub(crate) struct DatabaseConnection(Arc<Mutex<Connection>>);
 pub(crate) type SqliteSnapshot = DatabaseConnection;
 
 impl SqliteBackend {
-    /// Marks `location` for SQLite ([`marker`]), or fails if it is the filesystem's, then opens
-    /// its database, creating it and the Location if they don't exist. Gives the Backend, and the
-    /// poller that notices other Stores' Commits from the end of the change log as it is now.
+    /// Refuses `location` if it is inside another Store's Location or a Working copy, marks it for
+    /// SQLite ([`marker`]), or fails if it is the filesystem's, then opens its database, creating
+    /// it and the Location if they don't exist. Gives the Backend, and the poller that notices
+    /// other Stores' Commits from the end of the change log as it is now.
     pub(crate) async fn open(
         location: PathBuf,
         options: &SqliteOptions,
     ) -> Result<(SqliteBackend, SqlitePoller)> {
         let opening = location.clone();
-        let (connection, log) = off_runtime(move || open_at(&opening)).await?;
+        let (connection, log) = off_runtime(move || {
+            marker::refuse_nested(&opening)?;
+            open_at(&opening)
+        })
+        .await?;
         let connection = DatabaseConnection::new(connection);
         let log = Arc::new(Mutex::new(log));
         let store = StoreConnection { connection, log, location: Arc::new(location) };

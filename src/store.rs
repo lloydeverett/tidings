@@ -167,6 +167,10 @@ impl Store {
     /// [`Error::WrongBackend`](crate::Error::WrongBackend), without changing anything, if the
     /// Location is marked for SQLite: see [`detect`](Self::detect).
     ///
+    /// The Location can't be inside another Store's Location, or inside a Working copy. Opening
+    /// gives [`Error::NestedLocation`](crate::Error::NestedLocation), without changing anything, if
+    /// a directory above it holds a `.tidings/` directory, with symlinks on the way resolved.
+    ///
     /// Gives [`Error::Backend`](crate::Error::Backend) if a directory can't be made, the Backend
     /// marker names no Backend or can't be read, or the record of an interrupted Commit can't be
     /// read.
@@ -197,6 +201,10 @@ impl Store {
     /// it has none. Other files already in the Location are left there, and aren't Files. Gives
     /// [`Error::WrongBackend`](crate::Error::WrongBackend), without changing anything, if the
     /// Location is marked for the filesystem: see [`detect`](Self::detect).
+    ///
+    /// The Location can't be inside another Store's Location, or inside a Working copy. Opening
+    /// gives [`Error::NestedLocation`](crate::Error::NestedLocation), without changing anything, if
+    /// a directory above it holds a `.tidings/` directory, with symlinks on the way resolved.
     ///
     /// Other processes, and other Stores in this one, can open the same Location, and commit to it
     /// safely: Commits are applied one at a time. Every poll interval in `options`, the Store
