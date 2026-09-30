@@ -1425,3 +1425,40 @@ Fixed in 8897440 (README only):
 11. **The Status line:** updated.
 
 The changed examples were run against the binary. No re-review: prose edits only.
+
+## Dropping the old record format
+
+The owner asked for all reading of the record's version 1 to go, since no Working copy exists
+outside development, and for the layout then written as version 2 to become version 1. Reviewed
+before committing, as 30c87d9.
+
+### Standards
+
+No hard violations. Stale wording: a comment in `WorkingCopy::reconcile` on "only a hash was
+recorded", a case that can no longer happen; and the `resolve` command's doc and spec bullet not
+saying it opens the Store only to check it, as `status`'s do. Judgement calls: the Revision and
+hash pair is now written out twice in `Record::to_text`, while `parse_base` reads it once; the
+unknown-format test picks its expected message by the version's suffix, a pattern older than this
+change.
+
+### Spec
+
+Probed on a scratch Store: a new record is written as `tidings working-copy 1` with a hash on every
+`base` line and on each `diverged` line that has a Revision; versions `2`, `3`, `0`, `01`, `1 ` and
+`1.0` are refused by all five commands with the record, folder and `theirs` untouched; a line in the
+old layout (no hash) is refused as "a line it can't read". `resolve` still refuses mismatched Store
+flags and a Store that has gone, and a commit after the Store changed again is a Conflict. Every
+place a Base or Divergence is made computes its hash, so making it mandatory is safe. Findings: the
+same stale comment; no test pins the refusal of an old-layout line (checked by hand only).
+
+### Summary
+
+Standards: 0 hard violations, 3 stale wordings, 2 judgement calls. Spec: nothing missing or wrong
+beyond the stale comment.
+
+### Resolution
+
+In 30c87d9: the stale comment removed, and the `resolve` doc and spec bullet now say it opens the
+Store only to check it. Not acted on: the repeated pair (simpler than the closure it replaced), the
+test's suffix check (older than this change), and a test of an old-layout line (the spec keeps tests
+from reading the record's format beyond the unknown-format one).
